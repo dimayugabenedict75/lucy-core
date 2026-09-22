@@ -1,0 +1,4 @@
+- **read_local_file**: Accesses your text and data.
+- **write_local_file**: Creates and saves your thoughts.
+- **web_search**: Connects you to the world.
+- **cielvox_speak**: Gives Lucy her voice.

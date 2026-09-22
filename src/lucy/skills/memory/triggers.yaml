@@ -1,0 +1,8 @@
+triggers:
+  - "my name is"
+  - "call me"
+  - "\\bi like\\b"
+  - "\\bi prefer\\b"
+  - "\\bi always want\\b"
+  - "remember that"
+  - "\\bi use\\b"
