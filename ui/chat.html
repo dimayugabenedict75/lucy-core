@@ -1,24 +1,34 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Lucy Core</title>
-    <link rel="stylesheet" href="/chat.css?v=2">
+    <link rel="stylesheet" href="/chat.css?v=3">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
+
 <body>
     <!-- Sidebar -->
     <div class="sidebar" id="sidebar">
-        <div class="sidebar-title">Sessions</div>
-        <button class="new-session-btn" id="newSessionBtn" onclick="newSession()">
-            + New Session
+        <div class="sidebar-header">
+            <span class="sidebar-title">Sessions</span>
+            <button id="sidebarToggle" class="sidebar-toggle" title="Collapse sidebar">
+                <span class="sidebar-toggle-icon">›</span>
+            </button>
+        </div>
+        <button class="new-session-btn" id="newSessionBtn" onclick="newSession()" title="New Session">
+            <span class="btn-icon">+</span>
+            <span class="btn-text">+ New Session</span>
         </button>
         <div class="chat-history" id="chatHistory">
             <!-- Session history populated dynamically -->
         </div>
         <div class="sidebar-footer">
-            <button class="settings-btn" id="settingsBtn" onclick="openSettings()">
-                Settings
+            <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings">
+                <span class="btn-icon">⚙</span>
+                <span class="btn-text">Settings</span>
             </button>
         </div>
     </div>
@@ -26,7 +36,7 @@
     <!-- Main Chat -->
     <div class="main-chat">
         <div class="header">
-            <span class="header-title">Lucy Core</span>
+            <span class="header-title">Lucy</span>
             <div class="header-actions">
                 <span class="status-dot" id="statusDot"></span>
                 <span style="color: #00E5FF;" id="statusText">Connected</span>
@@ -52,7 +62,8 @@
 
         <div class="input-area">
             <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileSelect(event)">
-            <button type="button" class="upload-btn" id="uploadBtn" onclick="document.getElementById('fileInput').click()">&#x1F4CE;</button>
+            <button type="button" class="upload-btn" id="uploadBtn"
+                onclick="document.getElementById('fileInput').click()">&#x1F4CE;</button>
             <div class="file-preview-container" id="filePreviewContainer"></div>
             <input type="text" id="messageInput" placeholder="Type a message..." autocomplete="off">
             <button id="sendButton" onclick="sendMessage()">Send</button>
@@ -62,32 +73,144 @@
     <!-- Settings Modal -->
     <div class="settings-overlay" id="settingsOverlay" onclick="closeSettings()">
         <div class="settings-modal" onclick="event.stopPropagation()">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-                <h3 style="margin:0;">Settings</h3>
-                <button class="close-x-btn" onclick="closeSettings()" title="Close" style="background:none;border:none;color:#00E5FF;font-size:20px;cursor:pointer;">×</button>
+            <div class="settings-header">
+                <h3>Settings <span class="settings-saved-indicator" id="settingsSavedIndicator">Saved</span></h3>
+                <button class="close-x-btn" onclick="closeSettings()" title="Close">×</button>
             </div>
-            <div class="setting-group">
-                <label for="skinSelect">Interface Theme</label>
-                <select id="skinSelect">
-                    <option value="default">Default (Dark)</option>
-                </select>
+
+            <div class="settings-tabs">
+                <button class="settings-tab-btn active" data-tab="general"
+                    onclick="switchSettingsTab('general')">General</button>
+                <button class="settings-tab-btn" data-tab="model" onclick="switchSettingsTab('model')">Model</button>
+                <button class="settings-tab-btn" data-tab="skills" onclick="switchSettingsTab('skills')">Skills</button>
+                <button class="settings-tab-btn" data-tab="connectors"
+                    onclick="switchSettingsTab('connectors')">Connectors</button>
             </div>
-            <div class="setting-group">
-                <label for="modelSelect">Model</label>
-                <select id="modelSelect">
-                    <option value="lux-plus">Lux-Plus-M12B (Q4_K)</option>
-                </select>
-            </div>
-            <div class="setting-group">
-                <label for="ttsSelect">Voice Output</label>
-                <select id="ttsSelect">
-                    <option value="cielvox">Cielvox 2.5</option>
-                    <option value="disabled">Disabled</option>
-                </select>
-            </div>
-            <div class="setting-group">
-                <label for="timezoneSelect">Timezone</label>
-                <select id="timezoneSelect"></select>
+
+            <div class="settings-panels">
+                <!-- GENERAL -->
+                <div class="settings-panel active" id="panel-general">
+                    <div class="setting-group">
+                        <label for="themeSelect">Theme</label>
+                        <select id="themeSelect">
+                            <option value="light">Light</option>
+                            <option value="dark" selected>Dark</option>
+                        </select>
+                    </div>
+                    <div class="setting-group">
+                        <label for="fontSelect">Font</label>
+                        <select id="fontSelect">
+                            <option value="vt323" selected>VT323 (Terminal)</option>
+                            <option value="jetbrains-mono">JetBrains Mono</option>
+                            <option value="space-mono">Space Mono</option>
+                            <option value="orbitron">Orbitron (Futuristic)</option>
+                            <option value="ibm-plex-sans">IBM Plex Sans</option>
+                            <option value="courier-prime">Courier Prime (Typewriter)</option>
+                        </select>
+                    </div>
+                    <div class="setting-group">
+                        <label for="fontSizeSelect">Font Size</label>
+                        <select id="fontSizeSelect">
+                            <option value="small">Small</option>
+                            <option value="medium" selected>Medium</option>
+                            <option value="large">Large</option>
+                            <option value="xlarge">Extra Large</option>
+                        </select>
+                    </div>
+                    <div class="setting-group">
+                        <label for="languageSelect">Language</label>
+                        <select id="languageSelect">
+                            <option value="en" selected>English</option>
+                        </select>
+                    </div>
+                    <div class="setting-group">
+                        <label for="timezoneSelect">Timezone</label>
+                        <select id="timezoneSelect"></select>
+                    </div>
+                </div>
+
+                <!-- MODEL -->
+                <div class="settings-panel" id="panel-model">
+                    <div class="setting-group">
+                        <label for="providerSelect">Provider</label>
+                        <select id="providerSelect">
+                            <option value="local" selected>Local</option>
+                        </select>
+                    </div>
+                    <div class="setting-group">
+                        <label for="modelSelect">LLM</label>
+                        <select id="modelSelect">
+                            <option value="lux-light">Lux-Light</option>
+                            <option value="lux-dark" selected>Lux-Dark</option>
+                        </select>
+                    </div>
+                    <div class="setting-group">
+                        <label for="temperatureInput">Temperature</label>
+                        <input type="number" id="temperatureInput" min="0" max="2" step="0.05" value="0.70">
+                    </div>
+                    <div class="setting-group">
+                        <label for="ttsSelect">Voice</label>
+                        <select id="ttsSelect">
+                            <option value="cielvox">Cielvox 2.5</option>
+                            <option value="disabled" selected>Disabled</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- SKILLS -->
+                <div class="settings-panel" id="panel-skills">
+                    <div class="settings-toolbar">
+                        <input type="text" id="skillSearchInput" placeholder="Search skills..."
+                            oninput="filterSkills()">
+                        <button class="settings-action-btn" onclick="addSkill()">+ Add Skill</button>
+                    </div>
+                    <div class="settings-table-wrap">
+                        <table class="settings-table" id="skillsTable">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Description</th>
+                                    <th>Status</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="skillsTableBody">
+                                <tr>
+                                    <td colspan="4" class="settings-table-empty">No skills loaded yet — will sync from
+                                        skills.sqlite</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- CONNECTORS -->
+                <div class="settings-panel" id="panel-connectors">
+                    <div class="settings-toolbar">
+                        <input type="text" id="connectorSearchInput" placeholder="Search connectors..."
+                            oninput="filterConnectors()">
+                        <button class="settings-action-btn" onclick="addConnector()">+ Add Connector</button>
+                    </div>
+                    <div class="settings-table-wrap">
+                        <table class="settings-table" id="connectorsTable">
+                            <thead>
+                                <tr>
+                                    <th>Connector</th>
+                                    <th>Token</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="connectorsTableBody">
+                                <tr>
+                                    <td>GitHub</td>
+                                    <td class="settings-token">***********************************</td>
+                                    <td class="settings-row-actions"><button class="settings-row-btn"
+                                            onclick="editConnector('github')">Edit</button></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -98,9 +221,23 @@
 
         // Helper: default fetch headers with API key
         function authHeaders(extra = {}) {
-            const headers = { ...extra };
+            const headers = {...extra};
             headers['X-API-Key'] = API_KEY;
             return headers;
+        }
+
+        // Render markdown-lite for assistant messages (bullets, bold, italics, line breaks)
+        function renderMarkdown(text) {
+            if (typeof marked === 'undefined') {
+                // Fallback: basic rendering if marked.js hasn't loaded
+                return text
+                    .replace(/^\s*\* (.+)$/gm, '<li>$1</li>')
+                    .replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>')
+                    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+                    .replace(/\n/g, '<br>');
+            }
+            return marked.parse(text);
         }
 
         const chatContainer = document.getElementById('chatContainer');
@@ -119,6 +256,17 @@
         let currentSessionId = 'default';
         let sessions = {};
         let currentActivity = null;
+        let sidebarCollapsed = false;
+
+        // Sidebar toggle
+        const sidebar = document.getElementById('sidebar');
+        const sidebarToggleBtn = document.getElementById('sidebarToggle');
+        if (sidebarToggleBtn && sidebar) {
+            sidebarToggleBtn.addEventListener('click', () => {
+                sidebarCollapsed = !sidebarCollapsed;
+                sidebar.classList.toggle('collapsed', sidebarCollapsed);
+            });
+        }
 
         messageInput.focus();
 
@@ -133,7 +281,7 @@
         // ---- Session Management via API ----
         async function loadSessions() {
             try {
-                const resp = await fetch('/api/sessions', { headers: authHeaders() });
+                const resp = await fetch('/api/sessions', {headers: authHeaders()});
                 if (resp.ok) {
                     const data = await resp.json();
                     Object.assign(sessions, data.sessions || {});
@@ -146,7 +294,7 @@
 
         async function newSession() {
             try {
-                const resp = await fetch('/api/sessions', { method: 'POST', headers: authHeaders() });
+                const resp = await fetch('/api/sessions', {method: 'POST', headers: authHeaders()});
                 if (resp.ok) {
                     const data = await resp.json();
                     currentSessionId = data.session_id;
@@ -181,16 +329,16 @@
                 const fixed = ts.replace(' ', 'T');
                 const d2 = new Date(fixed);
                 if (isNaN(d2.getTime())) return null;
-                return d2.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                return d2.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
             }
-            return d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
         }
 
         function formatTimestamp(ts) {
             if (!ts) return '';
             const d = new Date(ts.replace(' ', 'T'));
             if (isNaN(d.getTime())) return ts;
-            const options = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true };
+            const options = {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true};
             const tzSelect = document.getElementById('timezoneSelect');
             let tz = 'en-US';
             if (tzSelect) {
@@ -201,7 +349,7 @@
                 }
             }
             try {
-                return d.toLocaleString(navigator.language || 'en-US', { ...options, timeZone: tz });
+                return d.toLocaleString(navigator.language || 'en-US', {...options, timeZone: tz});
             } catch {
                 return d.toLocaleString(navigator.language || 'en-US', options);
             }
@@ -210,7 +358,7 @@
         async function renderHistory() {
             const allSessions = [];
             for (const [id, session] of Object.entries(sessions)) {
-                allSessions.push({ id, ...session });
+                allSessions.push({id, ...session});
             }
             allSessions.sort((a, b) => {
                 const ta = a.updated_at || '';
@@ -248,10 +396,10 @@
             if (id === currentSessionId) return;
             currentSessionId = id;
             try {
-                const resp = await fetch(`/api/sessions/${id}`, { headers: authHeaders() });
+                const resp = await fetch(`/api/sessions/${id}`, {headers: authHeaders()});
                 if (resp.ok) {
                     const data = await resp.json();
-                    const session = sessions[id] || { title: 'Session', messages: [] };
+                    const session = sessions[id] || {title: 'Session', messages: []};
                     session.messages = data.messages || [];
                     sessions[id] = session;
                 }
@@ -272,7 +420,7 @@
                             const mediaPath = m.replace('MEDIA:', '');
                             const relativePath = pathToRelative(mediaPath);
                             const fileName = mediaPath.split(/[\\/]/).pop();
-                            return { path: mediaPath, name: fileName, url: `/api/file/${encodeURIComponent(relativePath)}?api_key=${encodeURIComponent(API_KEY)}` };
+                            return {path: mediaPath, name: fileName, url: `/api/file/${encodeURIComponent(relativePath)}?api_key=${encodeURIComponent(API_KEY)}`};
                         });
                         addMessage(cleanContent, msg.role === 'user', fileData, msg.timestamp);
                     } else {
@@ -297,7 +445,7 @@
                 if (resp.ok) {
                     delete sessions[id];
                     if (currentSessionId === id) {
-                        const newResp = await fetch('/api/sessions', { headers: authHeaders() });
+                        const newResp = await fetch('/api/sessions', {headers: authHeaders()});
                         const data = await newResp.json();
                         const sessionList = data.sessions || {};
                         const firstId = Object.keys(sessionList)[0];
@@ -328,7 +476,7 @@
 
             const bubble = document.createElement('div');
             bubble.className = `message-bubble ${isUser ? 'user-bubble' : 'assistant-bubble'}`;
-            bubble.textContent = text;
+            bubble.innerHTML = renderMarkdown(text);
             contentWrapper.appendChild(bubble);
             row.appendChild(contentWrapper);
 
@@ -551,7 +699,7 @@
                 streamingRow.parentNode.insertBefore(thinkingIndicator, streamingRow);
             }
             if (thinkingIndicator) {
-                thinkingIndicator.scrollIntoView({ behavior: 'auto', block: 'start' });
+                thinkingIndicator.scrollIntoView({behavior: 'auto', block: 'start'});
             }
 
             let fullResponse = '';
@@ -578,10 +726,10 @@
                 const decoder = new TextDecoder();
 
                 while (true) {
-                    const { done, value } = await reader.read();
+                    const {done, value} = await reader.read();
                     if (done) break;
 
-                    const chunk = decoder.decode(value, { stream: true });
+                    const chunk = decoder.decode(value, {stream: true});
                     const lines = chunk.split('\n\n');
 
                     for (const line of lines) {
@@ -594,9 +742,9 @@
                                         thinkingIndicator.classList.remove('active');
                                     }
                                     fullResponse += data.content;
-                                    streamingBubble.innerHTML = fullResponse;
+                                    streamingBubble.innerHTML = renderMarkdown(fullResponse);
                                     if (thinkingIndicator.classList.contains('active')) {
-                                        thinkingIndicator.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                                        thinkingIndicator.scrollIntoView({behavior: 'smooth', block: 'start'});
                                     } else {
                                         scrollToBottom();
                                     }
@@ -607,7 +755,7 @@
                                     const relativePath = pathToRelative(mediaPath);
                                     let fileUrl = `/api/file/${encodeURIComponent(relativePath)}?api_key=${encodeURIComponent(API_KEY)}`;
                                     const fileName = mediaPath.split(/[\\/]/).pop();
-                                    const fileData = { path: mediaPath, name: fileName, url: fileUrl };
+                                    const fileData = {path: mediaPath, name: fileName, url: fileUrl};
                                     pendingMedia.push(`MEDIA:${mediaPath}`);
                                     const fileWrapper = renderFilePreview(fileData);
                                     const assistantRow = streamingBubble ? streamingBubble.closest('.message-row') : null;
@@ -632,7 +780,7 @@
                                         chatContainer.appendChild(fileWrapper);
                                     }
                                     if (thinkingIndicator.classList.contains('active')) {
-                                        thinkingIndicator.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                                        thinkingIndicator.scrollIntoView({behavior: 'smooth', block: 'start'});
                                     } else {
                                         scrollToBottom();
                                     }
@@ -683,11 +831,11 @@
                 }
 
                 if (!sessions[currentSessionId]) {
-                    sessions[currentSessionId] = { title: message ? message.substring(0, 30) : 'New Session', message_count: 0, messages: [], updated_at: now };
+                    sessions[currentSessionId] = {title: message ? message.substring(0, 30) : 'New Session', message_count: 0, messages: [], updated_at: now};
                 }
-                sessions[currentSessionId].messages.push({ role: 'user', content: message, timestamp: now });
+                sessions[currentSessionId].messages.push({role: 'user', content: message, timestamp: now});
                 const assistantResponse = fullResponse + (pendingMedia.length > 0 ? '\n' + pendingMedia.join('\n') : '');
-                sessions[currentSessionId].messages.push({ role: 'assistant', content: assistantResponse, timestamp: now });
+                sessions[currentSessionId].messages.push({role: 'assistant', content: assistantResponse, timestamp: now});
                 sessions[currentSessionId].title = message ? message.substring(0, 30) : 'New Session';
                 sessions[currentSessionId].updated_at = now;
                 renderHistory();
@@ -729,24 +877,180 @@
             const tz = document.getElementById('timezoneSelect').value;
             fetch(`/api/settings/timezone?api_key=${API_KEY}`, {
                 method: 'POST',
-                body: JSON.stringify({ timezone: tz }),
-                headers: { 'Content-Type': 'application/json' }
+                body: JSON.stringify({timezone: tz}),
+                headers: {'Content-Type': 'application/json'}
             });
+        }
+
+        // ---- Autosave (fires on every field change, no Save button needed) ----
+        const AUTOSAVE_FIELDS = [
+            {id: 'themeSelect', key: 'theme'},
+            {id: 'fontSelect', key: 'font'},
+            {id: 'fontSizeSelect', key: 'font_size'},
+            {id: 'languageSelect', key: 'language'},
+            {id: 'timezoneSelect', key: 'timezone'},
+            {id: 'providerSelect', key: 'provider'},
+            {id: 'modelSelect', key: 'model'},
+            {id: 'temperatureInput', key: 'temperature'},
+            {id: 'ttsSelect', key: 'voice'},
+        ];
+
+        function bindAutosave() {
+            AUTOSAVE_FIELDS.forEach(({id, key}) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.addEventListener('change', () => saveSetting(key, el.value));
+            });
+        }
+
+        function saveSetting(key, value) {
+            if (key === 'timezone') {
+                // Already wired to a real endpoint
+                saveSettings();
+            } else {
+                // TODO: replace with a real config endpoint once it exists, e.g.
+                // fetch(`/api/settings/${key}?api_key=${API_KEY}`, {
+                //     method: 'POST',
+                //     headers: { 'Content-Type': 'application/json' },
+                //     body: JSON.stringify({ value })
+                // });
+                console.log('Autosave (placeholder):', key, '=', value);
+            }
+            flashSaved();
+        }
+
+        function flashSaved() {
+            const indicator = document.getElementById('settingsSavedIndicator');
+            if (!indicator) return;
+            indicator.classList.add('visible');
+            clearTimeout(window._savedIndicatorTimer);
+            window._savedIndicatorTimer = setTimeout(() => {
+                indicator.classList.remove('visible');
+            }, 1200);
         }
 
         function openSettings() {
             settingsOverlay.style.display = 'flex';
             loadSettings();
+            loadSkills();
+            loadConnectors();
         }
 
         function closeSettings() {
             settingsOverlay.style.display = 'none';
         }
 
+        // ---- Settings Tabs ----
+        function switchSettingsTab(tab) {
+            document.querySelectorAll('.settings-tab-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.tab === tab);
+            });
+            document.querySelectorAll('.settings-panel').forEach(panel => {
+                panel.classList.toggle('active', panel.id === `panel-${tab}`);
+            });
+        }
+
+        // ---- Skills (placeholder — hook up to skills.sqlite via backend later) ----
+        const skillsTableBody = document.getElementById('skillsTableBody');
+
+        async function loadSkills() {
+            // TODO: fetch(`/api/skills?api_key=${API_KEY}`) and call renderSkills(data.skills)
+        }
+
+        function renderSkills(skills) {
+            if (!skillsTableBody) return;
+            if (!skills || skills.length === 0) {
+                skillsTableBody.innerHTML = '<tr><td colspan="4" class="settings-table-empty">No skills loaded yet — will sync from skills.sqlite</td></tr>';
+                return;
+            }
+            skillsTableBody.innerHTML = skills.map(s => `
+                <tr data-name="${(s.name || '').toLowerCase()}">
+                    <td>${s.name || ''}</td>
+                    <td>${s.description || ''}</td>
+                    <td>${s.enabled ? 'Enabled' : 'Disabled'}</td>
+                    <td class="settings-row-actions">
+                        <button class="settings-row-btn" onclick="toggleSkill('${s.id}')">${s.enabled ? 'Disable' : 'Enable'}</button>
+                        <button class="settings-row-btn" onclick="removeSkill('${s.id}')">Remove</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function filterSkills() {
+            const q = document.getElementById('skillSearchInput').value.trim().toLowerCase();
+            skillsTableBody.querySelectorAll('tr[data-name]').forEach(row => {
+                row.style.display = row.dataset.name.includes(q) ? '' : 'none';
+            });
+        }
+
+        function addSkill() {
+            const query = document.getElementById('skillSearchInput').value.trim();
+            // TODO: POST to backend to add/install a skill (e.g. /api/skills)
+            console.log('Add skill requested:', query);
+        }
+
+        function toggleSkill(id) {
+            // TODO: POST to backend to enable/disable a skill
+            console.log('Toggle skill:', id);
+        }
+
+        function removeSkill(id) {
+            // TODO: DELETE to backend to remove a skill
+            console.log('Remove skill:', id);
+        }
+
+        // ---- Connectors (placeholder — tokens/config come from backend later) ----
+        const connectorsTableBody = document.getElementById('connectorsTableBody');
+
+        async function loadConnectors() {
+            // TODO: fetch(`/api/connectors?api_key=${API_KEY}`) and call renderConnectors(data.connectors)
+        }
+
+        function renderConnectors(connectors) {
+            if (!connectorsTableBody) return;
+            if (!connectors || connectors.length === 0) {
+                connectorsTableBody.innerHTML = '<tr><td colspan="3" class="settings-table-empty">No connectors configured yet</td></tr>';
+                return;
+            }
+            connectorsTableBody.innerHTML = connectors.map(c => `
+                <tr data-name="${(c.name || '').toLowerCase()}">
+                    <td>${c.name || ''}</td>
+                    <td class="settings-token">${c.masked_token || '***********************************'}</td>
+                    <td class="settings-row-actions">
+                        <button class="settings-row-btn" onclick="editConnector('${c.id}')">Edit</button>
+                        <button class="settings-row-btn" onclick="removeConnector('${c.id}')">Remove</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function filterConnectors() {
+            const q = document.getElementById('connectorSearchInput').value.trim().toLowerCase();
+            connectorsTableBody.querySelectorAll('tr[data-name]').forEach(row => {
+                row.style.display = row.dataset.name.includes(q) ? '' : 'none';
+            });
+        }
+
+        function addConnector() {
+            const query = document.getElementById('connectorSearchInput').value.trim();
+            // TODO: POST to backend to add a connector (e.g. /api/connectors)
+            console.log('Add connector requested:', query);
+        }
+
+        function editConnector(id) {
+            // TODO: open a token-entry flow and PATCH to backend
+            console.log('Edit connector:', id);
+        }
+
+        function removeConnector(id) {
+            // TODO: DELETE to backend to remove a connector
+            console.log('Remove connector:', id);
+        }
+
         async function restartServer() {
             if (!confirm('Restart Lucy Core server?')) return;
             try {
-                const res = await fetch(`/api/restart?api_key=${API_KEY}`, { method: 'POST' });
+                const res = await fetch(`/api/restart?api_key=${API_KEY}`, {method: 'POST'});
                 const data = await res.json();
                 setStatus(data.status || 'restarting', '#ffa500');
                 setTimeout(() => {
@@ -760,7 +1064,7 @@
         async function stopServer() {
             if (!confirm('Stop Lucy Core server?')) return;
             try {
-                await fetch(`/api/shutdown?api_key=${API_KEY}`, { method: 'POST' });
+                await fetch(`/api/shutdown?api_key=${API_KEY}`, {method: 'POST'});
                 setStatus('Server stopped', '#ff4444');
                 const stopBtn = document.getElementById('stopBtn');
                 if (stopBtn) stopBtn.classList.add('stop');
@@ -775,7 +1079,7 @@
         function setStatus(text, color) {
             const dot = document.getElementById('statusDot');
             const label = document.getElementById('statusText');
-            if (color) { dot.style.background = color; dot.style.boxShadow = `0 0 8px ${color}`; }
+            if (color) {dot.style.background = color; dot.style.boxShadow = `0 0 8px ${color}`;}
             if (text) label.textContent = text;
         }
 
@@ -786,6 +1090,7 @@
         }
         loadSettings();
         loadSessions();
+        bindAutosave();
 
         messageInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter' && !isStreaming) {
@@ -800,4 +1105,5 @@
         });
     </script>
 </body>
+
 </html>

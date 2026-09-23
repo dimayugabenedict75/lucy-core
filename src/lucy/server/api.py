@@ -51,10 +51,15 @@ async def verify_api_key(request: Request):
 # --- Core Configuration ---
 LLAMACPP_API_URL = "http://localhost:8080/v1"
 MODEL_NAME = os.environ.get("LUCY_MODEL_PATH", "D:/AI/lucy/LLM/Lux-Plus-M12B.i1-QAT_Q4_K.gguf")
-MAX_CONTEXT_TOKENS = 4096
-MAX_CONTEXT_MESSAGES = 50  # limit session history messages loaded into context
+MAX_CONTEXT_TOKENS = 8192      # token budget for session history + system prompts
+MAX_CONTEXT_MESSAGES = 50      # hard ceiling on messages loaded (safety)
+COMPRESSION_THRESHOLD = 0.75   # start summarizing when 75% of budget is used
+SUMMARY_RESERVE_TOKENS = 2048  # keep this many tokens free for the response
 DEFAULT_TEMPERATURE = 0.5
 MAX_TOOL_ROUNDS = 5
+# Timeout for llama-server streaming requests (seconds)
+# Bumps the default 120s to 600s for training/code-generation tasks.
+LUCY_TIMEOUT = float(os.environ.get("LUCY_TIMEOUT", "600.0"))
 
 # Sandbox root for file operations
 SAFE_ROOT = Path("C:/Users/dimay").resolve()
@@ -63,6 +68,45 @@ SAFE_ROOT = Path("C:/Users/dimay").resolve()
 # DEV_API_KEY defaults to 'dev-harness' if not set. The /api/health endpoint
 # is public; all other /api/* routes require X-API-Key header or ?api_key= query param.
 import secrets
+import tiktoken
+
+# Use the gpt2 tokenizer as a lightweight, dependency-light BPE approximation.
+# The exact token count will differ from the model's native tokenizer, but it's
+# accurate enough for budgeting decisions. Calibration constant below is tuned
+# for typical English chat text on Qwen/Llama 2-style tokenizers.
+_TOKEN_ENCODER = tiktoken.get_encoding("gpt2")
+# Empirical multiplier to adjust gpt2 tokens → model-native tokens for
+# Qwen-style tokenizers (roughly 1:1.3). Tweak if budget feels off.
+_TOKEN_SCALE = 1.0
+
+def _count_tokens(text: str) -> int:
+    """Estimate token count for a string using the gpt2 BPE tokenizer.
+
+    Returns model-native token estimate (not raw BPE count).
+    """
+    try:
+        return max(1, int(len(_TOKEN_ENCODER.encode(text)) * _TOKEN_SCALE))
+    except Exception:
+        # Fallback: ~4 chars per token (very rough)
+        return max(1, len(text) // 4)
+
+def _count_message_tokens(messages: list) -> int:
+    """Rough token estimate for a list of OpenAI-format messages."""
+    total = 0
+    for msg in messages:
+        # Every message has role + content
+        total += 4  # overhead per message
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += _count_tokens(role) + _count_tokens(content)
+        elif isinstance(content, list):
+            # Multimodal content — estimate text tokens only
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total += _count_tokens(part.get("text", ""))
+    return total
+
 DEV_API_KEY = os.environ.get("DEV_API_KEY", "dev-harness")
 # Allow API key via query param for browser GET requests (e.g. fetch from static HTML)
 API_KEY_QUERY_PARAM = "api_key"
@@ -116,6 +160,15 @@ _conn.execute(f"""
         session_id  TEXT NOT NULL,
         role        TEXT NOT NULL,
         content     TEXT NOT NULL,
+        created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', '{_tz_mod}'))
+    )
+""")
+_conn.execute(f"""
+    CREATE TABLE IF NOT EXISTS summaries (
+        session_id  TEXT NOT NULL,
+        summary     TEXT NOT NULL,
+        msg_count   INTEGER NOT NULL,
+        token_count INTEGER NOT NULL,
         created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', '{_tz_mod}'))
     )
 """)
@@ -901,7 +954,7 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float = 
         round_num += 1
         tool_calls_seen = False
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=LUCY_TIMEOUT) as client:
             # Resolve available tools from active skills (dynamic skill→tool mapping)
             available_tools = _resolve_skills_to_tools(skill_list) if skill_list else TOOLS
             payload = {
@@ -1030,7 +1083,7 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float = 
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=LUCY_TIMEOUT) as client:
             async with client.stream("POST", LLAMACPP_API_URL + "/chat/completions", json=payload) as resp:
                 if resp.status_code == 200:
                     async for line in resp.aiter_lines():
