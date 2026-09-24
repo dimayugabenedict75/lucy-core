@@ -1,0 +1,21 @@
+<svg id="lucy-avatar" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+    <!-- Face Shape -->
+    <path id="face-shape" d="M30,30 Q10,30 10,50 Q10,75 30,75 Q50,90 70,75 Q90,75 90,50 Q90,30 70,30 Z" 
+          fill="#E0F7FA" stroke="#00B0FF" stroke-width="1"/>
+    
+    <!-- Eyes -->
+    <circle id="left-eye" cx="35" cy="45" r="5" fill="#333" />
+    <circle id="right-eye" cx="65" cy="45" r="5" fill="#333" />
+    
+    <!-- Mouth -->
+    <path id="mouth" d="M40,60 Q50,70 60,60" 
+          stroke="#333" stroke-width="2" fill="none" stroke-linecap="round" />
+          
+    <!-- Personality Glow (Light vs Dark) -->
+    <defs>
+        <filter id="glow">
+            <feGaussianBlur stdDeviation="1.5" result="blur" />
+            <feComposite in="SourceGraphic" in2="blur" operator="over" />
+        </filter>
+    </defs>
+</svg>

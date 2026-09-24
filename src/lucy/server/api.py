@@ -172,7 +172,23 @@ _conn.execute(f"""
         created_at  TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', '{_tz_mod}'))
     )
 """)
+_conn.execute("""
+    CREATE TABLE IF NOT EXISTS connectors (
+        connector_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+        name          TEXT NOT NULL UNIQUE,
+        token         TEXT,
+        created_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+        updated_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
+    )
+""")
 _conn.commit()
+
+
+def _mask_token(token: str) -> str:
+    """Mask a token for display: show last 4 chars, rest as asterisks."""
+    if not token or len(token) < 4:
+        return "****"
+    return "*" * (len(token) - 4) + token[-4:]
 
 
 def _session_exists(session_id: str) -> bool:
@@ -1355,9 +1371,104 @@ async def serve_file(path: str, _: bool = Depends(verify_api_key)):
 
 
 @app.get("/api/skills")
-async def list_skills(_: bool = Depends(verify_api_key)):
-    """Lists all available skills for the frontend."""
-    return {"skills": _skills_manager.list_skills()}
+async def list_skills(_ = Depends(verify_api_key)):
+    """Lists all available skills for the frontend.
+
+    Returns skills with: id, name, trigger, instructions, tools, category, source.
+    """
+    rows = _conn.execute(
+        "SELECT skill_id, name, trigger, instructions, tools, category, source, "
+        "created_at, updated_at FROM skills ORDER BY category, name"
+    ).fetchall()
+    skills = []
+    for row in rows:
+        tools_list = []
+        if row["tools"]:
+            try:
+                tools_list = json.loads(row["tools"])
+            except (json.JSONDecodeError, TypeError):
+                tools_list = []
+        skills.append({
+            "id": row["skill_id"],
+            "name": row["name"],
+            "trigger": row["trigger"],
+            "instructions": row["instructions"],
+            "tools": tools_list,
+            "category": row["category"],
+            "source": row["source"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        })
+    return {"skills": skills}
+
+
+@app.get("/api/connectors")
+async def get_connectors(_ = Depends(verify_api_key)):
+    """Returns all connectors with masked tokens."""
+    rows = _conn.execute(
+        "SELECT connector_id, name, token, created_at, updated_at FROM connectors ORDER BY name"
+    ).fetchall()
+    connectors = []
+    for row in rows:
+        connectors.append({
+            "id": row["connector_id"],
+            "name": row["name"],
+            "masked_token": _mask_token(row["token"]) if row["token"] else None,
+            "has_token": bool(row["token"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        })
+    return {"connectors": connectors}
+
+
+@app.post("/api/connectors")
+async def create_connector(request: Request, _ = Depends(verify_api_key)):
+    """Add a new connector. Body: { name, token }"""
+    body = await request.json()
+    name = body.get("name", "").strip()
+    token = body.get("token", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Connector name is required")
+    with _db_lock:
+        _conn.execute(
+            "INSERT OR IGNORE INTO connectors (name, token) VALUES (?, ?)",
+            (name, token),
+        )
+        _conn.commit()
+    row = _conn.execute(
+        "SELECT connector_id, name FROM connectors WHERE name = ?", (name,)
+    ).fetchone()
+    return {"status": "ok", "id": row["connector_id"], "name": row["name"]}
+
+
+@app.patch("/api/connectors/{connector_id}")
+async def update_connector(connector_id: int, request: Request, _ = Depends(verify_api_key)):
+    """Update a connector's token. Body: { token }"""
+    body = await request.json()
+    token = body.get("token", "").strip()
+    with _db_lock:
+        result = _conn.execute(
+            "UPDATE connectors SET token = ?, updated_at = strftime('%Y-%m-%d %H:%M:%S', 'now') "
+            "WHERE connector_id = ?",
+            (token, connector_id),
+        )
+        _conn.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Connector not found")
+    return {"status": "ok", "id": connector_id}
+
+
+@app.delete("/api/connectors/{connector_id}")
+async def delete_connector(connector_id: int, _ = Depends(verify_api_key)):
+    """Delete a connector."""
+    with _db_lock:
+        result = _conn.execute(
+            "DELETE FROM connectors WHERE connector_id = ?", (connector_id,)
+        )
+        _conn.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Connector not found")
+    return {"status": "deleted", "id": connector_id}
 
 
 @app.post("/api/skills/learn")
@@ -1510,19 +1621,239 @@ async def create_session(_: bool = Depends(verify_api_key)):
     return {"session_id": session_id, "title": "New Session", "message_count": 0, "updated_at": now}
 
 
+# === Timezone settings via TimeAPI.io with caching ===
+
+import time as _time_mod  # noqa: E402
+
+_TIMEZONE_CACHE_PATH = "C:/Users/dimay/Lucy/Lucy_Core/runtime/tz_cache.json"
+_TIMEZONE_CACHE_MAX_AGE = 24 * 3600  # 24 hours
+_timezone_cache: dict | None = None
+_timezone_cache_expires: float = 0.0
+
+
+def _load_timezone_cache() -> dict | None:
+    """Load cached timezone list from disk, if fresh enough."""
+    global _timezone_cache, _timezone_cache_expires
+    if _timezone_cache is not None and _time_mod.time() < _timezone_cache_expires:
+        return _timezone_cache
+    cache_path = Path(_TIMEZONE_CACHE_PATH)
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text())
+            if cached.get("_expires", 0) > _time_mod.time():
+                _timezone_cache = cached
+                _timezone_cache_expires = cached["_expires"]
+                return _timezone_cache
+        except Exception:
+            pass
+    return None
+
+
+def _save_timezone_cache(data: dict):
+    """Persist timezone list to disk for future requests."""
+    global _timezone_cache, _timezone_cache_expires
+    data["_expires"] = _time_mod.time() + _TIMEZONE_CACHE_MAX_AGE
+    _timezone_cache = data
+    _timezone_cache_expires = data["_expires"]
+    try:
+        Path(_TIMEZONE_CACHE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        Path(_TIMEZONE_CACHE_PATH).write_text(json.dumps(data, ensure_ascii=False))
+    except Exception as e:
+        logger.debug(f"Failed to save timezone cache: {e}")
+
+
+# Static fallback list (kept for offline resilience)
+_STATIC_TIMEZONES = [
+    {"value": "system", "label": "System Default"},
+    {"value": "utc", "label": "UTC"},
+    {"value": "+08:00", "label": "GMT+8 (Beijing, Singapore)"},
+    {"value": "+00:00", "label": "GMT+0 (London)"},
+    {"value": "-05:00", "label": "GMT-5 (New York)"},
+    {"value": "-08:00", "label": "GMT-8 (Los Angeles)"},
+]
+
+
+def _fetch_timezone_zones_local() -> list[str]:
+    """Get IANA timezone names from Python's zoneinfo (local, no network)."""
+    from zoneinfo import available_timezones
+    zones = sorted(available_timezones())
+    # Filter out some known-invalid / internal zones
+    return [z for z in zones if z and not z.lower().startswith("factory")]
+
+
+def _resolve_zone_offset_local(zone: str) -> int | None:
+    """Resolve the current UTC offset for a zone using zoneinfo (local)."""
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+    try:
+        tz = ZoneInfo(zone)
+        now = datetime.now(tz)
+        offset = now.utcoffset()
+        if offset is not None:
+            return int(offset.total_seconds())
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_timezone_zones() -> list[str]:
+    """Fetch the list of IANA timezone names from TimeAPI.io."""
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        resp = await client.get(
+            "https://timeapi.io/api/timezone/availabletimezones",
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code == 200:
+            zones = resp.json()
+            if isinstance(zones, list):
+                return zones
+    raise RuntimeError(f"TimeAPI returned status {resp.status_code if resp else 'N/A'}")
+
+
+async def _resolve_zone_offsets(client: httpx.AsyncClient, zones: list[str]) -> dict:
+    """Resolve UTC offsets for IANA zone strings via TimeAPI.io.
+
+    Returns {zone_name: offset_seconds}. Parallel with semaphore=5 and
+    429-retry-with-backoff to handle TimeAPI rate limiting.
+    """
+    import time as _t
+    results: dict[str, int] = {}
+    semaphore = asyncio.Semaphore(5)
+
+    async def _fetch_one(zone: str):
+        async with semaphore:
+            for attempt in range(3):
+                try:
+                    resp = await client.get(
+                        f"https://timeapi.io/api/TimeZone/zone?timeZone={zone}",
+                        headers={"Accept": "application/json"},
+                    )
+                    if resp.status_code == 429:
+                        _t.sleep(0.5 * (2 ** attempt))
+                        continue
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        secs = data.get("currentUtcOffset", {}).get("seconds")
+                        if secs is not None:
+                            results[zone] = secs
+                    return
+                except Exception:
+                    if attempt < 2:
+                        _t.sleep(0.2 * (attempt + 1))
+                        continue
+                    return
+
+    # Process in small batches to avoid overwhelming TimeAPI
+    batch_size = 10
+    for i in range(0, len(zones), batch_size):
+        batch = zones[i:i + batch_size]
+        tasks = [_fetch_one(z) for z in batch]
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(0.3)
+
+    return results
+
+
+def _format_offset_label(seconds: int) -> str:
+    """Convert offset seconds to 'UTC+8' / 'UTC-5:30' style."""
+    sign = "+" if seconds >= 0 else "-"
+    abs_sec = abs(seconds)
+    hours = abs_sec // 3600
+    minutes = (abs_sec % 3600) // 60
+    if minutes:
+        return f"UTC{sign}{hours}:{minutes:02d}"
+    return f"UTC{sign}{hours}"
+
+
+def _build_timezone_list(zones: list[str], offset_map: dict) -> list[dict]:
+    """Build the label/value list for the frontend from live zone data."""
+    def _sort_key(zone: str):
+        return (offset_map.get(zone, 0), zone)
+
+    items = []
+    seen_values = {"system", "utc"}
+    items.append({"value": "system", "label": "System Default"})
+    items.append({"value": "utc", "label": "UTC"})
+
+    for zone in sorted(zones, key=_sort_key):
+        if zone in seen_values:
+            continue
+        seen_values.add(zone)
+        offset = offset_map.get(zone)
+        label_zone = zone.replace("_", " ")
+        if offset is not None:
+            items.append({
+                "value": zone,
+                "label": f"{_format_offset_label(offset)} {label_zone}",
+            })
+        else:
+            items.append({
+                "value": zone,
+                "label": label_zone,
+            })
+    return items
+
+
+async def _refresh_timezone_cache():
+    """One-shot: build full zone list with offsets and cache to disk.
+
+    Primary source: Python's zoneinfo (local, instant, DST-aware, no network).
+    Fallback source: TimeAPI.io (network, ~60s for 597 zones).
+    Cached for 24h. On total failure, keeps existing cache or static fallback.
+    """
+    # --- Primary: local zoneinfo (instant, no network, DST-aware) ---
+    try:
+        zones = _fetch_timezone_zones_local()
+        offset_map = {}
+        for zone in zones:
+            secs = _resolve_zone_offset_local(zone)
+            if secs is not None:
+                offset_map[zone] = secs
+        available = _build_timezone_list(zones, offset_map)
+        _save_timezone_cache({"timezones": available, "_source": "zoneinfo_local"})
+        logger.info(f"Timezone cache refreshed from zoneinfo: {len(available)} zones, "
+                    f"{len(offset_map)} with resolved offsets")
+        return
+    except Exception as e:
+        logger.warning(f"zoneinfo local timezone resolution failed: {e}; falling back to TimeAPI.io")
+
+    # --- Fallback: TimeAPI.io (network) ---
+    try:
+        zones = await _fetch_timezone_zones()
+        logger.info(f"TimeAPI returned {len(zones)} zones; resolving offsets...")
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            offset_map = await _resolve_zone_offsets(client, zones)
+        available = _build_timezone_list(zones, offset_map)
+        _save_timezone_cache({"timezones": available, "_source": "timeapi_io"})
+        logger.info(f"Timezone cache refreshed from TimeAPI.io: {len(available)} zones total, "
+                    f"{len(offset_map)} with resolved offsets")
+    except Exception as e:
+        logger.warning(f"Failed to refresh timezone cache from TimeAPI.io: {e}")
+
+
 @app.get("/api/settings/timezone")
 async def get_timezone_setting(_ = Depends(verify_api_key)):
-    """Returns the current timezone configuration."""
+    """Returns the current timezone configuration with live IANA zone list.
+
+    Zone list is resolved once from Python's zoneinfo (instant, local, DST-aware)
+    and cached for 24h. Falls back to TimeAPI.io if zoneinfo/tzdata is unavailable,
+    then to a static list if the network is unreachable.
+    """
     row = _conn.execute("SELECT value FROM tz_config WHERE key = 'timezone'").fetchone()
     tz = row["value"] if row else "system"
-    return {"timezone": tz, "available_timezones": [
-        {"value": "system", "label": "System Default"},
-        {"value": "utc", "label": "UTC"},
-        {"value": "+08:00", "label": "GMT+8 (Beijing, Singapore)"},
-        {"value": "+00:00", "label": "GMT+0 (London)"},
-        {"value": "-05:00", "label": "GMT-5 (New York)"},
-        {"value": "-08:00", "label": "GMT-8 (Los Angeles)"},
-    ]}
+
+    # Try cache first (in-memory or on-disk)
+    cached = _load_timezone_cache()
+    if cached and cached.get("timezones"):
+        available = cached["timezones"]
+    else:
+        # Cache miss — perform refresh. zoneinfo is instant; TimeAPI fallback ~60s.
+        logger.info("Timezone cache cold — performing refresh...")
+        await _refresh_timezone_cache()
+        cached = _load_timezone_cache()
+        available = cached.get("timezones", []) if cached else _STATIC_TIMEZONES
+
+    return {"timezone": tz, "available_timezones": available}
 
 
 @app.post("/api/settings/timezone")

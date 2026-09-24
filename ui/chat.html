@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Lucy Core</title>
     <link rel="stylesheet" href="/chat.css?v=3">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -33,10 +33,18 @@
         </div>
     </div>
 
+    <!-- Mobile sidebar backdrop -->
+    <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
     <!-- Main Chat -->
     <div class="main-chat">
         <div class="header">
-            <span class="header-title">Lucy</span>
+            <div class="header-left">
+                <button id="mobileMenuBtn" class="mobile-menu-btn" title="Sessions">
+                    <span>☰</span>
+                </button>
+                <span class="header-title">Lucy</span>
+            </div>
             <div class="header-actions">
                 <span class="status-dot" id="statusDot"></span>
                 <span style="color: #00E5FF;" id="statusText">Connected</span>
@@ -169,14 +177,12 @@
                             <thead>
                                 <tr>
                                     <th>Name</th>
-                                    <th>Description</th>
                                     <th>Status</th>
-                                    <th></th>
                                 </tr>
                             </thead>
                             <tbody id="skillsTableBody">
                                 <tr>
-                                    <td colspan="4" class="settings-table-empty">No skills loaded yet — will sync from
+                                    <td colspan="2" class="settings-table-empty">No skills loaded yet — will sync from
                                         skills.sqlite</td>
                                 </tr>
                             </tbody>
@@ -202,15 +208,31 @@
                             </thead>
                             <tbody id="connectorsTableBody">
                                 <tr>
-                                    <td>GitHub</td>
-                                    <td class="settings-token">***********************************</td>
-                                    <td class="settings-row-actions"><button class="settings-row-btn"
-                                            onclick="editConnector('github')">Edit</button></td>
+                                    <td colspan="2" class="settings-table-empty">No connectors configured yet</td>
                                 </tr>
                             </tbody>
                         </table>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Token Entry Modal -->
+    <div class="token-modal-overlay" id="tokenModal" onclick="closeTokenModal()">
+        <div class="token-modal" onclick="event.stopPropagation()">
+            <div class="token-modal-header">
+                <span class="token-modal-title" id="tokenModalName">Add Token</span>
+                <button class="token-modal-close" onclick="closeTokenModal()">×</button>
+            </div>
+            <div class="token-modal-body">
+                <input type="hidden" id="tokenModalId">
+                <input type="hidden" id="tokenModalConnectorName">
+                <input type="password" id="tokenModalInput" placeholder="Enter token here..." class="token-modal-input">
+            </div>
+            <div class="token-modal-footer">
+                <button class="token-modal-btn token-modal-cancel" onclick="closeTokenModal()">Cancel</button>
+                <button class="token-modal-btn token-modal-save" onclick="saveToken()">Save</button>
             </div>
         </div>
     </div>
@@ -261,11 +283,44 @@
         // Sidebar toggle
         const sidebar = document.getElementById('sidebar');
         const sidebarToggleBtn = document.getElementById('sidebarToggle');
+        const mobileMenuBtn = document.getElementById('mobileMenuBtn');
+        const sidebarBackdrop = document.getElementById('sidebarBackdrop');
+        const mobileQuery = window.matchMedia('(max-width: 768px)');
+
+        function openMobileSidebar() {
+            sidebar.classList.add('mobile-open');
+            sidebarBackdrop.classList.add('active');
+        }
+
+        function closeMobileSidebar() {
+            sidebar.classList.remove('mobile-open');
+            sidebarBackdrop.classList.remove('active');
+        }
+
         if (sidebarToggleBtn && sidebar) {
             sidebarToggleBtn.addEventListener('click', () => {
-                sidebarCollapsed = !sidebarCollapsed;
-                sidebar.classList.toggle('collapsed', sidebarCollapsed);
+                if (mobileQuery.matches) {
+                    // On mobile the same button just closes the drawer
+                    closeMobileSidebar();
+                } else {
+                    sidebarCollapsed = !sidebarCollapsed;
+                    sidebar.classList.toggle('collapsed', sidebarCollapsed);
+                }
             });
+        }
+
+        if (mobileMenuBtn) {
+            mobileMenuBtn.addEventListener('click', () => {
+                if (sidebar.classList.contains('mobile-open')) {
+                    closeMobileSidebar();
+                } else {
+                    openMobileSidebar();
+                }
+            });
+        }
+
+        if (sidebarBackdrop) {
+            sidebarBackdrop.addEventListener('click', closeMobileSidebar);
         }
 
         messageInput.focus();
@@ -320,6 +375,7 @@
             chatContainer.innerHTML = '';
             renderHistory();
             messageInput.focus();
+            if (mobileQuery.matches) closeMobileSidebar();
         }
 
         function formatTime(ts) {
@@ -432,6 +488,7 @@
             scrollToBottom();
             messageInput.focus();
             renderHistory();
+            if (mobileQuery.matches) closeMobileSidebar();
         }
 
         async function deleteSession(id, event) {
@@ -954,26 +1011,31 @@
         const skillsTableBody = document.getElementById('skillsTableBody');
 
         async function loadSkills() {
-            // TODO: fetch(`/api/skills?api_key=${API_KEY}`) and call renderSkills(data.skills)
+            try {
+                const resp = await fetch(`/api/skills?api_key=${API_KEY}`);
+                const data = await resp.json();
+                renderSkills(data.skills);
+            } catch (e) {
+                console.error('Failed to load skills:', e);
+            }
         }
 
         function renderSkills(skills) {
             if (!skillsTableBody) return;
             if (!skills || skills.length === 0) {
-                skillsTableBody.innerHTML = '<tr><td colspan="4" class="settings-table-empty">No skills loaded yet — will sync from skills.sqlite</td></tr>';
+                skillsTableBody.innerHTML = '<tr><td colspan="2" class="settings-table-empty">No skills loaded yet</td></tr>';
                 return;
             }
-            skillsTableBody.innerHTML = skills.map(s => `
-                <tr data-name="${(s.name || '').toLowerCase()}">
-                    <td>${s.name || ''}</td>
-                    <td>${s.description || ''}</td>
-                    <td>${s.enabled ? 'Enabled' : 'Disabled'}</td>
-                    <td class="settings-row-actions">
-                        <button class="settings-row-btn" onclick="toggleSkill('${s.id}')">${s.enabled ? 'Disable' : 'Enable'}</button>
-                        <button class="settings-row-btn" onclick="removeSkill('${s.id}')">Remove</button>
-                    </td>
-                </tr>
-            `).join('');
+            skillsTableBody.innerHTML = skills.map(s => {
+                const status = s.source || 'unknown';
+                const statusClass = status === 'learned' ? 'status-learned' : 'status-imported';
+                return `
+                    <tr data-name="${(s.name || '').toLowerCase()}">
+                        <td>${s.name || ''}</td>
+                        <td><span class="skill-status ${statusClass}">${status}</span></td>
+                    </tr>
+                `;
+            }).join('');
         }
 
         function filterSkills() {
@@ -1003,25 +1065,35 @@
         const connectorsTableBody = document.getElementById('connectorsTableBody');
 
         async function loadConnectors() {
-            // TODO: fetch(`/api/connectors?api_key=${API_KEY}`) and call renderConnectors(data.connectors)
+            try {
+                const resp = await fetch(`/api/connectors?api_key=${API_KEY}`);
+                const data = await resp.json();
+                renderConnectors(data.connectors);
+            } catch (e) {
+                console.error('Failed to load connectors:', e);
+                connectorsTableBody.innerHTML = '<tr><td colspan="2" class="settings-table-empty">Failed to load connectors</td></tr>';
+            }
         }
 
         function renderConnectors(connectors) {
             if (!connectorsTableBody) return;
             if (!connectors || connectors.length === 0) {
-                connectorsTableBody.innerHTML = '<tr><td colspan="3" class="settings-table-empty">No connectors configured yet</td></tr>';
+                connectorsTableBody.innerHTML = '<tr><td colspan="2" class="settings-table-empty">No connectors configured yet</td></tr>';
                 return;
             }
-            connectorsTableBody.innerHTML = connectors.map(c => `
-                <tr data-name="${(c.name || '').toLowerCase()}">
-                    <td>${c.name || ''}</td>
-                    <td class="settings-token">${c.masked_token || '***********************************'}</td>
-                    <td class="settings-row-actions">
-                        <button class="settings-row-btn" onclick="editConnector('${c.id}')">Edit</button>
-                        <button class="settings-row-btn" onclick="removeConnector('${c.id}')">Remove</button>
-                    </td>
-                </tr>
-            `).join('');
+            connectorsTableBody.innerHTML = connectors.map(c => {
+                const masked = c.masked_token || 'Not set';
+                return `
+                    <tr data-name="${(c.name || '').toLowerCase()}">
+                        <td>${c.name || ''}</td>
+                        <td class="settings-token">${masked}</td>
+                        <td class="settings-row-actions">
+                            <button class="settings-row-btn" onclick="editConnector('${c.id}')">Edit</button>
+                            <button class="settings-row-btn" onclick="removeConnector('${c.id}')">Remove</button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
         }
 
         function filterConnectors() {
@@ -1032,19 +1104,68 @@
         }
 
         function addConnector() {
-            const query = document.getElementById('connectorSearchInput').value.trim();
-            // TODO: POST to backend to add a connector (e.g. /api/connectors)
-            console.log('Add connector requested:', query);
+            const name = document.getElementById('connectorSearchInput').value.trim();
+            if (!name) {
+                alert('Please enter a connector name');
+                return;
+            }
+            openTokenModal(name, null);
         }
 
-        function editConnector(id) {
-            // TODO: open a token-entry flow and PATCH to backend
-            console.log('Edit connector:', id);
+        function openTokenModal(name, id) {
+            const modal = document.getElementById('tokenModal');
+            const modalTitle = document.getElementById('tokenModalName');
+            const modalInput = document.getElementById('tokenModalInput');
+            const modalId = document.getElementById('tokenModalId');
+            const modalName = document.getElementById('tokenModalConnectorName');
+            modalTitle.textContent = id ? `Edit "${name}"` : `Add "${name}"`;
+            modalId.value = id || '';
+            modalName.value = name;
+            modalInput.value = '';
+            modal.style.display = 'flex';
+            modalInput.focus();
+            modalInput.onkeyup = (e) => {
+                if (e.key === 'Enter') saveToken();
+            };
         }
 
-        function removeConnector(id) {
-            // TODO: DELETE to backend to remove a connector
-            console.log('Remove connector:', id);
+        function closeTokenModal() {
+            document.getElementById('tokenModal').style.display = 'none';
+        }
+
+        async function saveToken() {
+            const id = document.getElementById('tokenModalId').value;
+            const name = document.getElementById('tokenModalConnectorName').value;
+            const token = document.getElementById('tokenModalInput').value.trim();
+            const endpoint = id ? `/api/connectors/${id}?api_key=${API_KEY}` : `/api/connectors?api_key=${API_KEY}`;
+            const method = id ? 'PATCH' : 'POST';
+            try {
+                await fetch(endpoint, {
+                    method: method,
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(id ? {token} : {name, token})
+                });
+                closeTokenModal();
+                loadConnectors();
+            } catch (e) {
+                console.error('Failed to save connector:', e);
+            }
+        }
+
+        async function editConnector(id) {
+            // Fetch the connector to get its name
+            const resp = await fetch(`/api/connectors?api_key=${API_KEY}`);
+            const data = await resp.json();
+            const connector = data.connectors.find(c => c.id == id);
+            if (connector) {
+                openTokenModal(connector.name, id);
+            }
+        }
+
+        async function removeConnector(id) {
+            if (!confirm('Remove this connector?')) return;
+            await fetch(`/api/connectors/${id}?api_key=${API_KEY}`, {method: 'DELETE'});
+            loadConnectors();
         }
 
         async function restartServer() {

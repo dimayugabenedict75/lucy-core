@@ -17,6 +17,7 @@
 html,
 body {
     height: 100%;
+    height: 100dvh;
     font-family: 'VT323', monospace;
     background: var(--bg-deep);
     color: #e0e0e0;
@@ -32,6 +33,40 @@ body {
     display: flex;
     width: 100%;
     height: 100vh;
+    height: 100dvh;
+}
+
+/* ===== MOBILE MENU BUTTON (hidden on desktop) ===== */
+.mobile-menu-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border: 1px solid #333;
+    background: transparent;
+    border-radius: 8px;
+    color: var(--cyan);
+    font-size: 16px;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-right: 4px;
+}
+
+/* ===== MOBILE SIDEBAR BACKDROP ===== */
+.sidebar-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 150;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+}
+
+.sidebar-backdrop.active {
+    display: block;
+    opacity: 1;
 }
 
 /* ===== SIDEBAR ===== */
@@ -293,6 +328,12 @@ body {
     font-weight: 500;
     color: var(--cyan);
     letter-spacing: -0.3px;
+}
+
+.header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 .header-actions {
@@ -600,6 +641,7 @@ body {
     padding: 20px;
     width: 90%;
     max-width: 620px;
+    height: 82vh;
     max-height: 82vh;
     display: flex;
     flex-direction: column;
@@ -713,22 +755,28 @@ body {
 }
 
 .settings-panels {
+    flex: 1;
     overflow-y: auto;
     min-height: 0;
+    display: flex;
 }
 
 .settings-panel {
     display: none;
+    width: 100%;
+    flex-direction: column;
+    min-height: 0;
 }
 
 .settings-panel.active {
-    display: block;
+    display: flex;
 }
 
 .settings-toolbar {
     display: flex;
     gap: 8px;
     margin-bottom: 12px;
+    flex-shrink: 0;
 }
 
 .settings-toolbar input[type="text"] {
@@ -769,7 +817,8 @@ body {
     border: 1px solid #222;
     border-radius: 8px;
     overflow: hidden auto;
-    max-height: 260px;
+    flex: 1;
+    min-height: 0;
 }
 
 .settings-table {
@@ -806,6 +855,139 @@ body {
     text-align: center;
     color: #555;
     padding: 18px !important;
+}
+
+.skill-status {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: lowercase;
+}
+
+#skillsTable th:last-child,
+#skillsTable td:last-child {
+    width: 100px;
+    text-align: right;
+}
+
+#skillsTable td:first-child {
+    font-weight: 500;
+    color: #ddd;
+}
+
+.status-learned {
+    background: rgba(0, 229, 255, 0.15);
+    color: var(--cyan);
+    border: 1px solid var(--cyan);
+}
+
+.status-imported {
+    background: rgba(117, 117, 117, 0.2);
+    color: var(--gray);
+    border: 1px solid #444;
+}
+
+/* ===== TOKEN ENTRY MODAL ===== */
+.token-modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+}
+
+.token-modal {
+    background: var(--bg-card);
+    border: 1px solid #333;
+    border-radius: var(--radius);
+    width: 400px;
+    max-width: 90vw;
+    box-shadow: 0 0 20px rgba(0, 229, 255, 0.2);
+}
+
+.token-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px 0 20px;
+}
+
+.token-modal-title {
+    font-size: 14px;
+    color: var(--gray);
+}
+
+.token-modal-close {
+    background: none;
+    border: none;
+    color: var(--gray);
+    font-size: 20px;
+    cursor: pointer;
+    padding: 0;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.token-modal-close:hover {
+    color: var(--cyan);
+}
+
+.token-modal-body {
+    padding: 20px;
+}
+
+.token-modal-input {
+    width: 100%;
+    padding: 10px 12px;
+    background: rgba(0, 0, 0, 0.5);
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #fff;
+    font-family: 'VT323', monospace;
+    font-size: 14px;
+}
+
+.token-modal-input:focus {
+    outline: none;
+    border-color: var(--cyan);
+}
+
+.token-modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 0 20px 20px 20px;
+}
+
+.token-modal-btn {
+    padding: 6px 16px;
+    border: 1px solid #333;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--gray);
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.token-modal-btn:hover {
+    border-color: var(--cyan);
+    color: var(--cyan);
+}
+
+.token-modal-save {
+    background: var(--cyan);
+    color: #000;
+    border-color: var(--cyan);
+    font-weight: 700;
 }
 
 .settings-token {
@@ -905,4 +1087,189 @@ body {
     margin: 8px 0;
     overflow-x: auto;
     font-size: 12px;
+}
+
+/* ===== MOBILE (≤768px) ===== */
+@media (max-width: 768px) {
+    .mobile-menu-btn {
+        display: flex;
+    }
+
+    /* Sidebar becomes an off-canvas drawer instead of squeezing the layout */
+    .sidebar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        z-index: 200;
+        width: 78vw;
+        max-width: 300px;
+        height: 100vh;
+        height: 100dvh;
+        padding: 16px;
+        padding-top: max(16px, env(safe-area-inset-top));
+        padding-bottom: max(16px, env(safe-area-inset-bottom));
+        transform: translateX(-100%);
+        box-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
+    }
+
+    .sidebar.mobile-open {
+        transform: translateX(0);
+    }
+
+    /* The desktop icon-rail collapse state doesn't apply on mobile */
+    .sidebar.collapsed {
+        width: 78vw;
+        max-width: 300px;
+        padding: 16px;
+        padding-top: max(16px, env(safe-area-inset-top));
+        padding-bottom: max(16px, env(safe-area-inset-bottom));
+    }
+
+    .sidebar.collapsed .sidebar-title,
+    .sidebar.collapsed .chat-history {
+        display: flex;
+    }
+
+    .sidebar.collapsed .sidebar-header .sidebar-title {
+        display: inline;
+    }
+
+    .sidebar.collapsed #newSessionBtn,
+    .sidebar.collapsed .new-session-btn,
+    .sidebar.collapsed #settingsBtn,
+    .sidebar.collapsed .settings-btn {
+        width: 100%;
+        height: auto;
+        border-radius: var(--radius);
+        padding: 8px 12px;
+        margin: 0 0 16px 0;
+    }
+
+    .sidebar.collapsed .sidebar-footer #settingsBtn,
+    .sidebar.collapsed .sidebar-footer .settings-btn {
+        margin-bottom: 0;
+    }
+
+    .sidebar.collapsed .new-session-btn .btn-text,
+    .sidebar.collapsed .settings-btn .btn-text {
+        display: inline;
+    }
+
+    .sidebar.collapsed .new-session-btn .btn-icon,
+    .sidebar.collapsed .settings-btn .btn-icon {
+        display: none;
+    }
+
+    #app-container {
+        position: relative;
+    }
+
+    .main-chat {
+        width: 100%;
+    }
+
+    /* Header */
+    .header {
+        height: 56px;
+        padding: 0 12px;
+        padding-top: env(safe-area-inset-top);
+        height: calc(56px + env(safe-area-inset-top));
+        gap: 8px;
+    }
+
+    .header-actions {
+        gap: 8px;
+    }
+
+    .header-actions>span:not(.status-dot) {
+        display: none;
+    }
+
+    .control-btn {
+        width: 36px;
+        height: 36px;
+    }
+
+    /* Chat area */
+    .chat-container {
+        padding: 14px 12px 8px;
+    }
+
+    .message-bubble {
+        max-width: 88%;
+        padding: 12px 14px;
+        font-size: 14px;
+    }
+
+    /* Input area, with room for the home-indicator on notched phones */
+    .input-area {
+        padding: 12px;
+        padding-bottom: max(12px, env(safe-area-inset-bottom));
+        gap: 6px;
+    }
+
+    .input-area input[type="text"] {
+        font-size: 16px;
+        /* 16px prevents iOS Safari from auto-zooming on focus */
+        padding: 12px 14px;
+    }
+
+    .input-area button#sendButton {
+        min-width: 44px;
+        min-height: 44px;
+        padding: 10px 16px;
+    }
+
+    .upload-btn {
+        width: 44px;
+        height: 44px;
+    }
+
+    /* Settings modal */
+    .settings-overlay.active {
+        align-items: flex-end;
+    }
+
+    .settings-modal {
+        width: 100%;
+        max-width: 100%;
+        height: 88vh;
+        max-height: 88vh;
+        border-radius: var(--radius) var(--radius) 0 0;
+        padding: 16px;
+        padding-bottom: max(16px, env(safe-area-inset-bottom));
+    }
+
+    .setting-group select,
+    .setting-group input[type="text"],
+    .setting-group input[type="number"] {
+        font-size: 16px;
+    }
+
+    .settings-toolbar input[type="text"] {
+        font-size: 16px;
+    }
+
+    .settings-tabs {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+        -ms-overflow-style: none;
+    }
+
+    .settings-tabs::-webkit-scrollbar {
+        display: none;
+    }
+
+    .settings-tab-btn {
+        flex-shrink: 0;
+    }
+
+    .settings-table-wrap {
+        overflow: auto;
+    }
+
+    #connectorsTable {
+        min-width: 460px;
+    }
 }
