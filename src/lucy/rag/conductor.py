@@ -55,7 +55,17 @@ class Conductor:
         return context
 
     def add_to_knowledge(self, text: str):
-        """Converts new text to vector and adds it to the knowledge store."""
+        """Converts new text to vector and adds it to the knowledge store.
+
+        Duplicate detection: if an identical text string already exists in
+        the store, skip insertion to prevent duplicate button-clicks from
+        creating noise.
+        """
+        # Dedup check — skip if exact text already stored
+        for doc in self.knowledge_store:
+            if doc.get("text") == text:
+                return
+
         new_doc = {"text": text}
         self.knowledge_store.append(new_doc)
 
