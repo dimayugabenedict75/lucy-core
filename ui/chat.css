@@ -160,6 +160,121 @@ body {
     margin-bottom: 16px;
 }
 
+/* ===== VOICE TOGGLE ===== */
+.voice-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    border: 1px solid #222;
+    border-radius: var(--radius);
+    flex-shrink: 0;
+    transition: all 0.2s;
+}
+
+.voice-toggle-row.voice-active {
+    border-color: var(--cyan);
+    box-shadow: 0 0 8px rgba(0, 229, 255, 0.25);
+}
+
+.voice-toggle-row.voice-pending {
+    opacity: 0.7;
+}
+
+.voice-toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #aaa;
+    transition: color 0.2s;
+}
+
+.voice-toggle-label .btn-icon {
+    display: none;
+    font-size: 14px;
+}
+
+.voice-toggle-row.voice-active .voice-toggle-label {
+    color: var(--cyan);
+}
+
+.voice-switch {
+    position: relative;
+    display: inline-block;
+    width: 34px;
+    height: 18px;
+    flex-shrink: 0;
+    cursor: pointer;
+}
+
+.voice-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.voice-switch-slider {
+    position: absolute;
+    inset: 0;
+    background: #222;
+    border: 1px solid #333;
+    border-radius: 20px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.voice-switch-slider::before {
+    content: "";
+    position: absolute;
+    height: 12px;
+    width: 12px;
+    left: 2px;
+    top: 2px;
+    background: var(--gray);
+    border-radius: 50%;
+    transition: all 0.2s;
+}
+
+.voice-switch input:checked+.voice-switch-slider {
+    background: rgba(0, 229, 255, 0.15);
+    border-color: var(--cyan);
+}
+
+.voice-switch input:checked+.voice-switch-slider::before {
+    transform: translateX(16px);
+    background: var(--cyan);
+    box-shadow: 0 0 6px var(--cyan);
+}
+
+.voice-switch input:disabled+.voice-switch-slider {
+    cursor: wait;
+    opacity: 0.6;
+}
+
+.sidebar.collapsed .voice-toggle-row {
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 0;
+    margin: 0 auto 12px;
+    width: 32px;
+    border-radius: var(--radius);
+}
+
+.sidebar.collapsed .voice-toggle-label .btn-text {
+    display: none;
+}
+
+.sidebar.collapsed .voice-toggle-label .btn-icon {
+    display: inline-flex;
+}
+
+.sidebar.collapsed .voice-switch {
+    transform: scale(0.85);
+}
+
 .sidebar-title {
     font-size: 13px;
     font-weight: 500;
@@ -308,7 +423,13 @@ body {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    height: 100vh;
+    min-height: 0;
+    /* No explicit height here on purpose: body is height:100dvh and this is
+       a flex row child of body, so it stretches to fill that automatically.
+       A hardcoded height:100vh here used to fight that — on mobile, 100vh
+       (largest possible viewport, address bar collapsed) can be taller than
+       the actual visible 100dvh viewport, and since body has overflow:hidden,
+       the overflow got clipped, cutting off content up near the top/header. */
 }
 
 .header {
@@ -393,6 +514,44 @@ body {
 .control-btn.stop:hover {
     background: #442222;
     color: #ff6666;
+}
+
+/* Logs button is text, so it needs to be wider than the 32px icon buttons */
+.control-btn.logs {
+    width: auto;
+    padding: 0 10px;
+}
+
+/* ===== LOGS MODAL ===== */
+.token-modal.logs-modal {
+    width: 760px;
+    max-width: 94vw;
+}
+
+.logs-content {
+    margin: 0;
+    height: 55vh;
+    overflow: auto;
+    padding: 10px 12px;
+    background: rgba(0, 0, 0, 0.6);
+    border: 1px solid #333;
+    border-radius: 6px;
+    color: #b8ffd9;
+    font-family: 'VT323', monospace;
+    font-size: 14px;
+    line-height: 1.3;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.logs-auto {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-right: auto;
+    font-size: 12px;
+    color: var(--gray);
+    cursor: pointer;
 }
 
 /* ===== CHAT CONTAINER ===== */
@@ -1272,4 +1431,53 @@ body {
     #connectorsTable {
         min-width: 460px;
     }
+}
+
+/* ===== STOP / QUEUE ===== */
+.input-area button#sendButton.stop-mode {
+    border-color: #ff6666;
+    color: #ff6666;
+}
+
+.queue-tray {
+    display: none;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 24px 0;
+}
+
+.queue-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 10px;
+    border: 1px dashed #335;
+    border-radius: 6px;
+    background: rgba(0, 255, 255, 0.04);
+    font-size: 14px;
+    color: #9aa;
+}
+
+.queue-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.queue-btn {
+    background: none;
+    border: 1px solid #335;
+    border-radius: 4px;
+    color: #9cc;
+    font-family: inherit;
+    font-size: 13px;
+    padding: 1px 8px;
+    cursor: pointer;
+}
+
+.queue-btn:hover {
+    border-color: var(--cyan, #00e5ff);
+    color: #fff;
 }
