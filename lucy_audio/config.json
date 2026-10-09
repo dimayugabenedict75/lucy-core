@@ -1,0 +1,16 @@
+{
+  "models": [
+    {
+      "id": "cielvox26",
+      "name": "Cielvox 2.6",
+      "path": "D:/AI/cielvox2/models/cielvox26.onnx",
+      "sample_rate": 24000,
+      "channels": 1
+    }
+  ],
+  "voice-dir": "D:/AI/cielvox2/voice-dir",
+  "threads": 8,
+  "backend": "vulkan",
+  "n-gpu-layers": 50,
+  "port": 8091
+}

@@ -14,8 +14,10 @@ import yaml
 from pathlib import Path
 from typing import Optional
 
-DB_PATH = "C:/Users/dimay/Lucy/Lucy_Core/runtime/sessions.sqlite"
-SKILLS_DIR = Path("C:/Users/dimay/Lucy/Lucy_Core/src/lucy/skills/definitions")
+from lucy.paths import RUNTIME as _RUNTIME
+
+DB_PATH = str(_RUNTIME / "sessions.sqlite")
+SKILLS_DIR = Path(__file__).resolve().parent / "definitions"
 
 
 class SkillsDatabase:

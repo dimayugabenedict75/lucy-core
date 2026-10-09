@@ -7,6 +7,7 @@ the EmbeddingEngine to turn text into vectors for semantic search.
 """
 
 from .embedding_engine import EmbeddingEngine
+from lucy.paths import RUNTIME
 from pathlib import Path
 import json
 
@@ -18,7 +19,7 @@ class Conductor:
         self.embedding_engine = EmbeddingEngine()
 
         # Define the internal vector storage location
-        self.vector_store_path = Path("C:/Users/dimay/Lucy/Lucy_Core/runtime/data/knowledge_store.json")
+        self.vector_store_path = RUNTIME / "data" / "knowledge_store.json"
 
         # Load the existing knowledge base (if it exists)
         self.knowledge_store = []
@@ -29,30 +30,31 @@ class Conductor:
         # Ensure the directory for our vector storage exists
         self.vector_store_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Below this cosine-similarity score, a stored fact is treated as
+    # "not actually relevant" and left out, rather than force-fed to the
+    # model just because it happened to be the least-bad match.
+    MIN_RELEVANCE = 0.08
+
     def retrieve_context(self, query: str, top_k: int = 3):
         """
         Finds the most relevant context for a query.
-        1. Convert query to vector
-        2. Find the most relevant 'chunks' in our library
-        3. Return the 'context' to be injected into the prompt
+        1. Rank every stored fact against the query using one shared vocabulary
+        2. Drop anything below MIN_RELEVANCE
+        3. Return the top_k results as context to inject into the prompt,
+           or "" (falsy) if nothing relevant was found — callers should skip
+           injecting a [USER FACTS] block entirely in that case.
         """
         if not self.knowledge_store:
-            return "No prior knowledge found."
+            return ""
 
-        # Calculate similarity between the query and each document
-        rankings = []
-        for doc in self.knowledge_store:
-            sim = self.embedding_engine.compare(query, doc["text"])
-            rankings.append((sim, doc))
+        texts = [doc["text"] for doc in self.knowledge_store]
+        ranked = self.embedding_engine.rank(query, texts)
+        top_docs = [self.knowledge_store[idx] for score, idx in ranked[:top_k] if score >= self.MIN_RELEVANCE]
 
-        # Sort by similarity (descending)
-        rankings.sort(key=lambda x: x[0], reverse=True)
+        if not top_docs:
+            return ""
 
-        # Return the top_k results
-        top_docs = rankings[:top_k]
-        context = "\n---\n".join([doc["text"] for _, doc in top_docs])
-        
-        return context
+        return "\n---\n".join(doc["text"] for doc in top_docs)
 
     def add_to_knowledge(self, text: str):
         """Converts new text to vector and adds it to the knowledge store.

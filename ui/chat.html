@@ -5,23 +5,49 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Lucy Core</title>
-    <link rel="stylesheet" href="/chat.css?v=3">
+    <meta name="theme-color" content="#000000">
+    <script>
+        // Apply the saved theme before first paint (no flash). Full logic is in chat.js.
+        try { var t = localStorage.getItem('lucy.theme'); if (t === 'light' || t === 'dark') {
+            document.documentElement.setAttribute('data-theme', t);
+            document.querySelector('meta[name="theme-color"]').setAttribute('content', t === 'light' ? '#ffffff' : '#000000');
+        } } catch (e) {}
+    </script>
+    <link rel="stylesheet" href="/chat.css?v=__CSS_VERSION__">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Syntax highlighting for the file viewer and code blocks. Pinned version + integrity hashes.
+         If these cannot load (offline, blocked), code is simply shown as plain text. -->
+    <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js"
+        integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/languages/powershell.min.js"
+        integrity="sha384-LWJZQx0dgGhEK7snfNYrQs5K+QKD1sOmE02sOQCz4br9UmqSJDvPLoUVFaUyFnjq" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/languages/dos.min.js"
+        integrity="sha384-6+/BHm9a7L7KFZE/myAKBddEjwfPovVtBzDrEu/6VqocfSqvRMyM+Lf3k9n89yGH" crossorigin="anonymous"></script>
 </head>
 
 <body>
     <!-- Sidebar -->
     <div class="sidebar" id="sidebar">
-        <div class="sidebar-header">
-            <span class="sidebar-title">Sessions</span>
-            <button id="sidebarToggle" class="sidebar-toggle" title="Collapse sidebar">
-                <span class="sidebar-toggle-icon">›</span>
-            </button>
+        <button id="sidebarToggle" class="sidebar-toggle" title="Collapse sidebar">
+            <span class="sidebar-toggle-icon">›</span>
+        </button>
+        <div class="voice-toggle-row" id="voiceToggleRow" title="Voice (Stelnet Audio Server)">
+            <span class="voice-toggle-label">
+                <span class="btn-icon">&#x1F399;</span>
+                <span class="btn-text">Voice</span>
+            </span>
+            <label class="voice-switch">
+                <input type="checkbox" id="voiceToggle" onchange="toggleVoice(this.checked)">
+                <span class="voice-switch-slider"></span>
+            </label>
         </div>
         <button class="new-session-btn" id="newSessionBtn" onclick="newSession()" title="New Session">
             <span class="btn-icon">+</span>
             <span class="btn-text">+ New Session</span>
         </button>
+        <div class="sidebar-header">
+            <span class="sidebar-title">Sessions</span>
+        </div>
         <div class="chat-history" id="chatHistory">
             <!-- Session history populated dynamically -->
         </div>
@@ -47,8 +73,11 @@
             </div>
             <div class="header-actions">
                 <span class="status-dot" id="statusDot"></span>
-                <span style="color: #00E5FF;" id="statusText">Connected</span>
+                <span style="color: var(--accent);" id="statusText">Connected</span>
                 <div style="display: flex; gap: 8px; align-items: center;">
+                    <button id="logsBtn" class="control-btn logs" title="View server logs" onclick="openLogsModal()">
+                        <span style="font-size: 12px; letter-spacing: 1px;">LOGS</span>
+                    </button>
                     <button id="restartBtn" class="control-btn" title="Restart Lucy Core" onclick="restartServer()">
                         <span style="font-size: 16px;">↻</span>
                     </button>
@@ -68,14 +97,27 @@
             </div>
         </div>
 
-        <div class="input-area">
+        <form class="input-area" id="chatForm" autocomplete="off" onsubmit="return false;">
             <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileSelect(event)">
             <button type="button" class="upload-btn" id="uploadBtn"
                 onclick="document.getElementById('fileInput').click()">&#x1F4CE;</button>
             <div class="file-preview-container" id="filePreviewContainer"></div>
-            <input type="text" id="messageInput" placeholder="Type a message..." autocomplete="off">
-            <button id="sendButton" onclick="sendMessage()">Send</button>
-        </div>
+            <input type="text" id="messageInput" name="chat_message" placeholder="Type a message..." autocomplete="off"
+                data-lpignore="true" data-1p-ignore data-bwignore="true">
+            <button type="button" class="emoji-btn" id="pickerBtn" title="Emoji &amp; stickers"
+                aria-haspopup="dialog" aria-expanded="false" aria-controls="pickerPop">&#x1F642;</button>
+            <button type="button" id="sendButton" onclick="onSendClick()">Send</button>
+
+            <!-- Emoji & sticker picker: opens just above the input row -->
+            <div class="picker-pop" id="pickerPop" role="dialog" aria-label="Emoji and stickers" hidden>
+                <div class="picker-tabs" role="tablist">
+                    <button type="button" class="picker-tab active" data-tab="emoji" role="tab" aria-selected="true">Emoji</button>
+                    <button type="button" class="picker-tab" data-tab="stickers" role="tab" aria-selected="false">Stickers</button>
+                </div>
+                <div class="picker-body" id="pickerEmoji" role="tabpanel"></div>
+                <div class="picker-body" id="pickerStickers" role="tabpanel" hidden></div>
+            </div>
+        </form>
     </div>
 
     <!-- Settings Modal -->
@@ -148,13 +190,32 @@
                     <div class="setting-group">
                         <label for="modelSelect">LLM</label>
                         <select id="modelSelect">
-                            <option value="lux-light">Lux-Light</option>
-                            <option value="lux-dark" selected>Lux-Dark</option>
+                            <option value="lucy-12b" selected>Lucy 12B (port 8080)</option>
+                            <option value="lucy-4b">Lucy 4B (port 8081)</option>
                         </select>
+                        <div class="llm-status" id="llmStatus">Checking...</div>
                     </div>
                     <div class="setting-group">
                         <label for="temperatureInput">Temperature</label>
-                        <input type="number" id="temperatureInput" min="0" max="2" step="0.05" value="0.70">
+                        <input type="number" id="temperatureInput" name="model_temperature" min="0" max="2" step="0.05"
+                            value="0.70" autocomplete="off">
+                        <div class="llm-status" id="temperaturePreset">Preset: 12B 0.7 / 4B 0.5. Choosing a model resets it to its preset.</div>
+                    </div>
+                    <div class="setting-group">
+                        <label for="reasoningSelect">Reasoning</label>
+                        <select id="reasoningSelect">
+                            <option value="off" selected>OFF</option>
+                            <option value="on">ON</option>
+                        </select>
+                        <div class="llm-status">Changing this reloads the active model.</div>
+                    </div>
+                    <div class="setting-group">
+                        <label for="kvCacheSelect">KV Cache</label>
+                        <select id="kvCacheSelect">
+                            <option value="q8" selected>Q8</option>
+                            <option value="q4">Q4</option>
+                        </select>
+                        <div class="llm-status">Changing this reloads the active model.</div>
                     </div>
                     <div class="setting-group">
                         <label for="ttsSelect">Voice</label>
@@ -168,8 +229,8 @@
                 <!-- SKILLS -->
                 <div class="settings-panel" id="panel-skills">
                     <div class="settings-toolbar">
-                        <input type="text" id="skillSearchInput" placeholder="Search skills..."
-                            oninput="filterSkills()">
+                        <input type="text" id="skillSearchInput" name="skill_search" placeholder="Search skills..."
+                            autocomplete="off" oninput="filterSkills()">
                         <button class="settings-action-btn" onclick="addSkill()">+ Add Skill</button>
                     </div>
                     <div class="settings-table-wrap">
@@ -193,8 +254,8 @@
                 <!-- CONNECTORS -->
                 <div class="settings-panel" id="panel-connectors">
                     <div class="settings-toolbar">
-                        <input type="text" id="connectorSearchInput" placeholder="Search connectors..."
-                            oninput="filterConnectors()">
+                        <input type="text" id="connectorSearchInput" name="connector_search"
+                            placeholder="Search connectors..." autocomplete="off" oninput="filterConnectors()">
                         <button class="settings-action-btn" onclick="addConnector()">+ Add Connector</button>
                     </div>
                     <div class="settings-table-wrap">
@@ -219,1012 +280,50 @@
     </div>
 
     <!-- Token Entry Modal -->
+    <div class="token-modal-overlay" id="logsModal" onclick="closeLogsModal()">
+        <div class="token-modal logs-modal" onclick="event.stopPropagation()">
+            <div class="token-modal-header">
+                <span class="token-modal-title">Server Logs</span>
+                <button type="button" class="token-modal-close" onclick="closeLogsModal()">×</button>
+            </div>
+            <div class="token-modal-body">
+                <pre class="logs-content" id="logsContent">Loading...</pre>
+            </div>
+            <div class="token-modal-footer">
+                <label class="logs-auto"><input type="checkbox" id="logsAutoRefresh" checked> Auto-refresh</label>
+                <button type="button" class="token-modal-btn" onclick="fetchLogs()">Refresh</button>
+                <button type="button" class="token-modal-btn" onclick="closeLogsModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
     <div class="token-modal-overlay" id="tokenModal" onclick="closeTokenModal()">
         <div class="token-modal" onclick="event.stopPropagation()">
             <div class="token-modal-header">
                 <span class="token-modal-title" id="tokenModalName">Add Token</span>
-                <button class="token-modal-close" onclick="closeTokenModal()">×</button>
+                <button type="button" class="token-modal-close" onclick="closeTokenModal()">×</button>
             </div>
-            <div class="token-modal-body">
+            <form class="token-modal-body" id="tokenModalForm" autocomplete="off" onsubmit="return false;">
                 <input type="hidden" id="tokenModalId">
                 <input type="hidden" id="tokenModalConnectorName">
-                <input type="password" id="tokenModalInput" placeholder="Enter token here..." class="token-modal-input">
-            </div>
+                <input type="password" id="tokenModalInput" name="connector_token_value"
+                    placeholder="Enter token here..." class="token-modal-input" autocomplete="new-password"
+                    data-lpignore="true" data-1p-ignore data-bwignore="true">
+            </form>
             <div class="token-modal-footer">
-                <button class="token-modal-btn token-modal-cancel" onclick="closeTokenModal()">Cancel</button>
-                <button class="token-modal-btn token-modal-save" onclick="saveToken()">Save</button>
+                <button type="button" class="token-modal-btn token-modal-cancel"
+                    onclick="closeTokenModal()">Cancel</button>
+                <button type="button" class="token-modal-btn token-modal-save" onclick="saveToken()">Save</button>
             </div>
         </div>
     </div>
 
     <script>
-        // API key injected server-side (read-only, no secrets in client code)
-        const API_KEY = window.__API_KEY__ || '__API_KEY_PLACEHOLDER__';
-
-        // Helper: default fetch headers with API key
-        function authHeaders(extra = {}) {
-            const headers = {...extra};
-            headers['X-API-Key'] = API_KEY;
-            return headers;
-        }
-
-        // Render markdown-lite for assistant messages (bullets, bold, italics, line breaks)
-        function renderMarkdown(text) {
-            if (typeof marked === 'undefined') {
-                // Fallback: basic rendering if marked.js hasn't loaded
-                return text
-                    .replace(/^\s*\* (.+)$/gm, '<li>$1</li>')
-                    .replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>')
-                    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-                    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-                    .replace(/\n/g, '<br>');
-            }
-            return marked.parse(text);
-        }
-
-        const chatContainer = document.getElementById('chatContainer');
-        const messageInput = document.getElementById('messageInput');
-        const sendButton = document.getElementById('sendButton');
-        const statusText = document.getElementById('statusText');
-        const statusIndicator = document.getElementById('statusIndicator');
-        const chatHistoryEl = document.getElementById('chatHistory');
-        const settingsOverlay = document.getElementById('settingsOverlay');
-        const fileInput = document.getElementById('fileInput');
-        const filePreviewContainer = document.getElementById('filePreviewContainer');
-        const uploadBtn = document.getElementById('uploadBtn');
-
-        let selectedFiles = [];
-        let isStreaming = false;
-        let currentSessionId = 'default';
-        let sessions = {};
-        let currentActivity = null;
-        let sidebarCollapsed = false;
-
-        // Sidebar toggle
-        const sidebar = document.getElementById('sidebar');
-        const sidebarToggleBtn = document.getElementById('sidebarToggle');
-        const mobileMenuBtn = document.getElementById('mobileMenuBtn');
-        const sidebarBackdrop = document.getElementById('sidebarBackdrop');
-        const mobileQuery = window.matchMedia('(max-width: 768px)');
-
-        function openMobileSidebar() {
-            sidebar.classList.add('mobile-open');
-            sidebarBackdrop.classList.add('active');
-        }
-
-        function closeMobileSidebar() {
-            sidebar.classList.remove('mobile-open');
-            sidebarBackdrop.classList.remove('active');
-        }
-
-        if (sidebarToggleBtn && sidebar) {
-            sidebarToggleBtn.addEventListener('click', () => {
-                if (mobileQuery.matches) {
-                    // On mobile the same button just closes the drawer
-                    closeMobileSidebar();
-                } else {
-                    sidebarCollapsed = !sidebarCollapsed;
-                    sidebar.classList.toggle('collapsed', sidebarCollapsed);
-                }
-            });
-        }
-
-        if (mobileMenuBtn) {
-            mobileMenuBtn.addEventListener('click', () => {
-                if (sidebar.classList.contains('mobile-open')) {
-                    closeMobileSidebar();
-                } else {
-                    openMobileSidebar();
-                }
-            });
-        }
-
-        if (sidebarBackdrop) {
-            sidebarBackdrop.addEventListener('click', closeMobileSidebar);
-        }
-
-        messageInput.focus();
-
-        // ---- Path Helpers ----
-        function pathToRelative(filePath) {
-            let relativePath = filePath;
-            relativePath = relativePath.replace(/^C:[\\\/]Users[\\\/]dimay[\\\/]/i, '');
-            relativePath = relativePath.replace(/\\/g, '/');
-            return relativePath;
-        }
-
-        // ---- Session Management via API ----
-        async function loadSessions() {
-            try {
-                const resp = await fetch('/api/sessions', {headers: authHeaders()});
-                if (resp.ok) {
-                    const data = await resp.json();
-                    Object.assign(sessions, data.sessions || {});
-                    renderHistory();
-                }
-            } catch (e) {
-                console.error('Failed to load sessions:', e);
-            }
-        }
-
-        async function newSession() {
-            try {
-                const resp = await fetch('/api/sessions', {method: 'POST', headers: authHeaders()});
-                if (resp.ok) {
-                    const data = await resp.json();
-                    currentSessionId = data.session_id;
-                    sessions[currentSessionId] = {
-                        title: 'New Session',
-                        message_count: 0,
-                        messages: [],
-                        updated_at: data.updated_at || new Date().toISOString().replace('T', ' ').slice(0, 19)
-                    };
-                } else {
-                    throw new Error('Failed to create session');
-                }
-            } catch (e) {
-                console.error('Failed to create session:', e);
-                currentSessionId = 'session_' + Date.now();
-                sessions[currentSessionId] = {
-                    title: 'New Session',
-                    message_count: 0,
-                    messages: [],
-                    updated_at: new Date().toISOString().replace('T', ' ').slice(0, 19)
-                };
-            }
-            chatContainer.innerHTML = '';
-            renderHistory();
-            messageInput.focus();
-            if (mobileQuery.matches) closeMobileSidebar();
-        }
-
-        function formatTime(ts) {
-            if (!ts) return null;
-            const d = new Date(ts);
-            if (isNaN(d.getTime())) {
-                const fixed = ts.replace(' ', 'T');
-                const d2 = new Date(fixed);
-                if (isNaN(d2.getTime())) return null;
-                return d2.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
-            }
-            return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
-        }
-
-        function formatTimestamp(ts) {
-            if (!ts) return '';
-            const d = new Date(ts.replace(' ', 'T'));
-            if (isNaN(d.getTime())) return ts;
-            const options = {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true};
-            const tzSelect = document.getElementById('timezoneSelect');
-            let tz = 'en-US';
-            if (tzSelect) {
-                const selectedText = tzSelect.options[tzSelect.selectedIndex]?.text || '';
-                const match = selectedText.match(/GMT([+-])(\d+)/);
-                if (match) {
-                    tz = match[1] + match[2].padStart(2, '0');
-                }
-            }
-            try {
-                return d.toLocaleString(navigator.language || 'en-US', {...options, timeZone: tz});
-            } catch {
-                return d.toLocaleString(navigator.language || 'en-US', options);
-            }
-        }
-
-        async function renderHistory() {
-            const allSessions = [];
-            for (const [id, session] of Object.entries(sessions)) {
-                allSessions.push({id, ...session});
-            }
-            allSessions.sort((a, b) => {
-                const ta = a.updated_at || '';
-                const tb = b.updated_at || '';
-                if (!ta && !tb) return 0;
-                if (!ta) return -1;
-                if (!tb) return 1;
-                return tb.localeCompare(ta);
-            });
-            chatHistoryEl.innerHTML = '';
-            allSessions.forEach(session => {
-                const item = document.createElement('div');
-                item.className = 'history-item' + (session.id === currentSessionId ? ' active' : '');
-                item.onclick = () => switchSession(session.id);
-                const title = session.title || 'New Session';
-                const msgs = session.messages || [];
-                let preview = 'No messages yet';
-                if (msgs.length > 0) {
-                    const lastMsg = msgs[msgs.length - 1];
-                    preview = lastMsg.content || preview;
-                }
-                const truncatedPreview = preview.length > 50 ? preview.substring(0, 50) + '...' : preview;
-                const timeDisplay = formatTimestamp(session.updated_at) || '';
-                item.innerHTML = `
-                    <div class="history-title">${title}</div>
-                    <div class="history-preview">${truncatedPreview}</div>
-                    ${timeDisplay ? `<div class="history-time">${timeDisplay}</div>` : ``}
-                    <div class="delete-session-btn" title="Delete session" onclick="deleteSession('${session.id}', event)">🗑</div>
-                `;
-                chatHistoryEl.appendChild(item);
-            });
-        }
-
-        async function switchSession(id) {
-            if (id === currentSessionId) return;
-            currentSessionId = id;
-            try {
-                const resp = await fetch(`/api/sessions/${id}`, {headers: authHeaders()});
-                if (resp.ok) {
-                    const data = await resp.json();
-                    const session = sessions[id] || {title: 'Session', messages: []};
-                    session.messages = data.messages || [];
-                    sessions[id] = session;
-                }
-            } catch (e) {
-                console.error('Failed to load session:', e);
-            }
-
-            const session = sessions[id];
-            chatContainer.innerHTML = '';
-
-            if (session && session.messages) {
-                session.messages.forEach(msg => {
-                    const content = msg.content || '';
-                    const mediaMatches = content.match(/MEDIA:[^\s]+/g);
-                    const cleanContent = content.replace(/\nMEDIA:[^\s]+/g, '').trim();
-                    if (mediaMatches) {
-                        const fileData = mediaMatches.map(m => {
-                            const mediaPath = m.replace('MEDIA:', '');
-                            const relativePath = pathToRelative(mediaPath);
-                            const fileName = mediaPath.split(/[\\/]/).pop();
-                            return {path: mediaPath, name: fileName, url: `/api/file/${encodeURIComponent(relativePath)}?api_key=${encodeURIComponent(API_KEY)}`};
-                        });
-                        addMessage(cleanContent, msg.role === 'user', fileData, msg.timestamp);
-                    } else {
-                        addMessage(cleanContent, msg.role === 'user', [], msg.timestamp);
-                    }
-                });
-            }
-
-            scrollToBottom();
-            messageInput.focus();
-            renderHistory();
-            if (mobileQuery.matches) closeMobileSidebar();
-        }
-
-        async function deleteSession(id, event) {
-            event.stopPropagation();
-            if (!confirm('Delete this session?')) return;
-            try {
-                const resp = await fetch(`/api/sessions/${id}`, {
-                    method: 'DELETE',
-                    headers: authHeaders()
-                });
-                if (resp.ok) {
-                    delete sessions[id];
-                    if (currentSessionId === id) {
-                        const newResp = await fetch('/api/sessions', {headers: authHeaders()});
-                        const data = await newResp.json();
-                        const sessionList = data.sessions || {};
-                        const firstId = Object.keys(sessionList)[0];
-                        currentSessionId = firstId || 'default';
-                        chatContainer.innerHTML = '';
-                    }
-                    await renderHistory();
-                } else {
-                    console.error('Failed to delete session:', resp.statusText);
-                }
-            } catch (e) {
-                console.error('Failed to delete session:', e);
-            }
-        }
-
-        // ---- Message Handling ----
-        function addMessage(text, isUser = false, files = [], timestamp = null) {
-            const row = document.createElement('div');
-            row.className = `message-row ${isUser ? 'user-message' : 'assistant-message'}`;
-
-            const timeEl = document.createElement('div');
-            timeEl.className = 'message-time';
-            timeEl.textContent = formatTime(timestamp) || '';
-            row.appendChild(timeEl);
-
-            const contentWrapper = document.createElement('div');
-            contentWrapper.className = 'message-content';
-
-            const bubble = document.createElement('div');
-            bubble.className = `message-bubble ${isUser ? 'user-bubble' : 'assistant-bubble'}`;
-            bubble.innerHTML = renderMarkdown(text);
-            contentWrapper.appendChild(bubble);
-            row.appendChild(contentWrapper);
-
-            if (files && files.length > 0) {
-                const fileGroup = document.createElement('div');
-                fileGroup.style.display = 'flex';
-                fileGroup.style.flexWrap = 'wrap';
-                fileGroup.style.gap = '8px';
-                fileGroup.style.width = '100%';
-                files.forEach(f => {
-                    const fileEl = renderFilePreview(f);
-                    fileGroup.appendChild(fileEl);
-                });
-                row.appendChild(fileGroup);
-            }
-
-            chatContainer.appendChild(row);
-            scrollToBottom();
-            return bubble;
-        }
-
-        function renderFilePreview(fileData, isOutgoing = false) {
-            const wrapper = document.createElement('div');
-            wrapper.className = 'file-attachment';
-            wrapper.style.margin = '6px 0';
-            wrapper.style.clear = 'both';
-
-            if (fileData.type && fileData.type.startsWith('image/')) {
-                const img = document.createElement('img');
-                img.src = fileData.url || fileData.path || fileData.data_url;
-                img.alt = fileData.name || 'image';
-                img.style.maxWidth = '200px';
-                img.style.maxHeight = '200px';
-                img.style.borderRadius = '12px';
-                img.style.border = '1px solid #222';
-                img.onclick = () => window.open(img.src, '_blank');
-                img.style.cursor = 'pointer';
-                wrapper.appendChild(img);
-
-                const nameDiv = document.createElement('div');
-                nameDiv.textContent = fileData.name || 'Image';
-                nameDiv.style.fontSize = '11px';
-                nameDiv.style.color = '#666';
-                nameDiv.style.marginTop = '4px';
-                wrapper.appendChild(nameDiv);
-            } else {
-                const icon = getFileTypeIcon(fileData.name || fileData.path || '');
-                const el = document.createElement('div');
-                el.style.display = 'flex';
-                el.style.alignItems = 'center';
-                el.style.gap = '6px';
-                el.style.padding = '8px 12px';
-                el.style.background = '#0c0c0c';
-                el.style.border = '1px solid #222';
-                el.style.borderRadius = '8px';
-
-                const iconSpan = document.createElement('span');
-                iconSpan.textContent = icon;
-                iconSpan.style.fontSize = '16px';
-
-                const nameSpan = document.createElement('span');
-                nameSpan.textContent = (fileData.name || fileData.path || 'file');
-                nameSpan.style.fontSize = '12px';
-                nameSpan.style.color = '#aaa';
-                nameSpan.style.maxWidth = '180px';
-                nameSpan.style.overflow = 'hidden';
-                nameSpan.style.textOverflow = 'ellipsis';
-                nameSpan.style.whiteSpace = 'nowrap';
-
-                const downloadLink = document.createElement('a');
-                downloadLink.href = fileData.url || fileData.path || '#';
-                downloadLink.download = fileData.name || '';
-                downloadLink.textContent = '\u2193';
-                downloadLink.style.color = '#00E5FF';
-                downloadLink.style.fontSize = '14px';
-                downloadLink.style.textDecoration = 'none';
-                downloadLink.style.cursor = 'pointer';
-                downloadLink.onclick = (e) => {
-                    if (downloadLink.href === '#') e.preventDefault();
-                };
-
-                el.appendChild(iconSpan);
-                el.appendChild(nameSpan);
-                el.appendChild(downloadLink);
-                wrapper.appendChild(el);
-
-                if (fileData.size) {
-                    const sizeDiv = document.createElement('div');
-                    sizeDiv.textContent = formatFileSize(fileData.size);
-                    sizeDiv.style.fontSize = '11px';
-                    sizeDiv.style.color = '#666';
-                    sizeDiv.style.marginTop = '2px';
-                    wrapper.appendChild(sizeDiv);
-                }
-            }
-
-            return wrapper;
-        }
-
-        function getFileTypeIcon(filename) {
-            const ext = filename.split('.').pop().toLowerCase();
-            const icons = {
-                'pdf': '\uD83D\uDCC4', 'doc': '\uD83D\uDCC4', 'docx': '\uD83D\uDCC4', 'txt': '\uD83D\uDCC4',
-                'jpg': '\uD83D\uDFE0', 'jpeg': '\uD83D\uDFE0', 'png': '\uD83D\uDFE0', 'gif': '\uD83D\uDFE0',
-                'mp3': '\uD83C\uDFAF', 'wav': '\uD83C\uDFAF', 'ogg': '\uD83C\uDFAF',
-                'mp4': '\uD83D\uDCF9', 'mov': '\uD83D\uDCF9', 'webm': '\uD83D\uDCF9',
-                'zip': '\uD83D\u9C8B', 'rar': '\uD83D\u9C8B', '7z': '\uD83D\u9C8B',
-                'json': '\uD83D\uDDC4', 'yaml': '\uD83D\uDDC4', 'yml': '\uD83D\uDDC4',
-                'py': '\uD83D\uA782', 'js': '\uD83D\uDD90', 'html': '\uD83D\uDCBB', 'css': '\uD83D\uDDEE',
-            };
-            return icons[ext] || '\uD83D\u9C96';
-        }
-
-        function formatFileSize(bytes) {
-            if (bytes < 1024) return `${bytes} B`;
-            if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-            if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
-            return `${(bytes / 1073741824).toFixed(1)} GB`;
-        }
-
-        function handleFileSelect(event) {
-            const files = Array.from(event.target.files);
-            files.forEach(file => {
-                selectedFiles.push(file);
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    addFilePreview(file, e.target.result);
-                };
-                if (file.type.startsWith('image/')) {
-                    reader.readAsDataURL(file);
-                }
-            });
-            event.target.value = '';
-            updateSendButtonState();
-        }
-
-        function addFilePreview(file, dataUrl) {
-            const preview = document.createElement('div');
-            preview.className = 'file-preview';
-            preview.dataset.filename = file.name;
-
-            const nameSpan = document.createElement('span');
-            nameSpan.className = 'file-name';
-            nameSpan.textContent = file.name;
-            nameSpan.title = file.name;
-
-            const sizeSpan = document.createElement('span');
-            sizeSpan.className = 'file-size';
-            sizeSpan.textContent = formatFileSize(file.size);
-
-            const removeBtn = document.createElement('span');
-            removeBtn.className = 'remove-file';
-            removeBtn.textContent = '\u00d7';
-            removeBtn.onclick = () => {
-                selectedFiles = selectedFiles.filter(f => f.name !== file.name);
-                preview.remove();
-                updateSendButtonState();
-            };
-
-            preview.appendChild(nameSpan);
-            preview.appendChild(sizeSpan);
-            preview.appendChild(removeBtn);
-            filePreviewContainer.appendChild(preview);
-        }
-
-        function updateSendButtonState() {
-            uploadBtn.disabled = isStreaming;
-        }
-
-        function scrollToBottom() {
-            chatContainer.scrollTop = chatContainer.scrollHeight;
-        }
-
-        function setSending(sending) {
-            isStreaming = sending;
-            sendButton.disabled = sending;
-            messageInput.disabled = sending;
-            if (!sending) {
-                const ti = document.getElementById('thinkingIndicator');
-                if (ti) {
-                    ti.remove();
-                }
-            }
-        }
-
-        async function sendMessage() {
-            currentActivity = null;
-            const message = messageInput.value.trim();
-            if (!message && selectedFiles.length === 0) return;
-            if (isStreaming) return;
-
-            const imageFiles = selectedFiles.filter(f => f.type.startsWith('image/'));
-            await Promise.all(imageFiles.map(f => readFileAsDataURL(f)));
-
-            const outgoingFiles = selectedFiles.map(f => ({
-                name: f.name,
-                size: f.size,
-                type: f.type,
-                data_url: f.type.startsWith('image/') ? f._dataUrl : undefined,
-                path: f._savedPath || null
-            })).filter(f => f);
-
-            const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-            addMessage(message || '(file)', true, outgoingFiles, now);
-            const filesToSend = [...selectedFiles];
-            selectedFiles.forEach(f => delete f._dataUrl);
-            selectedFiles = [];
-            filePreviewContainer.innerHTML = '';
-            messageInput.value = '';
-            setSending(true);
-
-            const thinkingIndicator = document.createElement('div');
-            thinkingIndicator.className = 'thinking-indicator active';
-            thinkingIndicator.id = 'thinkingIndicator';
-            thinkingIndicator.innerHTML = '<span class="dot"></span><span>Thinking...</span>';
-
-            let streamingBubble = addMessage('', false, [], now);
-            const streamingRow = streamingBubble.closest('.message-row');
-            if (streamingRow) {
-                streamingRow.parentNode.insertBefore(thinkingIndicator, streamingRow);
-            }
-            if (thinkingIndicator) {
-                thinkingIndicator.scrollIntoView({behavior: 'auto', block: 'start'});
-            }
-
-            let fullResponse = '';
-            let pendingMedia = [];
-            let firstContentReceived = false;
-
-            try {
-                const formData = new FormData();
-                formData.append('message', message);
-                formData.append('session_id', currentSessionId);
-                formData.append('stream', 'true');
-                filesToSend.forEach(f => formData.append('files', f));
-
-                const response = await fetch(`/api/chat?api_key=${API_KEY}`, {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Server error: ${response.status}`);
-                }
-
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-
-                while (true) {
-                    const {done, value} = await reader.read();
-                    if (done) break;
-
-                    const chunk = decoder.decode(value, {stream: true});
-                    const lines = chunk.split('\n\n');
-
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const data = JSON.parse(line.substring(6));
-                                if (data.content) {
-                                    firstContentReceived = true;
-                                    if (currentActivity === 'think') {
-                                        thinkingIndicator.classList.remove('active');
-                                    }
-                                    fullResponse += data.content;
-                                    streamingBubble.innerHTML = renderMarkdown(fullResponse);
-                                    if (thinkingIndicator.classList.contains('active')) {
-                                        thinkingIndicator.scrollIntoView({behavior: 'smooth', block: 'start'});
-                                    } else {
-                                        scrollToBottom();
-                                    }
-                                } else if (data.error) {
-                                    streamingBubble.textContent = `Error: ${data.error}`;
-                                } else if (data.media) {
-                                    const mediaPath = data.media;
-                                    const relativePath = pathToRelative(mediaPath);
-                                    let fileUrl = `/api/file/${encodeURIComponent(relativePath)}?api_key=${encodeURIComponent(API_KEY)}`;
-                                    const fileName = mediaPath.split(/[\\/]/).pop();
-                                    const fileData = {path: mediaPath, name: fileName, url: fileUrl};
-                                    pendingMedia.push(`MEDIA:${mediaPath}`);
-                                    const fileWrapper = renderFilePreview(fileData);
-                                    const assistantRow = streamingBubble ? streamingBubble.closest('.message-row') : null;
-                                    if (assistantRow) {
-                                        let fileGroup = assistantRow.querySelector('.file-group');
-                                        if (!fileGroup) {
-                                            fileGroup = document.createElement('div');
-                                            fileGroup.className = 'file-group';
-                                            fileGroup.style.display = 'flex';
-                                            fileGroup.style.flexWrap = 'wrap';
-                                            fileGroup.style.gap = '8px';
-                                            fileGroup.style.width = '100%';
-                                            const contentWrapper = assistantRow.querySelector('.message-content');
-                                            if (contentWrapper && contentWrapper.nextSibling) {
-                                                assistantRow.insertBefore(fileGroup, contentWrapper.nextSibling);
-                                            } else {
-                                                assistantRow.appendChild(fileGroup);
-                                            }
-                                        }
-                                        fileGroup.appendChild(fileWrapper);
-                                    } else {
-                                        chatContainer.appendChild(fileWrapper);
-                                    }
-                                    if (thinkingIndicator.classList.contains('active')) {
-                                        thinkingIndicator.scrollIntoView({behavior: 'smooth', block: 'start'});
-                                    } else {
-                                        scrollToBottom();
-                                    }
-                                } else if (data.activity !== undefined) {
-                                    const activity = data.activity;
-                                    currentActivity = activity;
-                                    if (activity === null) {
-                                        if (window._activityHideTimer) {
-                                            clearTimeout(window._activityHideTimer);
-                                        }
-                                        window._activityHideTimer = setTimeout(() => {
-                                            thinkingIndicator.classList.remove('active');
-                                            window._activityHideTimer = null;
-                                        }, 1500);
-                                    } else {
-                                        if (window._activityHideTimer) {
-                                            clearTimeout(window._activityHideTimer);
-                                            window._activityHideTimer = null;
-                                        }
-                                        thinkingIndicator.classList.add('active');
-                                        const text = thinkingIndicator.querySelector('span:last-child');
-                                        if (text) {
-                                            const labels = {
-                                                'think': 'Thinking...',
-                                                'search': 'Searching...',
-                                                'read': 'Reading...',
-                                                'edit': 'Editing...',
-                                                'list': 'Listing files...',
-                                                'run': 'Running command...',
-                                                'send': 'Sending file...',
-                                            };
-                                            if (activity.includes(':')) {
-                                                const splitIdx = activity.indexOf(':');
-                                                const prefix = activity.substring(0, splitIdx);
-                                                const path = activity.substring(splitIdx + 1);
-                                                text.textContent = `${labels[prefix] || prefix}: ${path}`;
-                                            } else {
-                                                text.textContent = labels[activity] || activity;
-                                            }
-                                        }
-                                    }
-                                }
-                            } catch (e) {
-                                // Ignore parse errors
-                            }
-                        }
-                    }
-                }
-
-                if (!sessions[currentSessionId]) {
-                    sessions[currentSessionId] = {title: message ? message.substring(0, 30) : 'New Session', message_count: 0, messages: [], updated_at: now};
-                }
-                sessions[currentSessionId].messages.push({role: 'user', content: message, timestamp: now});
-                const assistantResponse = fullResponse + (pendingMedia.length > 0 ? '\n' + pendingMedia.join('\n') : '');
-                sessions[currentSessionId].messages.push({role: 'assistant', content: assistantResponse, timestamp: now});
-                sessions[currentSessionId].title = message ? message.substring(0, 30) : 'New Session';
-                sessions[currentSessionId].updated_at = now;
-                renderHistory();
-
-            } catch (error) {
-                console.error('Error:', error);
-                streamingBubble.textContent = `Error: ${error.message || 'Could not connect to Lucy Core.'}`;
-            } finally {
-                setSending(false);
-                messageInput.focus();
-            }
-        }
-
-        async function readFileAsDataURL(file) {
-            return new Promise((resolve) => {
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    file._dataUrl = e.target.result;
-                    resolve();
-                };
-                reader.readAsDataURL(file);
-            });
-        }
-
-        async function loadSettings() {
-            try {
-                const res = await fetch(`/api/settings/timezone?api_key=${API_KEY}`);
-                const data = await res.json();
-                const tzSelect = document.getElementById('timezoneSelect');
-                tzSelect.innerHTML = data.available_timezones.map(opt =>
-                    `<option value="${opt.value}" ${opt.value === data.timezone ? 'selected' : ''}>${opt.label}</option>`
-                ).join('');
-            } catch (e) {
-                console.error('Failed to load settings:', e);
-            }
-        }
-
-        function saveSettings() {
-            const tz = document.getElementById('timezoneSelect').value;
-            fetch(`/api/settings/timezone?api_key=${API_KEY}`, {
-                method: 'POST',
-                body: JSON.stringify({timezone: tz}),
-                headers: {'Content-Type': 'application/json'}
-            });
-        }
-
-        // ---- Autosave (fires on every field change, no Save button needed) ----
-        const AUTOSAVE_FIELDS = [
-            {id: 'themeSelect', key: 'theme'},
-            {id: 'fontSelect', key: 'font'},
-            {id: 'fontSizeSelect', key: 'font_size'},
-            {id: 'languageSelect', key: 'language'},
-            {id: 'timezoneSelect', key: 'timezone'},
-            {id: 'providerSelect', key: 'provider'},
-            {id: 'modelSelect', key: 'model'},
-            {id: 'temperatureInput', key: 'temperature'},
-            {id: 'ttsSelect', key: 'voice'},
-        ];
-
-        function bindAutosave() {
-            AUTOSAVE_FIELDS.forEach(({id, key}) => {
-                const el = document.getElementById(id);
-                if (!el) return;
-                el.addEventListener('change', () => saveSetting(key, el.value));
-            });
-        }
-
-        function saveSetting(key, value) {
-            if (key === 'timezone') {
-                // Already wired to a real endpoint
-                saveSettings();
-            } else {
-                // TODO: replace with a real config endpoint once it exists, e.g.
-                // fetch(`/api/settings/${key}?api_key=${API_KEY}`, {
-                //     method: 'POST',
-                //     headers: { 'Content-Type': 'application/json' },
-                //     body: JSON.stringify({ value })
-                // });
-                console.log('Autosave (placeholder):', key, '=', value);
-            }
-            flashSaved();
-        }
-
-        function flashSaved() {
-            const indicator = document.getElementById('settingsSavedIndicator');
-            if (!indicator) return;
-            indicator.classList.add('visible');
-            clearTimeout(window._savedIndicatorTimer);
-            window._savedIndicatorTimer = setTimeout(() => {
-                indicator.classList.remove('visible');
-            }, 1200);
-        }
-
-        function openSettings() {
-            settingsOverlay.style.display = 'flex';
-            loadSettings();
-            loadSkills();
-            loadConnectors();
-        }
-
-        function closeSettings() {
-            settingsOverlay.style.display = 'none';
-        }
-
-        // ---- Settings Tabs ----
-        function switchSettingsTab(tab) {
-            document.querySelectorAll('.settings-tab-btn').forEach(btn => {
-                btn.classList.toggle('active', btn.dataset.tab === tab);
-            });
-            document.querySelectorAll('.settings-panel').forEach(panel => {
-                panel.classList.toggle('active', panel.id === `panel-${tab}`);
-            });
-        }
-
-        // ---- Skills (placeholder — hook up to skills.sqlite via backend later) ----
-        const skillsTableBody = document.getElementById('skillsTableBody');
-
-        async function loadSkills() {
-            try {
-                const resp = await fetch(`/api/skills?api_key=${API_KEY}`);
-                const data = await resp.json();
-                renderSkills(data.skills);
-            } catch (e) {
-                console.error('Failed to load skills:', e);
-            }
-        }
-
-        function renderSkills(skills) {
-            if (!skillsTableBody) return;
-            if (!skills || skills.length === 0) {
-                skillsTableBody.innerHTML = '<tr><td colspan="2" class="settings-table-empty">No skills loaded yet</td></tr>';
-                return;
-            }
-            skillsTableBody.innerHTML = skills.map(s => {
-                const status = s.source || 'unknown';
-                const statusClass = status === 'learned' ? 'status-learned' : 'status-imported';
-                return `
-                    <tr data-name="${(s.name || '').toLowerCase()}">
-                        <td>${s.name || ''}</td>
-                        <td><span class="skill-status ${statusClass}">${status}</span></td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        function filterSkills() {
-            const q = document.getElementById('skillSearchInput').value.trim().toLowerCase();
-            skillsTableBody.querySelectorAll('tr[data-name]').forEach(row => {
-                row.style.display = row.dataset.name.includes(q) ? '' : 'none';
-            });
-        }
-
-        function addSkill() {
-            const query = document.getElementById('skillSearchInput').value.trim();
-            // TODO: POST to backend to add/install a skill (e.g. /api/skills)
-            console.log('Add skill requested:', query);
-        }
-
-        function toggleSkill(id) {
-            // TODO: POST to backend to enable/disable a skill
-            console.log('Toggle skill:', id);
-        }
-
-        function removeSkill(id) {
-            // TODO: DELETE to backend to remove a skill
-            console.log('Remove skill:', id);
-        }
-
-        // ---- Connectors (placeholder — tokens/config come from backend later) ----
-        const connectorsTableBody = document.getElementById('connectorsTableBody');
-
-        async function loadConnectors() {
-            try {
-                const resp = await fetch(`/api/connectors?api_key=${API_KEY}`);
-                const data = await resp.json();
-                renderConnectors(data.connectors);
-            } catch (e) {
-                console.error('Failed to load connectors:', e);
-                connectorsTableBody.innerHTML = '<tr><td colspan="2" class="settings-table-empty">Failed to load connectors</td></tr>';
-            }
-        }
-
-        function renderConnectors(connectors) {
-            if (!connectorsTableBody) return;
-            if (!connectors || connectors.length === 0) {
-                connectorsTableBody.innerHTML = '<tr><td colspan="2" class="settings-table-empty">No connectors configured yet</td></tr>';
-                return;
-            }
-            connectorsTableBody.innerHTML = connectors.map(c => {
-                const masked = c.masked_token || 'Not set';
-                return `
-                    <tr data-name="${(c.name || '').toLowerCase()}">
-                        <td>${c.name || ''}</td>
-                        <td class="settings-token">${masked}</td>
-                        <td class="settings-row-actions">
-                            <button class="settings-row-btn" onclick="editConnector('${c.id}')">Edit</button>
-                            <button class="settings-row-btn" onclick="removeConnector('${c.id}')">Remove</button>
-                        </td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        function filterConnectors() {
-            const q = document.getElementById('connectorSearchInput').value.trim().toLowerCase();
-            connectorsTableBody.querySelectorAll('tr[data-name]').forEach(row => {
-                row.style.display = row.dataset.name.includes(q) ? '' : 'none';
-            });
-        }
-
-        function addConnector() {
-            const name = document.getElementById('connectorSearchInput').value.trim();
-            if (!name) {
-                alert('Please enter a connector name');
-                return;
-            }
-            openTokenModal(name, null);
-        }
-
-        function openTokenModal(name, id) {
-            const modal = document.getElementById('tokenModal');
-            const modalTitle = document.getElementById('tokenModalName');
-            const modalInput = document.getElementById('tokenModalInput');
-            const modalId = document.getElementById('tokenModalId');
-            const modalName = document.getElementById('tokenModalConnectorName');
-            modalTitle.textContent = id ? `Edit "${name}"` : `Add "${name}"`;
-            modalId.value = id || '';
-            modalName.value = name;
-            modalInput.value = '';
-            modal.style.display = 'flex';
-            modalInput.focus();
-            modalInput.onkeyup = (e) => {
-                if (e.key === 'Enter') saveToken();
-            };
-        }
-
-        function closeTokenModal() {
-            document.getElementById('tokenModal').style.display = 'none';
-        }
-
-        async function saveToken() {
-            const id = document.getElementById('tokenModalId').value;
-            const name = document.getElementById('tokenModalConnectorName').value;
-            const token = document.getElementById('tokenModalInput').value.trim();
-            const endpoint = id ? `/api/connectors/${id}?api_key=${API_KEY}` : `/api/connectors?api_key=${API_KEY}`;
-            const method = id ? 'PATCH' : 'POST';
-            try {
-                await fetch(endpoint, {
-                    method: method,
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(id ? {token} : {name, token})
-                });
-                closeTokenModal();
-                loadConnectors();
-            } catch (e) {
-                console.error('Failed to save connector:', e);
-            }
-        }
-
-        async function editConnector(id) {
-            // Fetch the connector to get its name
-            const resp = await fetch(`/api/connectors?api_key=${API_KEY}`);
-            const data = await resp.json();
-            const connector = data.connectors.find(c => c.id == id);
-            if (connector) {
-                openTokenModal(connector.name, id);
-            }
-        }
-
-        async function removeConnector(id) {
-            if (!confirm('Remove this connector?')) return;
-            await fetch(`/api/connectors/${id}?api_key=${API_KEY}`, {method: 'DELETE'});
-            loadConnectors();
-        }
-
-        async function restartServer() {
-            if (!confirm('Restart Lucy Core server?')) return;
-            try {
-                const res = await fetch(`/api/restart?api_key=${API_KEY}`, {method: 'POST'});
-                const data = await res.json();
-                setStatus(data.status || 'restarting', '#ffa500');
-                setTimeout(() => {
-                    window.location.reload();
-                }, 1500);
-            } catch (e) {
-                console.error('Restart failed:', e);
-            }
-        }
-
-        async function stopServer() {
-            if (!confirm('Stop Lucy Core server?')) return;
-            try {
-                await fetch(`/api/shutdown?api_key=${API_KEY}`, {method: 'POST'});
-                setStatus('Server stopped', '#ff4444');
-                const stopBtn = document.getElementById('stopBtn');
-                if (stopBtn) stopBtn.classList.add('stop');
-                setTimeout(() => {
-                    window.location.reload();
-                }, 2000);
-            } catch (e) {
-                console.error('Stop failed:', e);
-            }
-        }
-
-        function setStatus(text, color) {
-            const dot = document.getElementById('statusDot');
-            const label = document.getElementById('statusText');
-            if (color) {dot.style.background = color; dot.style.boxShadow = `0 0 8px ${color}`;}
-            if (text) label.textContent = text;
-        }
-
-        // ---- Init ----
-        const greetingTime = document.getElementById('greetingTime');
-        if (greetingTime) {
-            greetingTime.textContent = formatTime(new Date().toISOString()) || '';
-        }
-        loadSettings();
-        loadSessions();
-        bindAutosave();
-
-        messageInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter' && !isStreaming) {
-                sendMessage();
-            }
-        });
-
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && settingsOverlay.style.display === 'flex') {
-                closeSettings();
-            }
-        });
+        // Values injected by the server when it serves this page (see GET / in api.py).
+        window.__API_KEY__ = '__API_KEY_PLACEHOLDER__';
+        window.__SAFE_ROOT__ = '__SAFE_ROOT_PLACEHOLDER__';
     </script>
+    <script src="/chat.js?v=__JS_VERSION__"></script>
 </body>
 
 </html>

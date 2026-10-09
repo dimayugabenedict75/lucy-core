@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "google-workspace": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-google-workspace"],
+      "env": {
+        "GOOGLE_CLIENT_ID": "167639071295-fag98421qac0fs3npoflrep1rt66pj82.apps.googleusercontent.com"
+      }
+    }
+  }
+}

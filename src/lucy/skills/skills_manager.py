@@ -13,7 +13,7 @@ class SkillsManager:
         if definitions_dir:
             self.skills_dir = Path(definitions_dir)
         else:
-            self.skills_dir = Path("C:/Users/dimay/Lucy/Lucy_Core/src/lucy/skills/definitions")
+            self.skills_dir = Path(__file__).resolve().parent / "definitions"
 
         # Load all DB skills into cache
         loaded = self._db.load_all_to_cache()

@@ -38,10 +38,12 @@ function renderMarkdown(text) {
 // The AudioServer outputs 24 kHz s16LE PCM, so we hard-code that here.
 let _audioCtx = null;
 
-// Sequential playback queue — prevents overlap between chunks.
-let _nextPlayTime = 0; // AudioContext.currentTime when the next chunk should start
-let _pendingChunks = []; // chunks buffered while a previous one is still playing
-let _hasScheduled = false; // guard against multiple scheduler loops
+// Gapless scheduling state (browser fallback; the default path is server-side DirectSound).
+// Frames are counted as integers so chunk N+1 starts on exactly the sample chunk N ends on.
+const PCM_PREBUFFER_SEC = 0.30;   // lead before the first chunk of an utterance / after a stall
+let _pcmBaseTime = 0;             // AudioContext time of scheduled frame 0
+let _pcmFrames = 0;               // frames scheduled since _pcmBaseTime
+let _pcmChain = Promise.resolve(); // chunks are scheduled strictly in arrival order
 
 function _getAudioContext() {
     if (!_audioCtx) {
@@ -54,63 +56,45 @@ function _getAudioContext() {
     return _audioCtx;
 }
 
-// Plays PCM chunks in strict sequential order: each chunk waits for the
-// previous chunk to finish before starting, eliminating overlap and drift.
-async function playPcmChunk(fileUrl, sampleRate, channels) {
-    try {
-        const resp = await fetch(fileUrl);
-        if (!resp.ok) {
-            console.warn(`PCM fetch failed: ${resp.status}`);
-            return;
-        }
-        const arrayBuffer = await resp.arrayBuffer();
-        const ctx = _getAudioContext();
-
-        // Decode s16LE PCM → Float32 → stereo if needed
-        const samples = new Int16Array(arrayBuffer);
-        let floatData;
-        let actualChannels = channels;
-        if (channels === 1) {
-            // Mono → stereo (duplicate channel)
-            floatData = new Float32Array(samples.length * 2);
-            for (let i = 0; i < samples.length; i++) {
-                const s = samples[i] / 32768;
-                floatData[i * 2] = s;
-                floatData[i * 2 + 1] = s;
-            }
-            actualChannels = 2;
-        } else {
-            floatData = new Float32Array(samples.length);
-            for (let i = 0; i < samples.length; i++) {
-                floatData[i] = samples[i] / 32768;
-            }
-        }
-
-        const numSamples = floatData.length / actualChannels;
-        const durationSec = numSamples / (sampleRate || 24000);
-        const audioBuf = ctx.createBuffer(actualChannels, numSamples, sampleRate || 24000);
-        for (let ch = 0; ch < actualChannels; ch++) {
-            const chanData = audioBuf.getChannelData(ch);
-            for (let i = 0; i < numSamples; i++) {
-                chanData[i] = floatData[i * actualChannels + ch];
-            }
-        }
-
-        const src = ctx.createBufferSource();
-        src.buffer = audioBuf;
-        src.connect(ctx.destination);
-
-        // Schedule playback immediately after whatever is currently queued
-        const startTime = Math.max(_nextPlayTime, ctx.currentTime);
-        src.start(startTime);
-        _nextPlayTime = startTime + durationSec;
-
-    } catch (e) {
-        console.warn('PCM playback error:', e);
-    }
+// Fetches start immediately (in parallel) but are SCHEDULED through a promise chain, so a small
+// chunk that downloads faster can never jump ahead of an earlier one.
+function playPcmChunk(fileUrl, sampleRate, channels) {
+    const fetched = fetch(fileUrl)
+        .then(r => (r.ok ? r.arrayBuffer() : (console.warn(`PCM fetch failed: ${r.status}`), null)))
+        .catch(e => (console.warn('PCM fetch error:', e), null));
+    _pcmChain = _pcmChain.then(async () => {
+        const ab = await fetched;
+        if (ab) _schedulePcm(ab, sampleRate || 24000);
+    }).catch(e => console.warn('PCM playback error:', e));
+    return _pcmChain;
 }
 
+function _schedulePcm(arrayBuffer, sampleRate) {
+    const ctx = _getAudioContext();
+    const samples = new Int16Array(arrayBuffer, 0, arrayBuffer.byteLength >> 1);
+    if (!samples.length) return;
+    const f32 = new Float32Array(samples.length);
+    for (let i = 0; i < samples.length; i++) f32[i] = samples[i] / 32768;
+    const buf = ctx.createBuffer(1, f32.length, sampleRate);   // mono; Web Audio upmixes
+    buf.copyToChannel(f32, 0);
 
+    const now = ctx.currentTime;
+    let start = _pcmBaseTime + _pcmFrames / sampleRate;
+    if (_pcmFrames === 0 || start < now + 0.005) {
+        // First chunk, or the queue ran dry: restart with a prebuffer so the next chunks can arrive.
+        if (_pcmFrames > 0) {
+            console.warn(`[pcm] underrun: queue ran dry ${Math.round((now - start) * 1000)} ms ago`);
+        }
+        _pcmBaseTime = now + PCM_PREBUFFER_SEC;
+        _pcmFrames = 0;
+        start = _pcmBaseTime;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start(start);
+    _pcmFrames += f32.length;
+}
 
 function parseMediaMarkers(text) {
     if (!text) return '';
@@ -118,6 +102,7 @@ function parseMediaMarkers(text) {
     // Handles both "MEDIA:path caption" and standalone "MEDIA:path" on its own line.
     // PCM files are excluded here — they are handled by playPcmChunk() in the SSE handler.
     return text.replace(/MEDIA:([^ \n]+)(?: (.+?))?(?=\n|$)/g, function(match, mediaPath, caption) {
+        if (/\.pcm$/i.test(mediaPath)) return '';
         const fileName = mediaPath.split(/[\\/]/).pop();
         const fileUrl = `/api/file/${encodeURIComponent(mediaPath)}?api_key=${encodeURIComponent(API_KEY)}`;
         const mimeType = getMimeType(fileName);
@@ -344,9 +329,9 @@ async function switchSession(id) {
     if (session && session.messages) {
         session.messages.forEach(msg => {
             const content = msg.content || '';
-            const mediaMatches = content.match(/MEDIA:[^\s]+/g);
+            const mediaMatches = (content.match(/MEDIA:[^\s]+/g) || []).filter(m => !/\.pcm$/i.test(m));
             const cleanContent = content.replace(/\nMEDIA:[^\s]+/g, '').trim();
-            if (mediaMatches) {
+            if (mediaMatches.length) {
                 const fileData = mediaMatches.map(m => {
                     const mediaPath = m.replace('MEDIA:', '');
                     const relativePath = pathToRelative(mediaPath);
@@ -874,6 +859,14 @@ filesToSend.forEach(f => formData.append('files', f));
                             let fileUrl = `/api/file/${encodeURIComponent(relativePath)}?api_key=${encodeURIComponent(API_KEY)}`;
                             const fileName = mediaPath.split(/[\\/]/).pop();
                             const mimeType = getMimeType(fileName);
+
+                            // Streaming TTS PCM chunk: play it only. Never render it in the chat,
+                            // and never record it in pendingMedia (so it isn't saved to history).
+                            if (fileName.toLowerCase().endsWith('.pcm')) {
+                                playPcmChunk(fileUrl, 24000, 1);
+                                continue;
+                            }
+
                             const fileData = {path: mediaPath, name: fileName, url: fileUrl, type: mimeType};
                             pendingMedia.push(`MEDIA:${mediaPath}`);
 
@@ -896,10 +889,6 @@ filesToSend.forEach(f => formData.append('files', f));
                             if (fileName.toLowerCase().endsWith('.wav')) {
                                 const audio = new Audio(fileUrl);
                                 audio.play().catch(e => console.warn('Voice autoplay failed:', e));
-                            }
-                            // Auto-play PCM chunks from streaming TTS — decode and play immediately
-                            if (fileName.toLowerCase().endsWith('.pcm')) {
-                                playPcmChunk(fileUrl, 24000, 1);
                             }
                             if (thinkingIndicator.classList.contains('active')) {
                                 thinkingIndicator.scrollIntoView({behavior: 'smooth', block: 'start'});
@@ -1065,6 +1054,8 @@ const AUTOSAVE_FIELDS = [
     {id: 'providerSelect', key: 'provider'},
     {id: 'modelSelect', key: 'model'},
     {id: 'temperatureInput', key: 'temperature'},
+    {id: 'reasoningSelect', key: 'reasoning'},
+    {id: 'kvCacheSelect', key: 'kv_cache'},
     {id: 'ttsSelect', key: 'voice'},
 ];
 
@@ -1110,16 +1101,94 @@ function saveSetting(key, value) {
     } else if (key === 'timezone') {
         // Already wired to a real endpoint
         saveSettings();
+    } else if (key === 'model' || key === 'temperature' || key === 'reasoning' || key === 'kv_cache') {
+        saveLlmSetting(key, value);
+        return;                       // flashSaved() is called once the server confirms
     } else {
-        // TODO: replace with a real config endpoint once it exists, e.g.
-        // fetch(`/api/settings/${key}?api_key=${API_KEY}`, {
-        //     method: 'POST',
-        //     headers: { 'Content-Type': 'application/json' },
-        //     body: JSON.stringify({ value })
-        // });
+        // Other fields (provider, voice, ...) are still placeholders
         console.log('Autosave (placeholder):', key, '=', value);
     }
     flashSaved();
+}
+
+// ---- Settings > Model (Lucy 12B / 4B, temperature, reasoning, KV cache) ----
+let _llmPollTimer = null;
+
+function _applyLlmStatus(st) {
+    const sel = document.getElementById('modelSelect');
+    if (sel) {
+        sel.innerHTML = st.models.map(m =>
+            `<option value="${m.id}">${m.label} (port ${m.port})</option>`).join('');
+        sel.value = st.active;
+    }
+    const temp = document.getElementById('temperatureInput');
+    if (temp && document.activeElement !== temp) temp.value = Number(st.temperature).toFixed(2);
+    const presets = document.getElementById('temperaturePreset');
+    if (presets) {
+        presets.textContent = 'Preset: ' + st.models.map(m =>
+            `${m.label.replace('Lucy ', '')} ${m.temperature_preset}`).join(' / ') +
+            '. Choosing a model resets it to its preset.';
+    }
+    const r = document.getElementById('reasoningSelect');
+    if (r) r.value = st.reasoning ? 'on' : 'off';
+    const kv = document.getElementById('kvCacheSelect');
+    if (kv) kv.value = st.kv_cache.startsWith('q4') ? 'q4' : 'q8';
+
+    const label = document.getElementById('llmStatus');
+    if (label) {
+        const active = st.models.find(m => m.id === st.active);
+        label.className = 'llm-status';
+        if (st.phase === 'loading' || st.phase === 'stopping') {
+            label.textContent = st.message || 'Loading...';
+            label.classList.add('loading');
+        } else if (st.phase === 'error') {
+            label.textContent = 'Error: ' + st.message;
+            label.classList.add('error');
+        } else if (active && active.ready) {
+            label.textContent = `${active.label} is loaded on port ${active.port}`;
+            label.classList.add('ready');
+        } else {
+            label.textContent = `${active ? active.label : 'Model'} is not running`;
+            label.classList.add('error');
+        }
+    }
+    // keep polling while a load is in progress
+    clearTimeout(_llmPollTimer);
+    if (st.phase === 'loading' || st.phase === 'stopping') {
+        _llmPollTimer = setTimeout(loadLlmStatus, 1500);
+    }
+}
+
+async function loadLlmStatus() {
+    try {
+        const res = await fetch(`/api/llm/status?api_key=${API_KEY}`);
+        if (res.ok) _applyLlmStatus(await res.json());
+    } catch (e) {
+        console.error('Failed to load LLM status:', e);
+    }
+}
+
+async function saveLlmSetting(key, value) {
+    let v = value;
+    if (key === 'temperature') v = parseFloat(value);
+    if (key === 'reasoning') v = (value === 'on');
+    try {
+        const res = await fetch(`/api/llm/settings?api_key=${API_KEY}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({[key]: v})
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            alert(err.detail || 'Could not save setting');
+            loadLlmStatus();
+            return;
+        }
+        _applyLlmStatus(await res.json());
+        flashSaved();
+    } catch (e) {
+        console.error('Failed to save LLM setting:', e);
+    }
 }
 
 function flashSaved() {
@@ -1135,6 +1204,7 @@ function flashSaved() {
 function openSettings() {
     settingsOverlay.style.display = 'flex';
     loadSettings();
+    loadLlmStatus();
     loadSkills();
     loadConnectors();
 }

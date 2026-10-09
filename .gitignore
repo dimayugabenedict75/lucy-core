@@ -1,6 +1,14 @@
 __pycache__/
 *.pyc
+*.pyo
 runtime/
 .env
 *.log
 *.gguf
+models/
+Lucy_Core.zip
+*.wav
+google_client_secret.json
+lucy_audio/build/
+lucy_audio/external/
+*.bin

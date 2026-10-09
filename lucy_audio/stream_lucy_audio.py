@@ -19,6 +19,7 @@ import base64
 import contextlib
 import http.client
 import json
+import re
 import shutil
 import socket
 import subprocess
@@ -31,12 +32,44 @@ from typing import IO, Iterable, Iterator
 from urllib.parse import urlencode, urlsplit
 
 
+try:                                    # optional: DirectSound player + chunk logger
+    from lucy_player import ChunkLog, make_player
+except ImportError:                     # imported from another directory
+    import os as _os
+    sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    try:
+        from lucy_player import ChunkLog, make_player
+    except ImportError:
+        ChunkLog = make_player = None
+
+
 class StreamError(RuntimeError):
     """Server sent an error event, replied badly, or the stream ended without [DONE]."""
 
 
-# -- SSE ----------------------------------------------------------------------
+# -- Text cleaning for TTS -----------------------------------------------------
+# Strips "Action:" prefixes, markdown markers (** for bold, */_ for italic),
+# and emojis/non-speech Unicode characters so the voice engine speaks cleanly.
+def clean_text_for_tts(text: str) -> str:
+    """Remove Action: prefixes, markdown, and emojis from text before TTS.
 
+    Handles delta-stream fragments: each chunk may contain partial markup
+    or stray Unicode, so cleaning is applied per-chunk in the stream loop.
+    E.g. "Action: send_tts(text='**Hello**') 📝" -> "send_tts(text='Hello')"
+    """
+    # Remove "Action:" prefix (with optional whitespace) - covers ReAct-style output
+    text = re.sub(r'^Action:\s*', '', text, flags=re.MULTILINE)
+    # Strip markdown bold and italic markers
+    text = text.replace('**', '').replace('__', '')
+    text = text.replace('*', '').replace('_', '')
+    # Remove emojis and other non-speech symbols (keep letters, numbers, basic punctuation, spaces)
+    text = re.sub(r'[^\w\s.,!?;:\'"-()<>]+', '', text, flags=re.UNICODE)
+    # Clean up any double spaces left behind
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+# -- SSE ----------------------------------------------------------------------
 def iter_sse_chunks(chunks: Iterable[bytes]) -> Iterator[dict]:
     """Spec-correct SSE decoder over byte chunks: multi-line data, comments, CRLF, [DONE] sentinel.
     UTF-8 is decoded per COMPLETE line, so a character split across reads is safe.
@@ -86,7 +119,6 @@ def iter_sse(resp: IO[bytes]) -> Iterator[dict]:
 
 
 # -- HTTP plumbing -----------------------------------------------------------
-
 class LucyAudioClient:
     """Zero-dependency client for Lucy Audio's streaming TTS and ASR endpoints."""
 
@@ -126,9 +158,9 @@ class LucyAudioClient:
 
 # -- TTS ---------------------------------------------------------------------
 
-    def speak(self, text: str, model: str, **extra) -> Iterator[bytes]:
-        """Yield s16LE PCM chunks as they're generated (SSE mode)."""
-        body = json.dumps({"model": model, "input": text, "response_format": "pcm",
+    def speak(self, text: str, model: str, log=None, **extra) -> Iterator[bytes]:
+        """Yield s16LE PCM chunks as they're generated (SSE mode). `log`: optional ChunkLog."""
+        body = json.dumps({"model": model, "input": clean_text_for_tts(text), "response_format": "pcm",
                            "stream_format": "sse", "sample_rate": 24000, **extra}).encode()
         conn, resp = self._post("/v1/audio/speech", body, "application/json",
                                 "text/event-stream")
@@ -136,17 +168,27 @@ class LucyAudioClient:
         try:
             for ev in iter_sse(resp):
                 if ev.get("type") == "speech.audio.delta":
-                    yield base64.b64decode(ev["audio"])
+                    pcm = base64.b64decode(ev["audio"])
+                    if log:
+                        log.chunk(len(pcm))
+                    yield pcm
                 elif ev.get("type") == "speech.audio.done":
                     self.last_timing = ev.get("timing")
+            if log:
+                log.done(self.last_timing)
+        except BaseException as e:
+            if log:
+                log.error(repr(e))
+            raise
         finally:
             conn.close()
 
-    def speak_raw(self, text: str, model: str, chunk: int = 4096, **extra) -> Iterator[bytes]:
+    def speak_raw(self, text: str, model: str, chunk: int = 4096, log=None, **extra) -> Iterator[bytes]:
         """Raw PCM mode: ~33% less bandwidth than base64 SSE, but no error events
         (a failure just ends the stream early). Keeps output sample-aligned."""
-        body = json.dumps({"model": model, "input": text, "response_format": "pcm",
-                           "stream_format": "sse", "sample_rate": 24000, **extra}).encode()
+        # NOTE: raw PCM needs stream_format "audio" (it was "sse" here, which returns base64 JSON events)
+        body = json.dumps({"model": model, "input": clean_text_for_tts(text), "response_format": "pcm",
+                           "stream_format": "audio", "sample_rate": 24000, **extra}).encode()
         conn, resp = self._post("/v1/audio/speech", body, "application/json",
                                 "application/octet-stream")
         carry = b""
@@ -157,7 +199,15 @@ class LucyAudioClient:
                     # HTTP chunks can split a sample
                     buf, carry = buf[:-1], buf[-1:]
                 if buf:                      # a lone odd byte leaves nothing to play yet
+                    if log:
+                        log.chunk(len(buf))
                     yield buf
+            if log:
+                log.done()
+        except BaseException as e:
+            if log:
+                log.error(repr(e))
+            raise
         finally:
             conn.close()
 
@@ -278,7 +328,7 @@ class LucyAudioClient:
             conn.close()
 
 
-# -- Transcript assembly -----------------------------------------------------
+# -- Transcript assembly ------------------------------------------------------
 
 @dataclass
 class Transcript:
@@ -314,7 +364,7 @@ class Transcript:
         return None
 
 
-# -- Local audio I/O (argv only, no shell) ----------------------------------
+# -- Local audio I/O (argv only, no shell) -----------------------------------
 
 def player(rate: int, channels: int = 1) -> subprocess.Popen:
     for argv in ([ "pw-cat", "--playback", "--format", "s16", "--rate", str(rate),
@@ -360,6 +410,11 @@ def main() -> None:
     s.add_argument("--rate", type=int, default=24000, help="model output rate (server doesn't send it)")
     s.add_argument("--raw", action="store_true", help="raw PCM transport instead of SSE")
     s.add_argument("-o", "--out", help="write .pcm instead of playing")
+    s.add_argument("--player", choices=["auto", "directsound", "pipe"], default="auto",
+                   help="auto = Windows DirectSound if available, else ffplay/aplay/pw-cat")
+    s.add_argument("--prebuffer-ms", type=int, default=300, help="audio queued before playback starts")
+    s.add_argument("--no-log", action="store_true", help="don't write the delta-chunk log")
+    s.add_argument("--log-file", help="chunk log path (default runtime/logs/deltastream_chunks.log)")
     f = sub.add_parser("file"); f.add_argument("wav"); f.add_argument("--model", required=True)
     f.add_argument("--language")
     li = sub.add_parser("listen"); li.add_argument("--model", required=True)
@@ -369,19 +424,31 @@ def main() -> None:
 
     try:
         if a.cmd == "say":
-            gen = (c.speak_raw if a.raw else c.speak)(a.text, a.model)
-            proc = None if a.out else player(a.rate)
-            sink = open(a.out, "wb") if a.out else proc.stdin
-            try:
-                for pcm in gen:
-                    sink.write(pcm); sink.flush()
-            except BrokenPipeError:
-                sys.exit("error: the audio player exited early")
-            finally:
-                with contextlib.suppress(BrokenPipeError):
-                    sink.close()
-                if proc is not None:
-                    proc.wait()          # let the tail of the audio finish playing
+            if a.out:                                    # dump raw PCM to a file, no playback
+                with open(a.out, "wb") as sink:
+                    for pcm in (c.speak_raw if a.raw else c.speak)(a.text, a.model):
+                        sink.write(pcm)
+            else:
+                if make_player is None:
+                    sys.exit("error: lucy_player.py not found next to this script")
+                pl = make_player(a.rate, 1, prefer=a.player, prebuffer_ms=a.prebuffer_ms) \
+                    if a.player != "pipe" else make_player(a.rate, 1, prefer="pipe")
+                log = ChunkLog(a.text, a.rate, player=pl, enabled=not a.no_log, path=a.log_file, source="cli")
+                if hasattr(pl, "on_event"):
+                    pl.on_event = log.player_event
+                print(f"[player] {type(pl).__name__}", file=sys.stderr)
+                try:
+                    pl.open()
+                    print(f"[player] device: {pl.device}", file=sys.stderr)
+                    for pcm in (c.speak_raw if a.raw else c.speak)(a.text, a.model, log=log):
+                        pl.feed(pcm)
+                    pl.wait()                            # let the tail finish playing
+                except BrokenPipeError:
+                    sys.exit("error: the audio player exited early")
+                finally:
+                    pl.close()
+                if not a.no_log:
+                    print(f"[log] {log.path}", file=sys.stderr)
         else:
             events = (c.transcribe_file(a.wav, a.model, a.language) if a.cmd == "file"
                       else c.transcribe_live(mic(a.rate), a.model, a.rate, language=a.language))

@@ -8,11 +8,12 @@ to be accessible from your Tailscale network.
 import sys
 import os
 import logging
+from pathlib import Path
 
 # --- Critical: Insert Lucy_Core src BEFORE any other path so that
 # the Hermes venv's editable install of 'lucy' (agents-harness)
 # does not shadow our package. ---
-LUCY_CORE_SRC = r"C:\Users\dimay\Lucy\Lucy_Core\src"
+LUCY_CORE_SRC = str(Path(__file__).resolve().parents[2])  # <root>/src
 if LUCY_CORE_SRC not in sys.path:
     sys.path.insert(0, LUCY_CORE_SRC)
 
