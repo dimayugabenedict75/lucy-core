@@ -1,0 +1,19 @@
+triggers:
+  - "my name is"
+  - "call me"
+  - "\\bi like\\b"
+  - "\\bi prefer\\b"
+  - "\\bi always want\\b"
+  - "remember that"
+  - "\\bi use\\b"
+  # Standing-instruction / correction phrasing — things the user says once
+  # but means as a permanent rule, not just a one-off comment for this turn.
+  - "don'?t assume"
+  - "never assume"
+  - "always ask"
+  - "always check"
+  - "check first"
+  - "don'?t guess"
+  - "ask (me )?before"
+  - "from now on"
+  - "\\bnever\\b.{0,20}\\bwithout\\b"

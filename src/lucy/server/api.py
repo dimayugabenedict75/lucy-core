@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Iterator, Iterable
 import httpx
 import asyncio
 import logging
@@ -13,20 +13,58 @@ from pathlib import Path
 
 # --- Lucy Core Imports ---
 import sys
-sys.path.insert(0, r"C:/Users/dimay/Lucy/Lucy_Core/src")
+# Put THIS project's src/ first so another install of `lucy` (e.g. the Hermes
+# venv's editable agents-harness) can't shadow it. Derived from this file's
+# location rather than a hardcoded user path.
+_SRC_DIR = str(Path(__file__).resolve().parents[2])
+if _SRC_DIR in sys.path:
+    sys.path.remove(_SRC_DIR)
+sys.path.insert(0, _SRC_DIR)
 
 from lucy.memory.manager import MemoryManager
 from lucy.skills.memory.hook import detect_memory_candidate, render_confirmation
 from lucy.skills.skills_manager import SkillsManager
+from lucy.server.voice_control import router as voice_router
+from lucy import paths as _paths
+from lucy.server.llm_manager import llm   # model switching, temperature, reasoning, KV cache
 import base64
 
 # Persona is loaded from file
-PERSONA_PATH = r"C:/Users/dimay/Lucy/Lucy_Core/.core/personas/lucy.md"
+PERSONA_PATH = str(_paths.PERSONA_PATH)
 
 app = FastAPI(title="Lucy Core API")
 
 logger = logging.getLogger("lucy.core.api")
 logging.basicConfig(level=logging.INFO)
+
+# --- Log file (read by GET /api/logs and the LOGS button in the chat UI) ---
+# Previously nothing wrote this file, so /api/logs always returned an empty list.
+LOG_PATH = str(_paths.RUNTIME / "lucy_core.log")
+
+
+def _setup_file_logging():
+    from logging.handlers import RotatingFileHandler
+    root = logging.getLogger()
+    # Idempotent: uvicorn --reload re-imports this module on every restart.
+    if any(getattr(h, "_lucy_log_file", False) for h in root.handlers):
+        return
+    try:
+        Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        handler._lucy_log_file = True
+        root.addHandler(handler)
+        # uvicorn's loggers don't propagate to root, so attach there too
+        # (request lines, startup/shutdown messages). "uvicorn.error" is
+        # deliberately omitted: it propagates into "uvicorn", so adding it
+        # as well would write every line twice.
+        for name in ("uvicorn", "uvicorn.access"):
+            logging.getLogger(name).addHandler(handler)
+    except Exception as e:  # never let logging setup stop the server from starting
+        logging.getLogger("lucy.core.api").warning(f"File logging disabled: {e}")
+
+
+_setup_file_logging()
 
 
 # --- API Key Dependency ---
@@ -49,8 +87,19 @@ async def verify_api_key(request: Request):
     raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 # --- Core Configuration ---
-LLAMACPP_API_URL = "http://localhost:8080/v1"
-MODEL_NAME = os.environ.get("LUCY_MODEL_PATH", "D:/AI/lucy/LLM/Lux-Plus-M12B.i1-QAT_Q4_K.gguf")
+# LLM endpoint / model / temperature are live values owned by lucy.server.llm_manager (`llm`):
+#   Lucy 12B -> :8080, Lucy 4B -> :8081, chosen in Settings > Model.
+LUCY_AUDIO_TTS_URL = "http://127.0.0.1:8091/v1/audio/speech"
+LUCY_AUDIO_MODEL = "cielvox26"
+# Playback of the TTS delta stream:
+#   "directsound" - the server plays the PCM itself through ONE persistent Windows DirectSound
+#                   stream (jitter buffer + prebuffer, no gaps between sentences). Plays on the
+#                   PC running Lucy Core. Falls back to "browser" if sounddevice is missing.
+#   "browser"     - old path: PCM chunk files are sent to the web UI and played with Web Audio
+#                   (use this when you chat from a phone/another device).
+LUCY_AUDIO_PLAYBACK = os.environ.get("LUCY_AUDIO_PLAYBACK", "directsound").lower()
+LUCY_AUDIO_PREBUFFER_MS = int(os.environ.get("LUCY_AUDIO_PREBUFFER_MS", "300"))
+LUCY_AUDIO_SAMPLE_RATE = 24000
 MAX_CONTEXT_TOKENS = 8192      # token budget for session history + system prompts
 MAX_CONTEXT_MESSAGES = 50      # hard ceiling on messages loaded (safety)
 COMPRESSION_THRESHOLD = 0.75   # start summarizing when 75% of budget is used
@@ -62,7 +111,9 @@ MAX_TOOL_ROUNDS = 5
 LUCY_TIMEOUT = float(os.environ.get("LUCY_TIMEOUT", "600.0"))
 
 # Sandbox root for file operations
-SAFE_ROOT = Path("C:/Users/dimay").resolve()
+SAFE_ROOT = _paths.SAFE_ROOT
+_HOME = SAFE_ROOT.as_posix()              # shown to the model in tool descriptions
+_ROOT_POSIX = _paths.ROOT.as_posix()
 
 # --- API Key Auth ---
 # DEV_API_KEY defaults to 'dev-harness' if not set. The /api/health endpoint
@@ -111,11 +162,34 @@ DEV_API_KEY = os.environ.get("DEV_API_KEY", "dev-harness")
 # Allow API key via query param for browser GET requests (e.g. fetch from static HTML)
 API_KEY_QUERY_PARAM = "api_key"
 
+# --- CUA Backend (Win32 API) ---
+# Import lucy_cua for direct desktop control — real OS cursor/mouse/keyboard
+from lucy.cua.lucy_cua import (
+    get_cursor_pos,
+    set_cursor_pos,
+    mouse_click,
+    mouse_drag,
+    key_combo,
+    type_text,
+    minimize_all,
+)
+
+# Voice control (Lucy Audio Server) — /api/voice/start, /stop, /status.
+# Protected the same way as the other /api/* routes.
+app.include_router(voice_router, dependencies=[Depends(verify_api_key)])
+
+# Emoji/sticker picker: lists and serves PNGs from assets/stickers/User (see stickers.py)
+try:
+    from lucy.server.stickers import router as stickers_router
+    app.include_router(stickers_router, dependencies=[Depends(verify_api_key)])
+except Exception as _e:  # a missing/broken stickers.py must not stop the whole server
+    logger.error(f"Sticker routes not loaded: {_e}")
+
 import sqlite3
 import threading
 
 # --- Session Storage (SQLite persisted) ---
-_DB_PATH = "C:/Users/dimay/Lucy/Lucy_Core/runtime/sessions.sqlite"
+_DB_PATH = str(_paths.RUNTIME / "sessions.sqlite")
 _PATH = Path(_DB_PATH)
 _PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -206,30 +280,108 @@ def _ensure_session(session_id: str):
         _conn.commit()
 
 
-def _generate_session_title(session_id: str):
-    """Generate a session title from the first user message if title is 'New Session'."""
+def _fallback_session_title(content: str) -> str:
+    """Fast fallback: summarize the first message to <=10 words.
+
+    Takes the first sentence or first ~10 words, whichever is shorter.
+    This is a heuristic summary, not a raw prompt dump.
+    """
+    text = content.strip()
+    # Try to find first sentence boundary (period, exclamation, question mark)
+    truncated = text
+    for sep in ['. ', '! ', '? ']:
+        idx = text.find(sep)
+        if idx > 0:
+            truncated = text[:idx]
+            break
+    # Then trim to 10 words
+    words = truncated.strip().split()[:10]
+    return ' '.join(words).rstrip('.,;:!?')
+
+
+async def _generate_session_title(session_id: str):
+    """Generate a session title from the first user message if title is 'New Session'.
+
+    Uses the local llama.cpp model to produce a concise Claude-style summary
+    (e.g. 'Build a web scraper with Python') instead of raw truncation.
+    Falls back to truncation if the LLM is unavailable. Never blocks the chat.
+    """
     with _db_lock:
         row = _conn.execute(
             "SELECT title FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
-        if row and row["title"] == "New Session":
-            first_msg = _conn.execute(
-                "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY rowid ASC LIMIT 1",
-                (session_id,),
-            ).fetchone()
-            if first_msg:
-                content = first_msg["content"]
-                # Generate a concise title from the first message
-                title = content.strip()[:60]
-                if len(content.strip()) > 60:
-                    title = content.strip()[:57] + "..."
-                _conn.execute(
-                    "UPDATE sessions SET title = ? WHERE session_id = ?",
-                    (title, session_id),
+        if not row or row["title"] != "New Session":
+            return
+
+        first_msg = _conn.execute(
+            "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY rowid ASC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if not first_msg:
+            return
+
+        content = first_msg["content"]
+
+    # Try LLM-based title generation (fast, non-blocking)
+    title = await _llm_title_from_query(content)
+
+    if not title:
+        title = _fallback_session_title(content)
+
+    with _db_lock:
+        _conn.execute(
+            "UPDATE sessions SET title = ? WHERE session_id = ?",
+            (title, session_id),
+        )
+        _conn.commit()
+
+
+async def _llm_title_from_query(content: str) -> Optional[str]:
+    """Ask the local llama.cpp model for a concise session title.
+
+    Returns the title string, or None if the request fails.
+    Uses a short timeout so it never blocks the chat pipeline.
+    Maximum 10 words — Claude-style concise summary, not a prompt dump.
+    """
+    prompt = (
+        "You are a title-generation assistant. Summarize the user's message "
+        "as a concise session title: lowercase, 4-7 words max, "
+        "no quotes, no punctuation. Just the title.\n\n"
+        f"User message: {content.strip()}\n"
+        "Title:"
+    )
+    payload = {
+        "model": llm.model_name,
+        "messages": [
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 32,
+        "stream": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                f"{llm.api_url}/chat/completions", json=payload
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Title generation failed (HTTP {resp.status_code})"
                 )
-                _conn.commit()
-                return title
-    return row["title"] if row else "New Session"
+                return None
+            data = resp.json()
+            title = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            title = title.strip()
+            # Clean up any stray punctuation/quotes the model added
+            title = title.strip('"\'').strip()
+            title = title.rstrip(".,;:!?")
+            # Enforce max 10 words — reject if over
+            if not title or len(title.split()) > 10 or len(title) > 80:
+                return None
+            return title
+    except Exception as e:
+        logger.debug(f"Title generation error: {e}")
+        return None
 
 
 def _get_messages(session_id: str) -> list[dict]:
@@ -300,13 +452,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_local_file",
-            "description": "Read a file from the local filesystem. Only safe paths under C:/Users/dimay are allowed.",
+            "description": f"Read a file from the local filesystem. Only safe paths under {_HOME} are allowed.",
             "parameters": {
                 "type": "json",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to the file to read (e.g. C:/Users/dimay/Desktop/Hello.txt)"
+                        "description": f"Absolute path to the file to read (e.g. {_HOME}/Desktop/Hello.txt)"
                     }
                 },
                 "required": ["file_path"]
@@ -316,14 +468,44 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "write_local_file",
-            "description": "Write content to a file on the local filesystem. Overwrites if the file exists. Only safe paths under C:/Users/dimay are allowed. Parent directories are created automatically. After writing, you MUST call send_file with the same file_path to deliver it to the user as a downloadable attachment.",
+            "name": "edit_local_file",
+            "description": "Edit a file on the local filesystem. Reads the existing content, makes string replacements, and writes the updated result back to the same path. Use this for partial edits (adding/removing/modifying specific text sections) rather than overwriting the entire file. For each replacement, old_string must match exactly and uniquely (or use replace_all=true to replace all matches). Parent directories must already exist. Use \\\"replace_all\\\": true to replace all occurrences of a pattern.",
             "parameters": {
                 "type": "json",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to the file to write (e.g. C:/Users/dimay/Desktop/Hello.txt)"
+                        "description": f"Absolute path to the file to edit (e.g. {_HOME}/Desktop/Hello.txt)"
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to find in the file content"
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text to substitute for old_string"
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "If true, replace all occurrences of old_string. If false (default), only the first occurrence is replaced",
+                        "default": False
+                    }
+                },
+                "required": ["file_path", "old_string", "new_string"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_local_file",
+            "description": f"Write content to a file on the local filesystem. Overwrites if the file exists. Only safe paths under {_HOME} are allowed. Parent directories are created automatically. Use this to write/create a brand new file. For editing an existing file, prefer edit_local_file to avoid accidental data loss.",
+            "parameters": {
+                "type": "json",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": f"Absolute path to the file to write (e.g. {_HOME}/Desktop/Hello.txt)"
                     },
                     "content": {
                         "type": "string",
@@ -338,7 +520,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_local_files",
-            "description": "List files in a local directory. Only safe paths under C:/Users/dimay are allowed.",
+            "description": f"List files in a local directory. Only safe paths under {_HOME} are allowed.",
             "parameters": {
                 "type": "json",
                 "properties": {
@@ -376,7 +558,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "find_file",
-            "description": "Find a file by name within a specific directory and subdirectories. Only safe paths under C:/Users/dimay are allowed.",
+            "description": f"Find a file by name within a specific directory and subdirectories. Only safe paths under {_HOME} are allowed.",
             "parameters": {
                 "type": "json",
                 "properties": {
@@ -386,7 +568,7 @@ TOOLS = [
                     },
                     "dir_path": {
                         "type": "string",
-                        "description": "Root directory to search in (default: C:/Users/dimay)"
+                        "description": f"Root directory to search in (default: {_HOME})"
                     }
                 },
                 "required": ["file_name"]
@@ -397,13 +579,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "send_file",
-            "description": "Signal to the client that a file is ready for the user to view or download. The file must already exist on disk under C:/Users/dimay.",
+            "description": f"Signal to the client that a file is ready for the user to view or download. The file must already exist on disk under {_HOME}.",
             "parameters": {
                 "type": "json",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to the file to send (e.g. C:/Users/dimay/data/uploads/screenshot.png)"
+                        "description": f"Absolute path to the file to send (e.g. {_HOME}/data/uploads/screenshot.png)"
                     },
                     "caption": {
                         "type": "string",
@@ -424,7 +606,7 @@ TOOLS = [
                 "properties": {
                     "image_path": {
                         "type": "string",
-                        "description": "Path to the uploaded image file on disk (e.g. C:/Users/dimay/Lucy/Lucy_Core/runtime/tmp/screenshot.png)"
+                        "description": f"Path to the uploaded image file on disk (e.g. {_ROOT_POSIX}/runtime/tmp/screenshot.png)"
                     },
                     "question": {
                         "type": "string",
@@ -479,6 +661,156 @@ TOOLS = [
                 "required": ["urls"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_tts",
+            "description": "Synthesize speech from text using the CielVox 2.6 TTS model (via the Lucy Audio server on port 8091). Returns a MEDIA: path to a WAV file that the client plays automatically.",
+            "parameters": {
+                "type": "json",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to synthesize. Keep under ~500 characters per call for best quality and streaming behavior."
+                    },
+                    "voice": {
+                        "type": "string",
+                        "description": "Voice preset to use (e.g. 'frieren'). Defaults to the model's configured default.",
+                        "default": "frieren"
+                    }
+                },
+                "required": ["text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cua_cursor",
+            "description": "Get or set the real OS cursor position via Win32 API. Pass action 'get' to read current position, or 'move' with x/y to move the cursor. Returns {'x': X, 'y': Y}.",
+            "parameters": {
+                "type": "json",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["get", "move"],
+                        "description": "'get' returns current cursor position; 'move' requires x and y"
+                    },
+                    "x": {
+                        "type": "integer",
+                        "description": "Target X coordinate (required for action='move')"
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Target Y coordinate (required for action='move')"
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cua_mouse",
+            "description": "Control mouse: click, drag, or move. action='click' requires x,y and optional button ('left'/'right'/'middle'). action='drag' requires x1,y1,x2,y2. action='move' requires x,y.",
+            "parameters": {
+                "type": "json",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["click", "drag", "move"],
+                        "description": "The mouse action to perform"
+                    },
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "x1": {"type": "integer", "description": "Drag start X (for drag action)"},
+                    "y1": {"type": "integer", "description": "Drag start Y (for drag action)"},
+                    "x2": {"type": "integer", "description": "Drag end X (for drag action)"},
+                    "y2": {"type": "integer", "description": "Drag end Y (for drag action)"},
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "middle"],
+                        "default": "left"
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cua_keyboard",
+            "description": "Send keyboard input. action='hotkey' requires keys list (e.g. ['win','d']). action='type' requires text string. action='press' requires a single key name.",
+            "parameters": {
+                "type": "json",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["hotkey", "type", "press", "minimize", "enter", "escape"],
+                        "description": "The keyboard action to perform"
+                    },
+                    "keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Key combo components (for hotkey action, e.g. ['win','d'])"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type (for type action)"
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_drive_files",
+            "description": "List the most recent files in your Google Drive.",
+            "parameters": {
+                "type": "json",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_google_doc",
+            "description": "Create a new Google Doc with the given title and return its name and ID.",
+            "parameters": {
+                "type": "json",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "The title for the new Google Doc"
+                    }
+                },
+                "required": ["title"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_doc_content",
+            "description": "Retrieve the full text content of a Google Doc by its title.",
+            "parameters": {
+                "type": "json",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "The title of the Google Doc to retrieve"
+                    }
+                },
+                "required": ["title"]
+            }
+        }
     }
 ]
 
@@ -493,6 +825,10 @@ def _resolve_skills_to_tools(skill_list: list[dict]) -> list[dict]:
     Each skill has a 'tools' field (list of tool name strings).
     Returns the full OpenAI-format tool definitions from TOOL_REGISTRY.
     Falls back to ALL tools if no skills specify tools (backward compat).
+
+    Note: write_local_file and edit_local_file and read_local_file are ALWAYS 
+    included (never skill-gated) so the model can reliably edit files without 
+    skill-matching confusion.
     """
     tool_names = set()
     for skill in skill_list:
@@ -501,6 +837,10 @@ def _resolve_skills_to_tools(skill_list: list[dict]) -> list[dict]:
             for t in tools:
                 if isinstance(t, str) and t in TOOL_REGISTRY:
                     tool_names.add(t)
+    # Always include file I/O tools (Fix 1: stop file I/O from being skill-gated)
+    tool_names.add("write_local_file")
+    tool_names.add("edit_local_file")
+    tool_names.add("read_local_file")
     if tool_names:
         return [TOOL_REGISTRY[name] for name in sorted(tool_names)]
     return TOOLS  # fallback: all tools available
@@ -644,7 +984,7 @@ async def _analyze_image(image_path: str, question: str = "") -> str:
 
     # Send to llama-server multimodal endpoint
     payload = {
-        "model": MODEL_NAME,
+        "model": llm.model_name,
         "messages": [
             {
                 "role": "user",
@@ -661,7 +1001,7 @@ async def _analyze_image(image_path: str, question: str = "") -> str:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
-                f"{LLAMACPP_API_URL}/chat/completions",
+                f"{llm.api_url}/chat/completions",
                 json=payload,
             )
             if resp.status_code == 200:
@@ -687,6 +1027,139 @@ def _resolve_path(file_path: str) -> Path:
     return target
 
 
+# -- Lucy Audio streaming TTS client (SSE delta stream) --
+# This replaces the batch send_tts approach: instead of waiting for the full
+# WAV file, we get s16LE PCM chunks as they're generated by the model.
+# Each chunk is yielded as a MEDIA: event for immediate playback — true streaming TTS.
+
+_NATIVE_PLAYER = None
+_NATIVE_PLAYER_TRIED = False
+_CHUNK_LOG_PATH = _paths.RUNTIME / "logs" / "deltastream_chunks.log"
+
+
+def _get_native_player():
+    """Process-wide DirectSound player (created once, kept open across sentences), or None."""
+    global _NATIVE_PLAYER, _NATIVE_PLAYER_TRIED
+    if LUCY_AUDIO_PLAYBACK != "directsound":
+        return None
+    if _NATIVE_PLAYER is not None or _NATIVE_PLAYER_TRIED:
+        return _NATIVE_PLAYER
+    _NATIVE_PLAYER_TRIED = True
+    try:
+        _audio_dir = str(_paths.ROOT / "lucy_audio")
+        if _audio_dir not in sys.path:
+            sys.path.insert(0, _audio_dir)
+        from lucy_player import DirectSoundPlayer, directsound_available
+        if not directsound_available():
+            logger.warning("DirectSound playback unavailable (needs Windows + 'pip install sounddevice'); "
+                           "falling back to browser playback")
+            return None
+        _NATIVE_PLAYER = DirectSoundPlayer(LUCY_AUDIO_SAMPLE_RATE, 1, prebuffer_ms=LUCY_AUDIO_PREBUFFER_MS)
+        _NATIVE_PLAYER.on_event = lambda ev: logger.info(f"DirectSound: {ev}")
+    except Exception as e:
+        logger.warning(f"DirectSound player init failed ({e}); falling back to browser playback")
+    return _NATIVE_PLAYER
+
+
+async def _stream_tts_to_sse(text: str, voice: str = "frieren") -> Iterator[str]:
+    """Connect to Lucy Audio's SSE streaming endpoint and play / yield the PCM deltas.
+
+    DirectSound mode: every delta goes straight into the persistent DirectSound player and this
+    generator yields nothing. Browser mode: each delta is written to a .pcm file and yielded as
+    MEDIA:/path so the web UI plays it. Both modes log every delta to
+    runtime/logs/deltastream_chunks.log (arrival gap, lead over real time, starvation, TTFB, RTF).
+    """
+    import uuid as _uuid
+    import httpx
+    from pathlib import Path
+
+    player = _get_native_player()
+    try:
+        from lucy_player import ChunkLog
+    except ImportError:
+        _audio_dir = str(_paths.ROOT / "lucy_audio")
+        if _audio_dir not in sys.path:
+            sys.path.insert(0, _audio_dir)
+        from lucy_player import ChunkLog
+    clog = ChunkLog(text, LUCY_AUDIO_SAMPLE_RATE, source="server", path=_CHUNK_LOG_PATH, player=player,
+                    playback="directsound" if player else "browser", voice=voice)
+    if player is not None:
+        player.on_event = clog.player_event      # underruns etc. land in the same log
+        # Opening the device takes tens of ms: do it off the event loop.
+        await asyncio.get_running_loop().run_in_executor(None, player.open)
+    else:
+        chunk_dir = _paths.HERMES_HOME / "cache" / "audio" / "stream"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    request_body = {
+        "model": LUCY_AUDIO_MODEL,
+        "input": text,
+        "response_format": "pcm",
+        "stream_format": "sse",
+        "sample_rate": LUCY_AUDIO_SAMPLE_RATE,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream(
+                "POST", LUCY_AUDIO_TTS_URL,
+                json=request_body,
+                headers={"Accept": "text/event-stream"},
+            ) as resp:
+                if resp.status_code != 200:
+                    err = await resp.aread()
+                    logger.error(f"Lucy Audio stream error: HTTP {resp.status_code}")
+                    clog.error(f"HTTP {resp.status_code}: {err[:200]!r}")
+                    return
+
+                buffer = ""
+                async for chunk in resp.aiter_text():
+                    buffer += chunk.replace("\r\n", "\n")
+                    # SSE: split on blank lines (event boundaries)
+                    while "\n\n" in buffer:
+                        event_data, buffer = buffer.split("\n\n", 1)
+                        for line in event_data.split("\n"):
+                            if line.startswith("data: "):
+                                payload = line[6:]
+                                if payload == "[DONE]":
+                                    clog.done()
+                                    return
+                                try:
+                                    ev = json.loads(payload)
+                                except json.JSONDecodeError:
+                                    continue
+                                if ev.get("type") == "speech.audio.delta":
+                                    audio_b64 = ev.get("audio", "")
+                                    if audio_b64:
+                                        pcm_data = base64.b64decode(audio_b64)
+                                        clog.chunk(len(pcm_data))
+                                        if player is not None:
+                                            player.feed(pcm_data)      # non-blocking
+                                        else:
+                                            chunk_path = chunk_dir / f"pcm_{_uuid.uuid4().hex[:8]}.pcm"
+                                            chunk_path.write_bytes(pcm_data)
+                                            yield f"MEDIA:{chunk_path.as_posix()}"
+                                elif ev.get("type") == "speech.audio.done":
+                                    logger.debug("Lucy Audio stream done")
+                                    clog.done(ev.get("timing"))
+                                    return
+                                elif ev.get("type") == "error":
+                                    err_msg = ev.get("error", {})
+                                    logger.error(f"Lucy Audio stream error: {err_msg}")
+                                    clog.error(str(err_msg))
+                                    return
+    except httpx.ConnectError:
+        logger.warning("Lucy Audio server not reachable on 8091 — is voice mode on?")
+        clog.error("connect error: Lucy Audio server not reachable on 8091")
+    except Exception as e:
+        logger.error(f"Lucy Audio stream exception: {e}")
+        clog.error(repr(e))
+    finally:
+        clog.done()                    # no-op if a summary/error was already written
+        if player is not None:
+            player.end_of_stream()     # play out whatever is queued, even if short or truncated
+
+
 async def execute_tool_call(tool_name: str, args: dict) -> str:
     """Execute a single tool call and return its string result."""
     logger.info(f"Executing tool: {tool_name} with args: {args}")
@@ -709,7 +1182,37 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
         except Exception as e:
             return f"[error reading file: {e}]"
 
-    elif tool_name == "write_local_file":
+    if tool_name == "edit_local_file":
+        file_path = args.get("file_path", "")
+        old_string = args.get("old_string", "")
+        new_string = args.get("new_string", "")
+        replace_all = args.get("replace_all", False)
+        # Normalize string booleans to actual Python booleans
+        # (llama-server may emit "true"/"false" strings instead of true/false)
+        if isinstance(replace_all, str):
+            replace_all = replace_all.lower() == "true"
+        target = _resolve_path(file_path)
+        if target is None:
+            return f"Error: {file_path} is outside the allowed root."
+        if not target.exists() or not target.is_file():
+            return f"File not found: {file_path}"
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+            if old_string not in content:
+                return f"Error: 'old_string' not found in file: {file_path}"
+            if not replace_all and content.count(old_string) > 1:
+                return f"Error: 'old_string' matches {content.count(old_string)} times in {file_path}. Use replace_all=true or provide more context."
+            occurrences = content.count(old_string) if replace_all else 1
+            if replace_all:
+                new_content = content.replace(old_string, new_string)
+            else:
+                new_content = content.replace(old_string, new_string, 1)
+            target.write_text(new_content, encoding="utf-8")
+            return f"Replaced {occurrences} occurrence(s) in {file_path}"
+        except Exception as e:
+            return f"[error editing file: {e}]"
+
+    if tool_name == "write_local_file":
         file_path = args.get("file_path", "")
         content = args.get("content", "")
         target = _resolve_path(file_path)
@@ -764,10 +1267,15 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
 
     elif tool_name == "find_file":
         file_name = args.get("file_name", "")
-        dir_path = args.get("dir_path", "C:/Users/dimay")
+        dir_path = args.get("dir_path", str(SAFE_ROOT))
         target = _resolve_path(dir_path)
         if target is None:
             return f"Error: {dir_path} is outside the allowed root."
+        # Validate file_name — reject shell-dangerous characters to prevent
+        # command injection in the find command below
+        _dangerous = [';', '|', '&', '$', '`', '"', "'"]
+        if not file_name or any(c in file_name for c in _dangerous):
+            return "Error: file_name contains invalid characters"
         try:
             result = subprocess.run(
                 ["bash", "-c", f'find "{target}" -name "{file_name}" -maxdepth 4 2>/dev/null | head -20'],
@@ -794,7 +1302,17 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
         if not target.exists() or not target.is_file():
             return f"File not found: {file_path}"
         # Return MEDIA: marker so Hermes/Discord sends it as an attachment
-        result = f"MEDIA:{target}"
+        # Use forward slashes in the path for cross-platform frontend compatibility
+        # Calculate path relative to SAFE_ROOT
+        try:
+            relative_path = target.relative_to(SAFE_ROOT)
+            media_path_str = relative_path.as_posix()
+        except ValueError:
+            # Fallback: use the absolute path if relative fails
+            media_path_str = target.as_posix()
+            
+        # Ensure we have a clean string for the MEDIA marker
+        result = f"MEDIA:{media_path_str}"
         if caption:
             result += f" {caption}"
         return result
@@ -817,10 +1335,138 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
             return f"Image not found or outside allowed path: {image_path}"
         return await _analyze_image(str(target), question)
 
+    elif tool_name == "send_tts":
+        text = args.get("text", "")
+        voice = args.get("voice", "frieren")
+        if not text:
+            return "send_tts requires 'text' parameter"
+        # Save the text to a temp input file for the wrapper to read
+        import uuid as _uuid
+        _ts = time.strftime("%Y%m%d_%H%M%S")
+        input_file = _paths.HERMES_HOME / "cache" / "scratch" / f"tts_input_{_uuid.uuid4().hex[:8]}.txt"
+        input_file.parent.mkdir(parents=True, exist_ok=True)
+        input_file.write_text(text, encoding="utf-8")
+        # Call the wrapper which proxies to lucy audio server on 8091
+        # Use the baked-in wrapper inside Lucy_Core/lucy_audio/ first;
+        # fall back to the Hermes scripts dir for backwards compat.
+        baked_wrapper = _paths.ROOT / "lucy_audio" / "build" / "windows-vulkan-release" / "bin" / "tts-wrapper-lucy-cielvox26.bat"
+        hermes_wrapper = _paths.HERMES_HOME / "scripts" / "tts-wrapper-lucy-cielvox26.bat"
+        wrapper = baked_wrapper if baked_wrapper.exists() else hermes_wrapper
+        output_file = _paths.HERMES_HOME / "cache" / "audio" / f"tts_lucy_{_uuid.uuid4().hex[:8]}.wav"
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # --- Delta stream log ---
+        log_path = _paths.RUNTIME / "logs" / "deltastream_tts.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _log_deltastream(status: str, msg: str = "", media_path: str = ""):
+            entry = {
+                "timestamp": _ts,
+                "session": "current",
+                "tool": "send_tts",
+                "status": status,
+                "voice": voice,
+                "text_preview": text[:80] + ("..." if len(text) > 80 else ""),
+                "message": msg,
+                "media": media_path,
+            }
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        _log_deltastream("started", text)
+        try:
+            result = subprocess.run(
+                ["cmd", "/c", str(wrapper), str(input_file), str(output_file)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                _log_deltastream("error", f"wrapper exit {result.returncode}: {result.stderr[:200]}")
+                logger.error(f"TTS wrapper failed: {result.stderr}")
+                return f"TTS failed: {result.stderr[:200]}"
+            if output_file.exists() and output_file.stat().st_size > 1000:
+                _log_deltastream("success", f"WAV {output_file.stat().st_size} bytes", str(output_file).replace("\\", "/"))
+                # Return MEDIA: path with forward slashes for frontend compatibility
+                return f"MEDIA:{str(output_file).replace(chr(92), '/')}"
+            _log_deltastream("error", f"output missing/too small (size={output_file.stat().st_size if output_file.exists() else 0})")
+            return f"TTS error: output file missing or too small"
+        except subprocess.TimeoutExpired:
+            _log_deltastream("timeout", "wrapper exceeded 120s")
+            logger.error("TTS wrapper timed out after 120s")
+            return f"TTS error: lucy audio server timeout (120s)"
+        except Exception as e:
+            _log_deltastream("error", str(e))
+            logger.error(f"TTS call error: {e}")
+            return f"TTS error: {e}"
+
+    elif tool_name in ("cua_cursor", "cua_mouse", "cua_keyboard"):
+        # Dispatch CUA tools to the lucy_cua module (Win32 API backend)
+        from lucy.cua.lucy_cua import (
+            get_cursor_pos, set_cursor_pos, mouse_click,
+            mouse_drag, key_combo, type_text, minimize_all,
+        )
+        try:
+            if tool_name == "cua_cursor":
+                action = args.get("action", "get")
+                if action == "get":
+                    return json.dumps(get_cursor_pos())
+                elif action == "move":
+                    x, y = args["x"], args["y"]
+                    return json.dumps(set_cursor_pos(x, y))
+                return json.dumps({"error": f"Unknown cursor action: {action}"})
+
+            elif tool_name == "cua_mouse":
+                action = args.get("action", "click")
+                if action == "click":
+                    x, y = args["x"], args["y"]
+                    button = args.get("button", "left")
+                    return json.dumps(mouse_click(x, y, button))
+                elif action == "move":
+                    x, y = args["x"], args["y"]
+                    return json.dumps(set_cursor_pos(x, y))
+                elif action == "drag":
+                    x1, y1, x2, y2 = args["x1"], args["y1"], args["x2"], args["y2"]
+                    return json.dumps(mouse_drag(x1, y1, x2, y2))
+                return json.dumps({"error": f"Unknown mouse action: {action}"})
+
+            elif tool_name == "cua_keyboard":
+                action = args.get("action", "press")
+                if action == "hotkey":
+                    keys = args.get("keys", [])
+                    return json.dumps(key_combo(keys))
+                elif action == "type":
+                    text_content = args.get("text", "")
+                    return json.dumps(type_text(text_content))
+                elif action in ("minimize", "enter", "escape"):
+                    key_map = {"minimize": ["win", "d"], "enter": ["enter"], "escape": ["escape"]}
+                    return json.dumps(key_combo(key_map[action]))
+                return json.dumps({"error": f"Unknown keyboard action: {action}"})
+
+        except Exception as e:
+            logger.error(f"CUA tool error ({tool_name}): {e}")
+            return json.dumps({"error": str(e)})
+
+    if tool_name == "list_drive_files":
+        from lucy.tools import Toolset
+        toolset = Toolset()
+        return toolset.list_drive_files()
+
+    if tool_name == "create_google_doc":
+        from lucy.tools import Toolset
+        toolset = Toolset()
+        title = args.get("title", "")
+        return toolset.create_google_doc(title)
+
+    if tool_name == "get_doc_content":
+        from lucy.tools import Toolset
+        toolset = Toolset()
+        title = args.get("title", "")
+        return toolset.get_doc_content(title)
+
     else:
         return f"Unknown tool: {tool_name}"
 
 
+# --- Request Models ---
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
@@ -839,7 +1485,7 @@ async def health_check():
     llama_online = False
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get(f"{LLAMACPP_API_URL}/models")
+            resp = await client.get(f"{llm.api_url}/models")
             if resp.status_code == 200:
                 llama_online = True
     except Exception:
@@ -870,6 +1516,22 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
     except Exception as e:
         logger.warning(f"Failed to retrieve skills: {e}")
 
+    # --- Tool usage guidance (Fix 2 reinforcement) ---
+    # Reinforce that edit/update/patch all map to edit_local_file,
+    # and edit should always be called (not just narrated) when the user
+    # asks to modify an existing file.
+    messages.append({"role": "system", "content": (
+        "TOOL USAGE RULES: (1) write_local_file — for creating NEW files only. "
+        "(2) edit_local_file — for modifying EXISTING files. "
+        "When the user says 'edit', 'update', 'patch', 'modify', or 'change' a file, "
+        "ALWAYS call edit_local_file. Do not narrate edits without calling the tool. "
+        "edit_local_file does partial string replacement — use it to change specific "
+        "sections without rewriting the whole file. "
+        "(3) read_local_file — for viewing file contents. "
+        "When you need to know what's in a file, call read_local_file first, "
+        "then use edit_local_file with the correct old_string."
+    )})
+
     # Session history (limit to last N messages to avoid context overflow)
     messages.extend(_get_messages(session_id)[-MAX_CONTEXT_MESSAGES:])
 
@@ -893,14 +1555,18 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
 
 
 async def _generate_once(messages: List[Dict[str, Any]], stream: bool) -> Any:
-    """Send one request to llama-server. Returns either a streaming response or full JSON."""
+    """Send one request to llama-server. Returns either a streaming response or full JSON.
+    
+    Retries once on 503 (llama-server busy starting up or handling another request).
+    """
     payload = {
-        "model": MODEL_NAME,
+        "model": llm.model_name,
         "messages": messages,
-        "temperature": DEFAULT_TEMPERATURE,
+        "temperature": llm.temperature,
         "max_tokens": 2048,
         "tools": TOOLS,
         "tool_choice": "auto",
+        **llm.request_extras(),
     }
     if stream:
         payload["stream"] = True
@@ -908,13 +1574,22 @@ async def _generate_once(messages: List[Dict[str, Any]], stream: bool) -> Any:
     else:
         payload["stream"] = False
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        if stream:
-            resp = await client.stream("POST", f"{LLAMACPP_API_URL}/chat/completions", json=payload)
-            return resp
-        else:
-            resp = await client.post(f"{LLAMACPP_API_URL}/chat/completions", json=payload)
-            return resp
+    max_retries = 1
+    for attempt in range(max_retries + 1):
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            if stream:
+                resp = await client.stream("POST", f"{llm.api_url}/chat/completions", json=payload)
+                # Check if the stream response started with an error
+                # (client.stream returns 200, but the first SSE line may contain an error)
+                return resp
+            else:
+                resp = await client.post(f"{llm.api_url}/chat/completions", json=payload)
+                if resp.status_code == 503 and attempt < max_retries:
+                    logger.warning(f"llama-server returned 503 (busy), retrying... (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(1.0)
+                    continue
+                return resp
+    return resp
 
 
 async def _collect_full_response(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -926,7 +1601,7 @@ async def _collect_full_response(messages: List[Dict[str, Any]]) -> Dict[str, An
 
 
 # --- Activity Indicator Helpers ---
-# Maps tool names to human-readable activity indicator labels
+# Maps tool names to a plain fallback activity label (no detail available).
 _TOOL_ACTIVITY_MAP = {
     "web_search": "search",
     "web_extract": "read",
@@ -935,24 +1610,115 @@ _TOOL_ACTIVITY_MAP = {
     "run_shell_command": "run",
     "send_file": "send",
     "analyze_image": "analyze",
+    "send_tts": "speak",
+    "cua_cursor": "control",
+    "cua_mouse": "control",
+    "cua_keyboard": "control",
+    "list_drive_files": "drive",
+    "create_google_doc": "docs",
+    "get_doc_content": "docs",
 }
+
+_ACTIVITY_DETAIL_MAX = 60  # truncate long detail (queries/commands) so the UI stays one line
+
+
+def _truncate(s: str, limit: int = _ACTIVITY_DETAIL_MAX) -> str:
+    s = s.strip()
+    return s if len(s) <= limit else s[:limit - 1] + "\u2026"
 
 
 def _tool_to_activity(tool_name: str, args: dict) -> str:
-    """Map a tool name to an activity indicator label for the frontend."""
-    if tool_name in _TOOL_ACTIVITY_MAP:
-        return _TOOL_ACTIVITY_MAP[tool_name]
-    # For write/edit tools, try to show the file path
-    if tool_name == "write_local_file" and args.get("file_path"):
+    """Map a tool name + its args to a 'prefix:detail' activity label for the
+    frontend (e.g. 'write:reset.py', 'search:latest iPhone'). The frontend
+    splits on the first ':' and looks up a human label for the prefix, so any
+    tool added here with a new prefix should get a matching entry added to
+    the `labels` map in chat.html."""
+    if tool_name == "edit_local_file" and args.get("file_path"):
         return f"edit:{args['file_path']}"
+    if tool_name == "write_local_file" and args.get("file_path"):
+        return f"write:{args['file_path']}"
     if tool_name == "read_local_file" and args.get("file_path"):
         return f"read:{args['file_path']}"
-    if tool_name == "analyze_image":
-        return "analyzing image"
-    return tool_name  # fallback: use tool name as-is
+    if tool_name == "list_local_files" and args.get("dir_path"):
+        return f"list:{args['dir_path']}"
+    if tool_name == "find_file" and args.get("file_name"):
+        return f"search:{args['file_name']}"
+    if tool_name == "run_shell_command" and args.get("command"):
+        return f"run:{_truncate(args['command'])}"
+    if tool_name == "send_file" and args.get("file_path"):
+        return f"send:{args['file_path']}"
+    if tool_name == "web_search" and args.get("query"):
+        return f"search:{_truncate(args['query'])}"
+    if tool_name == "web_extract" and args.get("urls"):
+        return f"read:{_truncate(', '.join(args['urls'][:2]))}"
+    if tool_name == "analyze_image" and args.get("image_path"):
+        return f"analyze:{args['image_path']}"
+    if tool_name == "send_tts" and args.get("text"):
+        return f"speak:{_truncate(args['text'], 40)}"
+    if tool_name == "cua_cursor" and args.get("action"):
+        if args["action"] == "move":
+            return f"cursor:move({args.get('x','?')},{args.get('y','?')})"
+        return f"cursor:{args['action']}"
+    if tool_name == "cua_mouse" and args.get("action"):
+        if args["action"] == "click":
+            return f"mouse:click({args.get('x','?')},{args.get('y','?')})"
+        elif args["action"] == "drag":
+            return f"mouse:drag({args.get('x1','?')},{args.get('y1','?')}"
+        return f"mouse:{args['action']}"
+    if tool_name == "cua_keyboard" and args.get("action"):
+        if args["action"] == "hotkey":
+            return f"keys:{','.join(args.get('keys', []))}"
+        elif args["action"] == "type":
+            return f"type:{_truncate(args.get('text',''), 40)}"
+        return f"keys:{args['action']}"
+
+    # No usable detail in args — fall back to a plain category label.
+    if tool_name in _TOOL_ACTIVITY_MAP:
+        return _TOOL_ACTIVITY_MAP[tool_name]
+    return tool_name  # last resort: raw tool name
 
 
-async def _stream_response(messages: List[Dict[str, Any]], temperature: float = DEFAULT_TEMPERATURE, skill_list: list[dict] = None):
+# --- Stop / queued-message support ---
+# The UI can abort a reply mid-stream and immediately send the next message.
+# This marks "the previous reply for this session is still running / cleaning
+# up" so the next request doesn't build its history before the interrupted
+# reply has been saved.
+_session_inflight: Dict[str, asyncio.Event] = {}
+
+import re
+
+def _clean_text_for_tts(text: str) -> str:
+    """Remove Action: prefixes, markdown bold/italic markers, and emojis
+    from text before it is sent to the TTS engine.
+
+    This prevents the voice from reading out 'Action: send_tts' or stuttering
+    on **bold** markers like 'star star Hello star star'.
+    """
+    import re
+    # Remove ReAct-style "Action:" / "Action Input:" prefixes (multiline)
+    text = re.sub(r'^(Action|Action Input):\s*', '', text, flags=re.MULTILINE | re.IGNORECASE)
+    # Strip markdown bold and italic markers (** and __ or * and _)
+    text = text.replace('**', '').replace('__', '')
+    text = text.replace('*', '').replace('_', '')
+    # Remove emojis and other non-speech Unicode symbols
+    # Using a simple approach: remove anything not a word char, space, or basic punctuation.
+    text = re.sub(r'[^\w\s.,!?;:\'"()\n-]', '', text, flags=re.UNICODE)
+    # Collapse multiple spaces/tabs into one
+    text = re.sub(r'[ \t]+', ' ', text)
+    return text.strip()
+
+
+
+async def _wait_for_previous_reply(session_id: str, timeout: float = 5.0):
+    prev = _session_inflight.get(session_id)
+    if prev is not None and not prev.is_set():
+        try:
+            await asyncio.wait_for(prev.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"Previous reply for session {session_id} did not finish within {timeout}s; continuing.")
+
+
+async def _stream_response(messages: List[Dict[str, Any]], temperature: float | None = None, skill_list: list[dict] = None, voice_mode: bool = False):
     """Stream a response from llama-server, handling tool calls in a loop.
 
     Emits SSE lines: {content}, {activity}, {media}, {done}, and finally [METRICS]{json}.
@@ -962,7 +1728,11 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float = 
     _total_tool_calls = 0
     _full_response_text = ""
     round_num = 0
+    _tts_voice = "frieren"
+    _tts_buffer = ""  # accumulates sentence fragments during streaming
 
+    if temperature is None:
+        temperature = llm.temperature          # Settings > Model value (preset per model)
     # Emit an initial "thinking" activity indicator for the first round
     yield f"data: {json.dumps({'activity': 'think'})}\n\n"
 
@@ -974,17 +1744,18 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float = 
             # Resolve available tools from active skills (dynamic skill→tool mapping)
             available_tools = _resolve_skills_to_tools(skill_list) if skill_list else TOOLS
             payload = {
-                "model": MODEL_NAME,
+                "model": llm.model_name,
                 "messages": messages,
-                "temperature": DEFAULT_TEMPERATURE,
+                "temperature": temperature,
                 "max_tokens": 2048,
                 "tools": available_tools,
                 "tool_choice": "auto",
                 "stream": True,
                 "stream_options": {"include_usage": True},
+                **llm.request_extras(),
             }
 
-            async with client.stream("POST", f"{LLAMACPP_API_URL}/chat/completions", json=payload) as resp:
+            async with client.stream("POST", f"{llm.api_url}/chat/completions", json=payload) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
                     yield f"data: {json.dumps({'error': 'Failed to connect to brain', 'status': resp.status_code, 'detail': error_body.decode()[:500]})}\n\n"
@@ -1008,7 +1779,29 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float = 
                                 if content:
                                     assistant_content += content
                                     _full_response_text += content
+                                    _tts_buffer += content
                                     yield f"data: {json.dumps({'content': content})}\n\n"
+
+                                    # --- Incremental TTS streaming ---
+                                    # When voice_mode is on, fire streaming TTS on each
+                                    # completed sentence fragment so audio starts playing
+                                    # while the LLM is still generating — not after.
+                                    if voice_mode and _tts_buffer:
+                                        import re as _re
+                                        _sentence_end = _re.search(r'[。．！？！？.!?…\n]\s*$', _tts_buffer)
+                                        if _sentence_end:
+                                            _chunk = _tts_buffer.strip()
+                                            _tts_buffer = ""
+                                            if _chunk:
+                                                _clean_chunk = _clean_text_for_tts(_chunk)
+                                                if _clean_chunk:
+                                                    yield f"data: {json.dumps({'activity': 'speak'})}\n\n"
+                                                    # Stream PCM chunks as they arrive from Lucy Audio SSE
+                                                    async for _media_event in _stream_tts_to_sse(_clean_chunk, _tts_voice):
+                                                        if _media_event.startswith("MEDIA:"):
+                                                            _media_path = _media_event.split(" ", 1)[0].replace("MEDIA:", "")
+                                                            yield f"data: {json.dumps({'media': _media_path})}\n\n"
+                                                yield f"data: {json.dumps({'activity': None})}\n\n"
 
                                 # Handle tool calls (cumulative — we collect args)
                                 tc_list = delta.get("tool_calls", [])
@@ -1088,19 +1881,25 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float = 
         force_messages = list(messages)
         force_messages.append({
             "role": "system",
-            "content": "You have used all your tool calls. Synthesize your response from the information gathered so far. Do not call any more tools.",
+            "content": (
+                "You have used all your tool calls for this turn and cannot call any more. "
+                "Do not fill remaining gaps with assumptions or guesses. Report only what you "
+                "actually confirmed via tools. For anything you did not confirm, say plainly "
+                "that you don't know yet and ask the user, rather than presenting a guess as fact."
+            ),
         })
         payload = {
-            "model": MODEL_NAME,
+            "model": llm.model_name,
             "messages": force_messages,
-            "temperature": DEFAULT_TEMPERATURE,
+            "temperature": temperature,
             "max_tokens": 2048,
             "tools": [],
             "stream": True,
             "stream_options": {"include_usage": True},
+            **llm.request_extras(),
         }
         async with httpx.AsyncClient(timeout=LUCY_TIMEOUT) as client:
-            async with client.stream("POST", LLAMACPP_API_URL + "/chat/completions", json=payload) as resp:
+            async with client.stream("POST", llm.api_url + "/chat/completions", json=payload) as resp:
                 if resp.status_code == 200:
                     async for line in resp.aiter_lines():
                         if line.startswith("data: "):
@@ -1115,14 +1914,43 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float = 
                                     content = delta.get("content", "")
                                     if content:
                                         _full_response_text += content
+                                        _tts_buffer += content
                                         yield f"data: {json.dumps({'content': content})}\n\n"
+                                        # Incremental TTS in the forced-response path too (streaming)
+                                        if voice_mode and _tts_buffer:
+                                            import re as _re2
+                                            _sent2 = _re2.search(r'[。．！？！？.!?…\n]\s*$', _tts_buffer)
+                                            if _sent2:
+                                                _chunk2 = _tts_buffer.strip()
+                                                _tts_buffer = ""
+                                                if _chunk2:
+                                                    _clean_chunk2 = _clean_text_for_tts(_chunk2)
+                                                    if _clean_chunk2:
+                                                        yield f"data: {json.dumps({'activity': 'speak'})}\n\n"
+                                                        async for _ev2 in _stream_tts_to_sse(_clean_chunk2, _tts_voice):
+                                                            if _ev2.startswith("MEDIA:"):
+                                                                _mp2 = _ev2.split(" ", 1)[0].replace("MEDIA:", "")
+                                                                yield f"data: {json.dumps({'media': _mp2})}\n\n"
+                                                    yield f"data: {json.dumps({'activity': None})}\n\n"
                             except json.JSONDecodeError:
-                                continue
+                                                continue
+
+    # --- Final TTS for any remaining buffered text (voice_mode) ---
+    # During streaming, most of the response was already spoken incrementally.
+    # This catches the last sentence fragment that didn't end with punctuation.
+    if voice_mode and _tts_buffer.strip():
+        _final_clean = _clean_text_for_tts(_tts_buffer.strip())
+        if _final_clean:
+            yield f"data: {json.dumps({'activity': 'speak'})}\n\n"
+            async for _ev_final in _stream_tts_to_sse(_final_clean, _tts_voice):
+                if _ev_final.startswith("MEDIA:"):
+                    _media_final = _ev_final.split(" ", 1)[0].replace("MEDIA:", "")
+                    yield f"data: {json.dumps({'media': _media_final})}\n\n"
+        yield f"data: {json.dumps({'activity': None})}\n\n"
 
     # Emit final metrics line per SSE protocol: [METRICS]{json}
     _elapsed = max(_time_mod.time() - _start_time, 0.001)
-    import re as _re
-    _token_count = len(_re.findall(r'\w+', _full_response_text))
+    _token_count = _count_tokens(_full_response_text)
     _tps = round(_token_count / _elapsed, 1)
     _metrics_json = json.dumps({
         'tokens_generated': _token_count,
@@ -1139,6 +1967,7 @@ async def chat_endpoint(
     message: Optional[str] = Form(None),
     session_id: Optional[str] = Form("default"),
     stream: Optional[bool] = Form(True),
+    voice_mode: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     _: bool = Depends(verify_api_key),
 ):
@@ -1147,12 +1976,18 @@ async def chat_endpoint(
     Accepts multipart/form-data for file uploads, or JSON for plain text.
     """
     # Try JSON first (backward compat with plain text requests)
+    file_paths: list[str] = []
     if not files and not message:
         try:
             body = await request.json()
             message = body.get("message", "")
             session_id = body.get("session_id", "default")
             stream = body.get("stream", True)
+            voice_mode = body.get("voice_mode", voice_mode)
+            # Accept file paths as strings (for Discord gateway relay)
+            file_paths = body.get("file_paths", []) or body.get("files", []) or []
+            if isinstance(file_paths, str):
+                file_paths = [file_paths]
         except Exception:
             pass
 
@@ -1168,20 +2003,34 @@ async def chat_endpoint(
             # Re-extract files from form if not already parsed
             if files is None:
                 files = form.getlist("files") if "files" in form else None
+            # Also accept file_paths as a form field (JSON string or comma-separated)
+            fp_field = form.get("file_paths")
+            if fp_field:
+                try:
+                    file_paths = json.loads(fp_field) if isinstance(fp_field, str) else fp_field
+                    if isinstance(file_paths, str):
+                        file_paths = [file_paths]
+                except Exception:
+                    file_paths = [fp_field]
         except Exception:
             pass
 
-    if not message:
+    # Allow empty message when files are attached (the model can reason about the image)
+    if not message and not files and not file_paths:
         raise HTTPException(status_code=400, detail="No message provided")
 
     # Handle uploaded files — save them to a temp upload dir
     uploaded_file_paths = []
     image_paths = []
     if files:
-        upload_dir = Path("C:/Users/dimay/Lucy/Lucy_Core/runtime/tmp")
+        upload_dir = _paths.RUNTIME / "tmp"
         upload_dir.mkdir(parents=True, exist_ok=True)
         for f in files:
-            safe_name = f.filename.replace("../", "").replace("..\\", "")
+            # Robust path traversal protection: extract basename only,
+            # reject any path separators or parent-dir references
+            safe_name = os.path.basename(f.filename.replace("\\", "/").strip())
+            if not safe_name or safe_name in (".", ".."):
+                safe_name = "uploaded_file"
             fpath = upload_dir / safe_name
             content = await f.read()
             fpath.write_bytes(content)
@@ -1190,6 +2039,22 @@ async def chat_endpoint(
             if str(fpath).lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp')):
                 image_paths.append(str(fpath))
             await f.seek(0)
+
+    # Handle file paths passed as strings (e.g. from Discord gateway relay)
+    if file_paths:
+        for fp in file_paths:
+            if not isinstance(fp, str):
+                continue
+            target = _resolve_path(fp)
+            if target is None or not target.exists():
+                logger.warning(f"File path from relay not found or unsafe: {fp}")
+                continue
+            uploaded_file_paths.append(str(target))
+            if str(target).lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp')):
+                image_paths.append(str(target))
+
+    # If the user just stopped a reply in this session, let it finish saving first
+    await _wait_for_previous_reply(session_id)
 
     # Build messages (includes system persona, memory, skills, history, and new user message)
     # Image paths are embedded directly in the user message as multimodal content
@@ -1207,11 +2072,16 @@ async def chat_endpoint(
     # Check for memory-worthy fact in the user message
     memory_fact = detect_memory_candidate(message)
     # Generate session title from first message if it's still "New Session"
-    _generate_session_title(session_id)
+    asyncio.create_task(_generate_session_title(session_id))
+    reply_done = asyncio.Event()
+    _session_inflight[session_id] = reply_done
+
     async def event_stream():
         full_response = ""
+        # Parse voice_mode from form field (string "true" or "false")
+        voice_mode_bool = voice_mode and voice_mode.lower() == "true"
         try:
-            async for event_data in _stream_response(messages):
+            async for event_data in _stream_response(messages, voice_mode=voice_mode_bool):
                 if event_data.startswith("data: "):
                     chunk_data = event_data[6:]
                     try:
@@ -1237,27 +2107,281 @@ async def chat_endpoint(
                     yield f"data: {json.dumps({'content': confirmation})}\n\n"
 
         except asyncio.CancelledError:
-            # Client disconnected — must re-raise; CancelledError is BaseException on 3.8+
-            # and will NOT be caught by except Exception, causing uvicorn worker crash.
+            # Client disconnected (e.g. the user pressed Stop) — must re-raise;
+            # CancelledError is BaseException on 3.8+ and will NOT be caught by
+            # except Exception, causing uvicorn worker crash.
             logger.info("Client disconnected (CancelledError in event_stream)")
+            # Save what was generated so far, marked as interrupted. Otherwise the
+            # history ends with a user message that has no reply, and the next
+            # message creates two user turns in a row, which some chat templates
+            # (e.g. Mistral-style) reject.
+            try:
+                partial = full_response.strip()
+                note = "[Response interrupted by the user.]"
+                _append_message(session_id, "assistant", f"{partial}\n\n{note}" if partial else note)
+            except Exception as e:
+                logger.error(f"Failed to save interrupted reply: {e}")
             raise
         except Exception as e:
             logger.error(f"Streaming error: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            reply_done.set()
+            if _session_inflight.get(session_id) is reply_done:
+                _session_inflight.pop(session_id, None)
 
     if stream:
         return StreamingResponse(event_stream(), media_type="text/event-stream")
     # Non-streaming: collect the full response
     full_response = ""
+    media_paths: list[str] = []
     async for event in event_stream():
         stripped = event.replace("data: ", "").strip()
         try:
             parsed = json.loads(stripped)
             if "content" in parsed:
                 full_response += parsed["content"]
+            if "media" in parsed:
+                media_paths.append(parsed["media"])
         except json.JSONDecodeError:
             continue
-    return {"response": full_response, "session_id": session_id}
+    result: dict = {"response": full_response, "session_id": session_id}
+    if media_paths:
+        result["media"] = media_paths[0] if len(media_paths) == 1 else media_paths
+    return result
+
+
+@app.post("/api/tts")
+async def tts_endpoint(
+    request: Request,
+    text: str = Form(None),
+    voice: str = Form("frieren"),
+    _: bool = Depends(verify_api_key),
+):
+    """Direct TTS endpoint — bypasses chat, goes straight to lucy audio server on 8091.
+
+    Accepts JSON or form data. Returns a MEDIA: path to the generated WAV file.
+    """
+    if not text:
+        try:
+            body = await request.json()
+            text = body.get("text", "")
+            voice = body.get("voice", "frieren")
+        except Exception:
+            pass
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided")
+    result = await execute_tool_call("send_tts", {"text": text, "voice": voice})
+    if result.startswith("MEDIA:"):
+        media_path = result.split(" ", 1)[0].replace("MEDIA:", "")
+        return {"media": media_path, "path": media_path}
+    return {"error": result}
+
+
+@app.post("/api/cua")
+async def cua_endpoint(
+    action: str = Form(..., description="Action to perform: cursor_get, cursor_move, mouse_click, mouse_drag, key_combo, type_text, minimize_all"),
+    x: Optional[int] = Form(None),
+    y: Optional[int] = Form(None),
+    x1: Optional[int] = Form(None),
+    y1: Optional[int] = Form(None),
+    x2: Optional[int] = Form(None),
+    y2: Optional[int] = Form(None),
+    button: str = Form("left"),
+    keys: Optional[str] = Form(None),
+    text: Optional[str] = Form(None),
+    _: bool = Depends(verify_api_key),
+):
+    """Direct CUA (Computer Use) endpoint — Win32 API backend.
+    
+    Controls the real OS cursor, mouse, and keyboard via direct Win32 API calls
+    (ctypes → user32.dll), bypassing cua-driver overlay/synthetic-event limitations.
+    
+    Available actions:
+    - cursor_get: Get current cursor position → {'x': X, 'y': Y}
+    - cursor_move: Requires x, y → Move real cursor to (x, y)
+    - mouse_click: Requires x, y, optional button → Click at (x, y)
+    - mouse_drag: Requires x1, y1, x2, y2 → Drag from (x1,y1) to (x2,y2)
+    - key_combo: Requires keys (comma-separated e.g. 'win,d') → Press key combination
+    - type_text: Requires text → Type a string
+    - minimize_all: Win+D → Minimize all windows
+    """
+    import json as _json
+    
+    try:
+        if action == "cursor_get":
+            result = get_cursor_pos()
+        elif action == "cursor_move":
+            if x is None or y is None:
+                raise HTTPException(status_code=400, detail="x and y required for cursor_move")
+            result = set_cursor_pos(x, y)
+        elif action == "mouse_click":
+            if x is None or y is None:
+                raise HTTPException(status_code=400, detail="x and y required for mouse_click")
+            result = mouse_click(x, y, button)
+        elif action == "mouse_drag":
+            if x1 is None or y1 is None or x2 is None or y2 is None:
+                raise HTTPException(status_code=400, detail="x1, y1, x2, y2 required for mouse_drag")
+            result = mouse_drag(x1, y1, x2, y2)
+        elif action == "key_combo":
+            if not keys:
+                raise HTTPException(status_code=400, detail="keys required for key_combo (comma-separated, e.g. 'win,d')")
+            key_list = keys.split(",")
+            result = key_combo(key_list)
+        elif action == "type_text":
+            if not text:
+                raise HTTPException(status_code=400, detail="text required for type_text")
+            result = type_text(text)
+        elif action == "minimize_all":
+            result = minimize_all()
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown action: {action}. Available: cursor_get, cursor_move, mouse_click, mouse_drag, key_combo, type_text, minimize_all")
+        
+        return {"action": action, "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"CUA error on action={action}: {e}")
+        return {"action": action, "error": str(e)}
+
+
+@app.post("/api/server/restart")
+async def server_restart(
+    _: bool = Depends(verify_api_key),
+):
+    """Trigger a server restart via uvicorn --reload mechanism.
+
+    Touches api.py to trigger the reload watcher (requires --reload flag on startup).
+    Returns immediately; the server will reload within ~2 seconds.
+
+    NOTE: This restarts the Lucy Core API server process only.
+    It does NOT restart the llama-server (port 8080) or lucy audio server (port 8091).
+    OS-level operations (reboot/shutdown/lock) are not supported by this endpoint.
+    """
+    import os
+    api_path = str(Path(__file__).resolve())
+    try:
+        # Touch the file to trigger uvicorn --reload watcher
+        os.utime(api_path, None)
+        return {
+            "status": "restart_triggered",
+            "method": "file_touch (uvicorn --reload)",
+            "file": api_path,
+            "message": "Server reload signal sent. The server will restart within ~2 seconds.",
+        }
+    except Exception as e:
+        logger.error(f"Server restart failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "note": "If the server was not started with --reload, file touch will not trigger a restart.",
+        }
+
+
+def _shutdown_lucy_core_sequence():
+    """Runs in a background thread after /api/server/stop has responded.
+
+    Stops, in order:
+      1. The Lucy Audio Server, only if it is running.
+      2. Lucy Core itself — this process, plus the uvicorn --reload supervisor
+         that spawned it, if there is one.
+
+    It never touches other Python processes, llama-server (8080), or the
+    batch file / terminal that launched Lucy Core.
+    """
+    import multiprocessing
+    import subprocess
+    import threading
+
+    time.sleep(0.75)  # let the HTTP response flush to the browser first
+
+    try:
+        from lucy.server import voice_control
+        if voice_control.stop_all():
+            logger.info("Lucy Audio Server stopped.")
+    except Exception as e:
+        logger.error(f"Failed to stop Lucy Audio during shutdown: {e}")
+
+    try:
+        _conn.commit()
+    except Exception:
+        pass
+
+    logger.info("Lucy Core shutting down.")
+
+    # Under `uvicorn --reload`, this process is a worker spawned by a reloader
+    # supervisor; if we only exit ourselves, the supervisor would just spawn a
+    # replacement. multiprocessing.parent_process() is set only in that case
+    # (a plain `uvicorn.run(...)` server has no multiprocessing parent), so it
+    # identifies exactly the supervisor and nothing else.
+    parent = multiprocessing.parent_process()
+    if parent is not None and parent.pid:
+        # /T also takes down its child tree (this worker). Only that tree.
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(parent.pid)],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    os._exit(0)
+
+
+@app.post("/api/server/stop")
+async def server_stop(
+    _: bool = Depends(verify_api_key),
+):
+    """Stops Lucy Core, and the Lucy Audio Server if it is running.
+
+    Does NOT kill other python.exe processes and does NOT touch llama-server
+    (port 8080). Responds immediately, then shuts down ~1 second later.
+    """
+    import threading
+    try:
+        from lucy.server import voice_control
+        voice_running = voice_control._is_alive() or voice_control._external_lucy_audio_running()
+    except Exception:
+        voice_running = False
+
+    threading.Thread(target=_shutdown_lucy_core_sequence, daemon=True).start()
+    return {"status": "stopping", "lucy_audio_was_running": voice_running}
+
+
+@app.get("/api/logs")
+async def get_logs(
+    lines: int = 100,
+    follow: bool = False,
+    _: bool = Depends(verify_api_key),
+):
+    """Returns the last N log lines from runtime/lucy_core.log.
+
+    If follow=true, streams new log entries as Server-Sent Events (SSE).
+    """
+    log_path = Path(LOG_PATH)
+
+    if not follow:
+        if not log_path.exists():
+            return {"logs": []}
+        from collections import deque
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            # deque(maxlen=N) keeps only the last N lines instead of loading
+            # the whole file — the UI polls this every few seconds.
+            recent = deque(f, maxlen=lines) if lines > 0 else list(f)
+        return {"logs": [line.rstrip("\n") for line in recent]}
+
+    def event_stream():
+        if not log_path.exists():
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.touch()
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)
+            while True:
+                line = f.readline()
+                if line:
+                    payload = json.dumps({"log": line.rstrip()})
+                    yield f"data: {payload}\n\n"
+                else:
+                    time.sleep(0.5)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/cli")
@@ -1266,6 +2390,7 @@ async def cli_chat_endpoint(
     message: str = Form(None),
     session_id: str = Form("cli-dev"),
     stream: bool = Form(True),
+    voice_mode: Optional[str] = Form(None),
     _: bool = Depends(verify_api_key),
 ):
     """CLI-focused chat endpoint — coding mode (temp=0.3, technical tone).
@@ -1280,6 +2405,20 @@ async def cli_chat_endpoint(
             message = body.get("message", "")
             session_id = body.get("session_id", session_id)
             stream = body.get("stream", stream)
+            voice_mode = body.get("voice_mode", voice_mode)
+        except Exception:
+            pass
+
+    # If still no message, try reading from form data (already parsed by FastAPI)
+    if not message:
+        try:
+            form = await request.form()
+            message = form.get("message", "")
+            session_id = form.get("session_id") or session_id
+            stream_str = form.get("stream")
+            if stream_str is not None:
+                stream = stream_str == "true" or stream_str is True
+            voice_mode = form.get("voice_mode", voice_mode)
         except Exception:
             pass
 
@@ -1287,6 +2426,7 @@ async def cli_chat_endpoint(
         raise HTTPException(status_code=400, detail="No message provided")
 
     session_id = f"cli-{session_id}" if not session_id.startswith("cli-") else session_id
+    voice_mode_bool = voice_mode and voice_mode.lower() == "true"
 
     # Build messages (CLI mode — same as chat but with coding tone)
     messages = _build_messages(session_id, message)
@@ -1294,12 +2434,12 @@ async def cli_chat_endpoint(
     # Store user message in CLI session
     _append_message(session_id, "user", message)
     memory_fact = detect_memory_candidate(message)
-    _generate_session_title(session_id)
+    asyncio.create_task(_generate_session_title(session_id))
 
     async def event_stream():
         full_response = ""
         try:
-            async for event_data in _stream_response(messages, temperature=0.3):
+            async for event_data in _stream_response(messages, temperature=0.3, voice_mode=voice_mode_bool):
                 if event_data.startswith("data: "):
                     chunk_data = event_data[6:]
                     try:
@@ -1327,40 +2467,69 @@ async def cli_chat_endpoint(
     if stream:
         return StreamingResponse(event_stream(), media_type="text/event-stream")
     full_response = ""
+    media_paths: list[str] = []
     async for event in event_stream():
         stripped = event.replace("data: ", "").strip()
         try:
             parsed = json.loads(stripped)
             if "content" in parsed:
                 full_response += parsed["content"]
+            if "media" in parsed:
+                media_paths.append(parsed["media"])
         except json.JSONDecodeError:
             continue
-    return {"response": full_response, "session_id": session_id}
+    result: dict = {"response": full_response, "session_id": session_id}
+    if media_paths:
+        result["media"] = media_paths[0] if len(media_paths) == 1 else media_paths
+    return result
 
 
 @app.get("/")
 async def root(request: Request):
     """Serve the chat UI with API key injected into the DOM."""
-    ui_path = "C:/Users/dimay/Lucy/Lucy_Core/ui/chat.html"
+    ui_path = _paths.UI_DIR / "chat.html"
     html = Path(ui_path).read_text(encoding="utf-8")
     # Inject the API key into the DOM so browser fetch() can read it
     # The placeholder __API_KEY_PLACEHOLDER__ is replaced with the actual key
     html = html.replace("__API_KEY_PLACEHOLDER__", DEV_API_KEY)
+    html = html.replace("__SAFE_ROOT_PLACEHOLDER__", SAFE_ROOT.as_posix())
+    # Cache-busting: the asset URLs get the file's modification time as ?v=, so
+    # an updated chat.js / chat.css is picked up on the next page load without
+    # editing the version number by hand.
+    html = html.replace("__CSS_VERSION__", _asset_version("chat.css"))
+    html = html.replace("__JS_VERSION__", _asset_version("chat.js"))
     return HTMLResponse(content=html)
+
+
+def _asset_version(filename: str) -> str:
+    try:
+        return str(int((_paths.UI_DIR / filename).stat().st_mtime))
+    except OSError:
+        return "0"
 
 
 @app.get("/chat.css")
 async def serve_css():
     """Serve the external stylesheet for the chat UI."""
-    css_path = "C:/Users/dimay/Lucy/Lucy_Core/ui/chat.css"
+    css_path = _paths.UI_DIR / "chat.css"
     css = Path(css_path).read_text(encoding="utf-8")
     return HTMLResponse(content=css, media_type="text/css")
+
+
+@app.get("/chat.js")
+async def serve_js():
+    """Serve the external script for the chat UI."""
+    js_path = _paths.UI_DIR / "chat.js"
+    if not js_path.exists():
+        raise HTTPException(status_code=404, detail="chat.js not found")
+    js = Path(js_path).read_text(encoding="utf-8")
+    return HTMLResponse(content=js, media_type="application/javascript")
 
 
 @app.get("/api/file/{path:path}")
 async def serve_file(path: str, _: bool = Depends(verify_api_key)):
     """Serve a file from the safe root for the frontend to download/view."""
-    file_path = Path(f"C:/Users/dimay/{path}").resolve()
+    file_path = (SAFE_ROOT / path).resolve()
     try:
         file_path.relative_to(SAFE_ROOT)
     except ValueError:
@@ -1529,7 +2698,7 @@ async def fast_health_check():
     """
     import json as _json
     payload = {
-        "model": MODEL_NAME,
+        "model": llm.model_name,
         "messages": [{"role": "user", "content": "OK"}],
         "max_tokens": 1,
         "tools": [],
@@ -1538,7 +2707,7 @@ async def fast_health_check():
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.post(
-                f"{LLAMACPP_API_URL}/chat/completions",
+                f"{llm.api_url}/chat/completions",
                 json=payload,
             )
             if resp.status_code == 200:
@@ -1547,7 +2716,7 @@ async def fast_health_check():
                 return {
                     "status": "healthy",
                     "llama_server": "online",
-                    "model": data.get("model", MODEL_NAME),
+                    "model": data.get("model", llm.model_name),
                     "tokens_generated": usage.get("completion_tokens", 0),
                     "tokens_per_second": round(
                         usage.get("completion_tokens", 0) / max(usage.get("total_duration_ms", 1) / 1000, 0.001),
@@ -1565,7 +2734,7 @@ async def model_metrics(_: bool = Depends(verify_api_key)):
     """Returns model specification details from llama-server."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{LLAMACPP_API_URL}/models")
+            resp = await client.get(f"{llm.api_url}/models")
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("data"):
@@ -1579,11 +2748,11 @@ async def model_metrics(_: bool = Depends(verify_api_key)):
                         "size_bytes": meta.get("size", 0),
                         "format": meta.get("format", "unknown"),
                         "backend": "llama-server",
-                        "base_url": LLAMACPP_API_URL,
+                        "base_url": llm.api_url,
                     }
     except Exception as e:
         logger.warning(f"Failed to get model metrics: {e}")
-    return {"error": "Could not retrieve model metrics", "llama_server": LLAMACPP_API_URL}
+    return {"error": "Could not retrieve model metrics", "llama_server": llm.api_url}
 
 
 @app.get("/api/metrics/session")
@@ -1625,7 +2794,7 @@ async def create_session(_: bool = Depends(verify_api_key)):
 
 import time as _time_mod  # noqa: E402
 
-_TIMEZONE_CACHE_PATH = "C:/Users/dimay/Lucy/Lucy_Core/runtime/tz_cache.json"
+_TIMEZONE_CACHE_PATH = str(_paths.RUNTIME / "tz_cache.json")
 _TIMEZONE_CACHE_MAX_AGE = 24 * 3600  # 24 hours
 _timezone_cache: dict | None = None
 _timezone_cache_expires: float = 0.0
@@ -1716,7 +2885,6 @@ async def _resolve_zone_offsets(client: httpx.AsyncClient, zones: list[str]) -> 
     Returns {zone_name: offset_seconds}. Parallel with semaphore=5 and
     429-retry-with-backoff to handle TimeAPI rate limiting.
     """
-    import time as _t
     results: dict[str, int] = {}
     semaphore = asyncio.Semaphore(5)
 
@@ -1729,7 +2897,7 @@ async def _resolve_zone_offsets(client: httpx.AsyncClient, zones: list[str]) -> 
                         headers={"Accept": "application/json"},
                     )
                     if resp.status_code == 429:
-                        _t.sleep(0.5 * (2 ** attempt))
+                        await asyncio.sleep(0.5 * (2 ** attempt))
                         continue
                     if resp.status_code == 200:
                         data = resp.json()
@@ -1739,7 +2907,7 @@ async def _resolve_zone_offsets(client: httpx.AsyncClient, zones: list[str]) -> 
                     return
                 except Exception:
                     if attempt < 2:
-                        _t.sleep(0.2 * (attempt + 1))
+                        await asyncio.sleep(0.2 * (attempt + 1))
                         continue
                     return
 
@@ -1750,7 +2918,6 @@ async def _resolve_zone_offsets(client: httpx.AsyncClient, zones: list[str]) -> 
         tasks = [_fetch_one(z) for z in batch]
         await asyncio.gather(*tasks)
         await asyncio.sleep(0.3)
-
     return results
 
 
@@ -1831,6 +2998,40 @@ async def _refresh_timezone_cache():
         logger.warning(f"Failed to refresh timezone cache from TimeAPI.io: {e}")
 
 
+@app.on_event("startup")
+async def _llm_autostart():
+    """If "autostart": true in runtime/data/llm_models.json, load the active model at boot."""
+    if llm.cfg.get("autostart"):
+        asyncio.get_running_loop().create_task(llm.ensure_active())
+
+
+# === LLM settings (Settings > Model) ===
+@app.get("/api/llm/status")
+async def llm_status(_ = Depends(verify_api_key)):
+    """Active model, temperature, reasoning, KV cache and per-model readiness (UI polls this while loading)."""
+    return await llm.status()
+
+
+@app.post("/api/llm/settings")
+async def llm_settings(request: Request, _ = Depends(verify_api_key)):
+    """Partial update: {model, temperature, reasoning, kv_cache}.
+
+    model     -> unloads the other llama-server, loads this one (background; poll /api/llm/status).
+                 Temperature resets to the model's preset (12B 0.7 / 4B 0.5).
+    kv_cache / reasoning -> restart the active model with the new launch flags.
+    temperature applies to the next message with no reload.
+    """
+    body = await request.json()
+    try:
+        todo = llm.update(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    llm.schedule(todo)
+    if todo:
+        llm.phase, llm.message = "loading", "Switching..." if "switch" in todo else "Reloading with new settings..."
+    return await llm.status()
+
+
 @app.get("/api/settings/timezone")
 async def get_timezone_setting(_ = Depends(verify_api_key)):
     """Returns the current timezone configuration with live IANA zone list.
@@ -1907,8 +3108,8 @@ async def restart_server(_ = Depends(verify_api_key)):
         subprocess.Popen([sys.executable, "-c",
             "import uvicorn; from lucy.server.api import app; "
             "uvicorn.run(app, host='0.0.0.0', port=8090, log_level='info')"
-        ], env={**os.environ, "PYTHONPATH": "C:/Users/dimay/Lucy/Lucy_Core/src"},
-        cwd="C:/Users/dimay/Lucy/Lucy_Core")
+        ], env={**os.environ, "PYTHONPATH": str(_paths.SRC)},
+        cwd=str(_paths.ROOT))
     asyncio.create_task(_delayed_restart())
     return {"status": "restarting", "detail": "Server will restart shortly"}
 

@@ -12,6 +12,15 @@ agent:
   tool_use_enforcement: true
   persona_path: C:/Users/dimay/Lucy/Lucy_Core/.core/personas/lucy.md
 
+cua:
+  backend: lucy_cua
+  type: win32_api
+  description: >
+    Direct Win32 API cursor/mouse/keyboard control via ctypes → user32.dll.
+    Bypasses cua-driver overlay/synthetic-event limitations.
+    Available tools: cua_cursor, cua_mouse, cua_keyboard.
+    Accessible via /api/cua endpoint.
+
 memory:
   memory_enabled: true
   user_profile_enabled: true
@@ -21,5 +30,17 @@ display:
   skin: default
   interface: gui
   language: en
+
+lucy_audio:
+  enabled: true
+  path: C:/Users/dimay/Lucy/Lucy_Core/lucy_audio
+  model: cielvox26
+  reference_text: "The journey continues, one quiet step at a time."
+  voice_ref: C:/Users/dimay/Lucy/Lucy_Core/lucy_audio/models/TTS/frieren/frieren.wav
+  port: 8091
+  sample_rate: 24000
+  bits_per_sample: 16
+  stream_mode: sse
+  engine: vulkan
 
 harness_type: "8090_native"
