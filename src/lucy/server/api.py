@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 # --- Lucy Core Imports ---
+import re
 import sys
 # Put THIS project's src/ first so another install of `lucy` (e.g. the Hermes
 # venv's editable agents-harness) can't shadow it. Derived from this file's
@@ -26,7 +27,9 @@ from lucy.skills.memory.hook import detect_memory_candidate, render_confirmation
 from lucy.skills.skills_manager import SkillsManager
 from lucy.server.voice_control import router as voice_router
 from lucy import paths as _paths
-from lucy.server.llm_manager import llm   # model switching, temperature, reasoning, KV cache
+from contextvars import ContextVar
+from lucy.server.llm_manager import llm                      # model switching, temperature, reasoning, KV cache
+from lucy.server.agent_loop import AgentLoop, LoopConfig     # reliable tool-calling loop (retries, validation, ...)
 import base64
 
 # Persona is loaded from file
@@ -105,7 +108,9 @@ MAX_CONTEXT_MESSAGES = 50      # hard ceiling on messages loaded (safety)
 COMPRESSION_THRESHOLD = 0.75   # start summarizing when 75% of budget is used
 SUMMARY_RESERVE_TOKENS = 2048  # keep this many tokens free for the response
 DEFAULT_TEMPERATURE = 0.5
-MAX_TOOL_ROUNDS = 5
+MAX_TOOL_ROUNDS = int(os.environ.get("LUCY_MAX_TOOL_ROUNDS", "8"))    # tool rounds per turn
+LUCY_MAX_TOKENS = int(os.environ.get("LUCY_MAX_TOKENS", "4096"))      # per model call (big tool args need room)
+LUCY_TOOL_TIMEOUT = float(os.environ.get("LUCY_TOOL_TIMEOUT", "120")) # seconds before a hung tool is abandoned
 # Timeout for llama-server streaming requests (seconds)
 # Bumps the default 120s to 600s for training/code-generation tasks.
 LUCY_TIMEOUT = float(os.environ.get("LUCY_TIMEOUT", "600.0"))
@@ -454,7 +459,7 @@ TOOLS = [
             "name": "read_local_file",
             "description": f"Read a file from the local filesystem. Only safe paths under {_HOME} are allowed.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
@@ -471,7 +476,7 @@ TOOLS = [
             "name": "edit_local_file",
             "description": "Edit a file on the local filesystem. Reads the existing content, makes string replacements, and writes the updated result back to the same path. Use this for partial edits (adding/removing/modifying specific text sections) rather than overwriting the entire file. For each replacement, old_string must match exactly and uniquely (or use replace_all=true to replace all matches). Parent directories must already exist. Use \\\"replace_all\\\": true to replace all occurrences of a pattern.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
@@ -501,7 +506,7 @@ TOOLS = [
             "name": "write_local_file",
             "description": f"Write content to a file on the local filesystem. Overwrites if the file exists. Only safe paths under {_HOME} are allowed. Parent directories are created automatically. Use this to write/create a brand new file. For editing an existing file, prefer edit_local_file to avoid accidental data loss.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
@@ -522,7 +527,7 @@ TOOLS = [
             "name": "list_local_files",
             "description": f"List files in a local directory. Only safe paths under {_HOME} are allowed.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "dir_path": {
                         "type": "string",
@@ -543,7 +548,7 @@ TOOLS = [
             "name": "run_shell_command",
             "description": "Run a shell command on the local machine. Use bash syntax. Timeout is 10 seconds. Use this ONLY for system inspection (listing files, checking processes, etc.). Do NOT use this for web fetching — use web_search and web_extract tools instead.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
@@ -560,7 +565,7 @@ TOOLS = [
             "name": "find_file",
             "description": f"Find a file by name within a specific directory and subdirectories. Only safe paths under {_HOME} are allowed.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "file_name": {
                         "type": "string",
@@ -581,7 +586,7 @@ TOOLS = [
             "name": "send_file",
             "description": f"Signal to the client that a file is ready for the user to view or download. The file must already exist on disk under {_HOME}.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
@@ -602,7 +607,7 @@ TOOLS = [
             "name": "analyze_image",
             "description": "Analyze an image file that was uploaded in this conversation. The image must have been sent as a file upload. Returns a detailed description of what is seen in the image, including objects, text, colors, layout, and any notable details. Use this whenever the user attaches an image and asks you to describe, explain, read, or analyze it.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "image_path": {
                         "type": "string",
@@ -623,7 +628,7 @@ TOOLS = [
             "name": "web_search",
             "description": "Search the web for information. Returns top results with titles, URLs, and snippets. Use this to discover current information, research topics, find articles, and gather background context.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
@@ -645,7 +650,7 @@ TOOLS = [
             "name": "web_extract",
             "description": "Extract clean, readable text content from one or more web pages. Converts HTML to markdown. Use after web_search to read the full content of the most relevant result.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "urls": {
                         "type": "array",
@@ -668,7 +673,7 @@ TOOLS = [
             "name": "send_tts",
             "description": "Synthesize speech from text using the CielVox 2.6 TTS model (via the Lucy Audio server on port 8091). Returns a MEDIA: path to a WAV file that the client plays automatically.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
@@ -690,7 +695,7 @@ TOOLS = [
             "name": "cua_cursor",
             "description": "Get or set the real OS cursor position via Win32 API. Pass action 'get' to read current position, or 'move' with x/y to move the cursor. Returns {'x': X, 'y': Y}.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
@@ -716,7 +721,7 @@ TOOLS = [
             "name": "cua_mouse",
             "description": "Control mouse: click, drag, or move. action='click' requires x,y and optional button ('left'/'right'/'middle'). action='drag' requires x1,y1,x2,y2. action='move' requires x,y.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
@@ -745,7 +750,7 @@ TOOLS = [
             "name": "cua_keyboard",
             "description": "Send keyboard input. action='hotkey' requires keys list (e.g. ['win','d']). action='type' requires text string. action='press' requires a single key name.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
@@ -772,7 +777,7 @@ TOOLS = [
             "name": "list_drive_files",
             "description": "List the most recent files in your Google Drive.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {},
                 "required": []
             }
@@ -784,7 +789,7 @@ TOOLS = [
             "name": "create_google_doc",
             "description": "Create a new Google Doc with the given title and return its name and ID.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "title": {
                         "type": "string",
@@ -801,7 +806,7 @@ TOOLS = [
             "name": "get_doc_content",
             "description": "Retrieve the full text content of a Google Doc by its title.",
             "parameters": {
-                "type": "json",
+                "type": "object",
                 "properties": {
                     "title": {
                         "type": "string",
@@ -811,8 +816,94 @@ TOOLS = [
                 "required": ["title"]
             }
         }
+    },
+    # --- Persistent memory (the agent decides what to keep) ---
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Save something to your persistent long-term memory so you still know it in future "
+                "conversations. Call this on your own initiative, without being asked, when the user "
+                "reveals a lasting preference, a fact about themselves / their setup / projects, a "
+                "decision, a correction, or a standing instruction ('from now on', 'always', 'never'). "
+                "Write ONE short, self-contained sentence (e.g. 'Benny prefers concise answers'). "
+                "Do NOT save one-off requests, small talk, temporary details, or secrets (passwords, "
+                "tokens, API keys). If an existing memory is outdated or contradicted, pass its id in "
+                "replaces_id instead of adding a second, conflicting one."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The memory: one short self-contained sentence."},
+                    "category": {"type": "string",
+                                 "enum": ["preference", "instruction", "fact", "person", "project", "other"],
+                                 "description": "preference/instruction are always loaded into every conversation."},
+                    "importance": {"type": "integer",
+                                   "description": "1-5. 5 = must never forget, 3 = normal, 1 = minor detail."},
+                    "replaces_id": {"type": "integer",
+                                    "description": "Id of an outdated memory this one replaces (see recall_memory)."}
+                },
+                "required": ["content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_memory",
+            "description": (
+                "Look up your persistent memory. Pass a query to find memories about a topic, or leave "
+                "it empty to list everything you remember. Each result has an id (needed by forget / "
+                "remember's replaces_id). The most relevant memories are already shown to you at the "
+                "start of each conversation; use this to dig deeper."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to look for (empty = list all)."},
+                    "limit": {"type": "integer", "description": "Max results (default 8)."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": ("Delete one memory by id (get ids from recall_memory). Use when the user asks "
+                            "you to forget something or a memory is wrong."),
+            "parameters": {
+                "type": "object",
+                "properties": {"memory_id": {"type": "integer", "description": "Id of the memory to delete."}},
+                "required": ["memory_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_conversations",
+            "description": (
+                "Search the user's PAST conversations (other sessions, not the current one). Use it "
+                "whenever the user refers to an earlier chat ('last time', 'we talked about', 'what did I "
+                "say about'), or when you need background you don't have, BEFORE answering from guesswork. "
+                "Returns matching message snippets with dates and session ids. To read more of one "
+                "conversation, call again with that session_id and an empty query."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Words to look for (empty only with session_id)."},
+                    "session_id": {"type": "string", "description": "Limit to / read one session."},
+                    "days": {"type": "integer", "description": "Only look at the last N days."},
+                    "limit": {"type": "integer", "description": "Max results (default 5, max 15)."}
+                },
+                "required": []
+            }
+        }
     }
 ]
+
+_MEMORY_TOOLS = ("remember", "recall_memory", "forget", "search_conversations")
 
 # --- Tool Registry (lookup by name for dynamic skill-tool mapping) ---
 TOOL_REGISTRY: Dict[str, dict] = {
@@ -841,6 +932,7 @@ def _resolve_skills_to_tools(skill_list: list[dict]) -> list[dict]:
     tool_names.add("write_local_file")
     tool_names.add("edit_local_file")
     tool_names.add("read_local_file")
+    tool_names.update(_MEMORY_TOOLS)          # memory + past-chat search are always available
     if tool_names:
         return [TOOL_REGISTRY[name] for name in sorted(tool_names)]
     return TOOLS  # fallback: all tools available
@@ -1160,9 +1252,76 @@ async def _stream_tts_to_sse(text: str, voice: str = "frieren") -> Iterator[str]
             player.end_of_stream()     # play out whatever is queued, even if short or truncated
 
 
+# Which chat session the running reply belongs to (so search_conversations can skip it).
+_current_session: ContextVar[str | None] = ContextVar("lucy_current_session", default=None)
+# Sessions where the agent saved a memory during the current turn (suppresses the click-to-save prompt).
+_agent_saved_turn: set = set()
+
+_SECRET_RE = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9\-]{10,}"
+    r"|AIza[0-9A-Za-z_\-]{30,}|(?:password|passwd|pwd|secret|api[_ -]?key|token)\s*(?:is|=|:)\s*\S{4,})",
+    re.IGNORECASE)
+
+
+def _run_memory_tool(tool_name: str, args: dict) -> str:
+    """remember / recall_memory / forget / search_conversations (blocking; run in a worker thread)."""
+    from lucy.memory import history as _history
+    if tool_name == "remember":
+        content = str(args.get("content", "")).strip()
+        if not content:
+            return json.dumps({"status": "error", "error": "content is required"})
+        if _SECRET_RE.search(content):
+            return json.dumps({"status": "refused",
+                               "error": "That looks like a password/token/API key. Secrets are never stored in memory."})
+        rid = args.get("replaces_id")
+        result = _memory_manager.save_memory(
+            content, category=str(args.get("category") or "fact"), importance=args.get("importance", 3),
+            source="agent", replaces_id=rid if rid not in ("", None, 0) else None)
+        if result.get("status") in ("saved", "updated"):
+            sid = _current_session.get()
+            if sid:
+                _agent_saved_turn.add(sid)
+            logger.info(f"Memory {result['status']} (#{result['id']}): {result['text']}")
+        return json.dumps(result, ensure_ascii=False)
+
+    if tool_name == "recall_memory":
+        query = str(args.get("query", "")).strip()
+        try:
+            limit = max(1, min(int(args.get("limit", 8)), 30))
+        except (TypeError, ValueError):
+            limit = 8
+        docs = _memory_manager.recall(query, limit) if query else _memory_manager.list_all()[-limit:]
+        if not docs:
+            return "No matching memories." if query else "Your memory is empty."
+        return "\n".join(f"#{d['id']} [{d['category']}, importance {d['importance']}] {d['text']}" for d in docs)
+
+    if tool_name == "forget":
+        ok = _memory_manager.forget(args.get("memory_id"))
+        return json.dumps({"status": "forgotten" if ok else "not_found", "id": args.get("memory_id")})
+
+    if tool_name == "search_conversations":
+        query = str(args.get("query", "")).strip()
+        sid = str(args.get("session_id") or "").strip() or None
+        if not query and not sid:
+            return "Give a query, or a session_id to read that conversation."
+        if not query:
+            msgs = _history.read_session(_conn, _db_lock, sid)
+            return _history.format_results(msgs, f"Latest messages of session {sid}:") or "No messages found for that session."
+        res = _history.search_history(
+            _conn, _db_lock, query, session_id=sid,
+            exclude_session=None if sid else _current_session.get(),
+            days=args.get("days"), limit=args.get("limit", 5))
+        return (_history.format_results(res, f"Found {len(res)} match(es) in past conversations:")
+                or "Nothing found in past conversations for that query.")
+    return f"Unknown memory tool: {tool_name}"
+
+
 async def execute_tool_call(tool_name: str, args: dict) -> str:
     """Execute a single tool call and return its string result."""
     logger.info(f"Executing tool: {tool_name} with args: {args}")
+
+    if tool_name in _MEMORY_TOOLS:
+        return await asyncio.to_thread(_run_memory_tool, tool_name, args)
 
     if tool_name == "read_local_file":
         file_path = args.get("file_path", "")
@@ -1507,6 +1666,20 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
     except Exception as e:
         logger.warning(f"Failed to retrieve memory context: {e}")
 
+    messages.append({"role": "system", "content": (
+        "MEMORY: You have persistent memory that survives across conversations; [USER FACTS] (if shown) "
+        "is what you already remember. On your own initiative - never ask permission and keep any "
+        "mention of it to a few words - call `remember` when the user shares a lasting preference, a "
+        "fact about themselves or their setup, a project detail, a decision, a correction, or a standing "
+        "instruction ('from now on', 'always', 'never'). One short self-contained sentence per memory. "
+        "If something you remember changed, pass replaces_id (find it with `recall_memory`) instead of "
+        "adding a conflicting memory. Never store passwords, tokens or API keys, or temporary one-off "
+        "details. When the user refers to an earlier conversation ('last time', 'we talked about', "
+        "'what did I say about') or you lack background you need, call `search_conversations` (past "
+        "chats) or `recall_memory` BEFORE answering instead of guessing. Only say you saved or "
+        "remembered something if the tool call succeeded."
+    )})
+
     # Inject relevant skills
     try:
         relevant_skills = _skills_manager.get_relevant_skills(user_message)
@@ -1617,6 +1790,10 @@ _TOOL_ACTIVITY_MAP = {
     "list_drive_files": "drive",
     "create_google_doc": "docs",
     "get_doc_content": "docs",
+    "remember": "remember",
+    "recall_memory": "recall",
+    "forget": "forget",
+    "search_conversations": "history",
 }
 
 _ACTIVITY_DETAIL_MAX = 60  # truncate long detail (queries/commands) so the UI stays one line
@@ -1655,6 +1832,12 @@ def _tool_to_activity(tool_name: str, args: dict) -> str:
         return f"analyze:{args['image_path']}"
     if tool_name == "send_tts" and args.get("text"):
         return f"speak:{_truncate(args['text'], 40)}"
+    if tool_name == "remember" and args.get("content"):
+        return f"remember:{_truncate(args['content'], 40)}"
+    if tool_name == "recall_memory" and args.get("query"):
+        return f"recall:{_truncate(args['query'])}"
+    if tool_name == "search_conversations" and args.get("query"):
+        return f"history:{_truncate(args['query'])}"
     if tool_name == "cua_cursor" and args.get("action"):
         if args["action"] == "move":
             return f"cursor:move({args.get('x','?')},{args.get('y','?')})"
@@ -1718,245 +1901,134 @@ async def _wait_for_previous_reply(session_id: str, timeout: float = 5.0):
             logger.warning(f"Previous reply for session {session_id} did not finish within {timeout}s; continuing.")
 
 
-async def _stream_response(messages: List[Dict[str, Any]], temperature: float | None = None, skill_list: list[dict] = None, voice_mode: bool = False):
+class _Brain:
+    """Adapter that lets the agent loop see the live llama-server (llm_manager)."""
+    @property
+    def base_url(self) -> str:
+        return llm.api_url
+
+    @property
+    def model(self) -> str:
+        return llm.model_name
+
+    @property
+    def label(self) -> str:
+        return llm.active["label"]
+
+    def extras(self) -> dict:
+        return llm.request_extras()
+
+    def loading(self) -> bool:
+        return llm.phase in ("loading", "stopping")
+
+    def error(self):
+        return llm.message if llm.phase == "error" else None
+
+    async def ready(self) -> bool:
+        return await llm._healthy(llm.active["port"])
+
+    async def ensure(self) -> None:
+        """The model isn't running (crashed / never started): start it again."""
+        if not self.loading():
+            llm.phase, llm.message = "loading", f"Loading {llm.active['label']}..."
+            asyncio.get_running_loop().create_task(llm.ensure_active())
+
+
+_BRAIN = _Brain()
+_AGENT_TRACE_PATH = _paths.RUNTIME / "logs" / "agent_trace.jsonl"
+_trace_lock = threading.Lock()
+
+
+def _agent_trace(entry: dict) -> None:
+    """One JSON line per tool call / retry / turn summary: runtime/logs/agent_trace.jsonl."""
+    try:
+        _AGENT_TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _trace_lock:
+            if _AGENT_TRACE_PATH.exists() and _AGENT_TRACE_PATH.stat().st_size > 5_000_000:
+                _AGENT_TRACE_PATH.replace(_AGENT_TRACE_PATH.with_suffix(".jsonl.1"))
+            with open(_AGENT_TRACE_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+async def _stream_response(messages: List[Dict[str, Any]], temperature: float | None = None, skill_list: list[dict] = None, voice_mode: bool = False, session_id: str | None = None):
     """Stream a response from llama-server, handling tool calls in a loop.
 
-    Emits SSE lines: {content}, {activity}, {media}, {done}, and finally [METRICS]{json}.
+    The loop itself lives in lucy.server.agent_loop (retries, tool validation, timeouts, loop and
+    empty-reply protection, context budget...). This wrapper turns its events into the SSE stream
+    and does the incremental voice (TTS) work.
+
+    Emits SSE lines: {content}, {activity}, {media}, {error}, and finally [METRICS]{json}.
     """
     import time as _time_mod
     _start_time = _time_mod.time()
-    _total_tool_calls = 0
     _full_response_text = ""
-    round_num = 0
     _tts_voice = "frieren"
     _tts_buffer = ""  # accumulates sentence fragments during streaming
+    _stats: dict = {}
 
+    _current_session.set(session_id)          # lets search_conversations skip the live conversation
     if temperature is None:
         temperature = llm.temperature          # Settings > Model value (preset per model)
-    # Emit an initial "thinking" activity indicator for the first round
-    yield f"data: {json.dumps({'activity': 'think'})}\n\n"
+    available_tools = _resolve_skills_to_tools(skill_list) if skill_list else TOOLS
+    agent = AgentLoop(
+        brain=_BRAIN, tools=available_tools,
+        execute=lambda name, args: execute_tool_call(name, args),   # looked up at call time
+        activity_for=_tool_to_activity, count_tokens=_count_tokens, temperature=temperature,
+        cfg=LoopConfig(max_rounds=MAX_TOOL_ROUNDS, max_tokens=LUCY_MAX_TOKENS, tool_timeout=LUCY_TOOL_TIMEOUT,
+                       ctx_tokens=int(llm.cfg.get("context_length", 100000)), http_timeout=LUCY_TIMEOUT),
+        trace=_agent_trace, session_id=session_id)
 
-    while round_num < MAX_TOOL_ROUNDS:
-        round_num += 1
-        tool_calls_seen = False
+    async def _speak(text: str):
+        """Yield SSE lines that speak `text` through Lucy Audio (voice mode)."""
+        clean = _clean_text_for_tts(text)
+        if clean:
+            yield f"data: {json.dumps({'activity': 'speak'})}\n\n"
+            async for media_event in _stream_tts_to_sse(clean, _tts_voice):
+                if media_event.startswith("MEDIA:"):
+                    media_path = media_event.split(" ", 1)[0].replace("MEDIA:", "")
+                    yield f"data: {json.dumps({'media': media_path})}\n\n"
+        yield f"data: {json.dumps({'activity': None})}\n\n"
 
-        async with httpx.AsyncClient(timeout=LUCY_TIMEOUT) as client:
-            # Resolve available tools from active skills (dynamic skill→tool mapping)
-            available_tools = _resolve_skills_to_tools(skill_list) if skill_list else TOOLS
-            payload = {
-                "model": llm.model_name,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": 2048,
-                "tools": available_tools,
-                "tool_choice": "auto",
-                "stream": True,
-                "stream_options": {"include_usage": True},
-                **llm.request_extras(),
-            }
-
-            async with client.stream("POST", f"{llm.api_url}/chat/completions", json=payload) as resp:
-                if resp.status_code != 200:
-                    error_body = await resp.aread()
-                    yield f"data: {json.dumps({'error': 'Failed to connect to brain', 'status': resp.status_code, 'detail': error_body.decode()[:500]})}\n\n"
-                    return
-
-                assistant_content = ""
-                tool_calls: List[Dict[str, Any]] = []
-                finish_reason = None
-
-                async for line in resp.aiter_lines():
-                    if line.startswith("data: "):
-                        chunk_data = line[6:]
-                        if chunk_data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(chunk_data)
-                            if chunk.get("choices"):
-                                choice = chunk["choices"][0]
-                                delta = choice.get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    assistant_content += content
-                                    _full_response_text += content
-                                    _tts_buffer += content
-                                    yield f"data: {json.dumps({'content': content})}\n\n"
-
-                                    # --- Incremental TTS streaming ---
-                                    # When voice_mode is on, fire streaming TTS on each
-                                    # completed sentence fragment so audio starts playing
-                                    # while the LLM is still generating — not after.
-                                    if voice_mode and _tts_buffer:
-                                        import re as _re
-                                        _sentence_end = _re.search(r'[。．！？！？.!?…\n]\s*$', _tts_buffer)
-                                        if _sentence_end:
-                                            _chunk = _tts_buffer.strip()
-                                            _tts_buffer = ""
-                                            if _chunk:
-                                                _clean_chunk = _clean_text_for_tts(_chunk)
-                                                if _clean_chunk:
-                                                    yield f"data: {json.dumps({'activity': 'speak'})}\n\n"
-                                                    # Stream PCM chunks as they arrive from Lucy Audio SSE
-                                                    async for _media_event in _stream_tts_to_sse(_clean_chunk, _tts_voice):
-                                                        if _media_event.startswith("MEDIA:"):
-                                                            _media_path = _media_event.split(" ", 1)[0].replace("MEDIA:", "")
-                                                            yield f"data: {json.dumps({'media': _media_path})}\n\n"
-                                                yield f"data: {json.dumps({'activity': None})}\n\n"
-
-                                # Handle tool calls (cumulative — we collect args)
-                                tc_list = delta.get("tool_calls", [])
-                                if tc_list:
-                                    for tc in tc_list:
-                                        idx = tc.get("index", 0)
-                                        while len(tool_calls) <= idx:
-                                            tool_calls.append({"id": "", "name": "", "arguments": ""})
-                                        if "id" in tc:
-                                            tool_calls[idx]["id"] = tc["id"]
-                                        if "name" in tc.get("function", {}):
-                                            tool_calls[idx]["name"] = tc["function"]["name"]
-                                        if "arguments" in tc.get("function", {}):
-                                            tool_calls[idx]["arguments"] += tc["function"]["arguments"]
-
-                                finish_reason = choice.get("finish_reason")
-                        except json.JSONDecodeError:
-                            continue
-
-                if finish_reason == "tool_calls" and tool_calls:
-                    tool_calls_seen = True
-
-                    # Add assistant message with tool calls to conversation
-                    tool_call_objs = []
-                    for tc in tool_calls:
-                        tool_call_objs.append({
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                        })
-                    messages.append({
-                        "role": "assistant",
-                        "content": assistant_content,
-                        "tool_calls": tool_call_objs,
-                    })
-
-                    # Execute each tool call and add results — emit per-tool activity events
-                    _total_tool_calls += len(tool_calls)
-                    for tc in tool_calls:
-                        name = tc["name"]
-                        try:
-                            args = json.loads(tc["arguments"]) if tc["arguments"].strip() else {}
-                        except json.JSONDecodeError:
-                            args = {}
-
-                        # Emit activity indicator BEFORE executing the tool
-                        activity = _tool_to_activity(name, args)
-                        yield f"data: {json.dumps({'activity': activity})}\n\n"
-
-                        result = await execute_tool_call(name, args)
-
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": result,
-                        })
-
-                        # If the tool returned a MEDIA: marker, emit it to the frontend
-                        if result.startswith("MEDIA:"):
-                            media_path = result.split(" ", 1)[0].replace("MEDIA:", "")
-                            yield f"data: {json.dumps({'media': media_path})}\n\n"
-
-                    # Clear activity, then loop back — emit "think" for the next round
-                    yield f"data: {json.dumps({'activity': None})}\n\n"
-                    yield f"data: {json.dumps({'activity': 'think'})}\n\n"
-
-                    # Loop back to request another round of completions
-                    continue
-                else:
-                    # No tool calls — response is complete
-                    break
-
-    else:
-        # While-loop exhausted (MAX_TOOL_ROUNDS reached without final text response).
-        # Force a final generation with no tools available.
-        logger.warning("Max tool rounds reached without completion — forcing final response")
-        force_messages = list(messages)
-        force_messages.append({
-            "role": "system",
-            "content": (
-                "You have used all your tool calls for this turn and cannot call any more. "
-                "Do not fill remaining gaps with assumptions or guesses. Report only what you "
-                "actually confirmed via tools. For anything you did not confirm, say plainly "
-                "that you don't know yet and ask the user, rather than presenting a guess as fact."
-            ),
-        })
-        payload = {
-            "model": llm.model_name,
-            "messages": force_messages,
-            "temperature": temperature,
-            "max_tokens": 2048,
-            "tools": [],
-            "stream": True,
-            "stream_options": {"include_usage": True},
-            **llm.request_extras(),
-        }
-        async with httpx.AsyncClient(timeout=LUCY_TIMEOUT) as client:
-            async with client.stream("POST", llm.api_url + "/chat/completions", json=payload) as resp:
-                if resp.status_code == 200:
-                    async for line in resp.aiter_lines():
-                        if line.startswith("data: "):
-                            chunk_data = line[6:]
-                            if chunk_data == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(chunk_data)
-                                if chunk.get("choices"):
-                                    choice = chunk["choices"][0]
-                                    delta = choice.get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        _full_response_text += content
-                                        _tts_buffer += content
-                                        yield f"data: {json.dumps({'content': content})}\n\n"
-                                        # Incremental TTS in the forced-response path too (streaming)
-                                        if voice_mode and _tts_buffer:
-                                            import re as _re2
-                                            _sent2 = _re2.search(r'[。．！？！？.!?…\n]\s*$', _tts_buffer)
-                                            if _sent2:
-                                                _chunk2 = _tts_buffer.strip()
-                                                _tts_buffer = ""
-                                                if _chunk2:
-                                                    _clean_chunk2 = _clean_text_for_tts(_chunk2)
-                                                    if _clean_chunk2:
-                                                        yield f"data: {json.dumps({'activity': 'speak'})}\n\n"
-                                                        async for _ev2 in _stream_tts_to_sse(_clean_chunk2, _tts_voice):
-                                                            if _ev2.startswith("MEDIA:"):
-                                                                _mp2 = _ev2.split(" ", 1)[0].replace("MEDIA:", "")
-                                                                yield f"data: {json.dumps({'media': _mp2})}\n\n"
-                                                    yield f"data: {json.dumps({'activity': None})}\n\n"
-                            except json.JSONDecodeError:
-                                                continue
+    async for ev in agent.run(messages):
+        if ev.kind == "content":
+            _full_response_text += ev.data
+            _tts_buffer += ev.data
+            yield f"data: {json.dumps({'content': ev.data})}\n\n"
+            # Incremental TTS: speak each finished sentence while the model is still generating.
+            if voice_mode and re.search(r'[。．！？！？.!?…\n]\s*$', _tts_buffer):
+                chunk, _tts_buffer = _tts_buffer.strip(), ""
+                if chunk:
+                    async for line in _speak(chunk):
+                        yield line
+        elif ev.kind == "activity":
+            yield f"data: {json.dumps({'activity': ev.data})}\n\n"
+        elif ev.kind == "media":
+            yield f"data: {json.dumps({'media': ev.data})}\n\n"
+        elif ev.kind == "error":
+            yield f"data: {json.dumps(ev.data)}\n\n"
+            return
+        elif ev.kind == "metrics":
+            _stats = ev.data
 
     # --- Final TTS for any remaining buffered text (voice_mode) ---
-    # During streaming, most of the response was already spoken incrementally.
-    # This catches the last sentence fragment that didn't end with punctuation.
+    # Catches the last sentence fragment that didn't end with punctuation.
     if voice_mode and _tts_buffer.strip():
-        _final_clean = _clean_text_for_tts(_tts_buffer.strip())
-        if _final_clean:
-            yield f"data: {json.dumps({'activity': 'speak'})}\n\n"
-            async for _ev_final in _stream_tts_to_sse(_final_clean, _tts_voice):
-                if _ev_final.startswith("MEDIA:"):
-                    _media_final = _ev_final.split(" ", 1)[0].replace("MEDIA:", "")
-                    yield f"data: {json.dumps({'media': _media_final})}\n\n"
-        yield f"data: {json.dumps({'activity': None})}\n\n"
+        async for line in _speak(_tts_buffer.strip()):
+            yield line
 
     # Emit final metrics line per SSE protocol: [METRICS]{json}
     _elapsed = max(_time_mod.time() - _start_time, 0.001)
     _token_count = _count_tokens(_full_response_text)
-    _tps = round(_token_count / _elapsed, 1)
     _metrics_json = json.dumps({
         'tokens_generated': _token_count,
         'time_ms': int(_elapsed * 1000),
-        'tokens_per_second': _tps,
-        'tool_calls': _total_tool_calls,
+        'tokens_per_second': round(_token_count / _elapsed, 1),
+        'tool_calls': _stats.get('tool_calls', 0),
+        'rounds': _stats.get('rounds', 0),
+        'tool_errors': _stats.get('tool_errors', 0),
+        'retries': _stats.get('retries', 0),
     })
     yield f"data: [METRICS]{_metrics_json}\n\n"
 
@@ -2071,6 +2143,7 @@ async def chat_endpoint(
     _append_message(session_id, "user", message)
     # Check for memory-worthy fact in the user message
     memory_fact = detect_memory_candidate(message)
+    _agent_saved_turn.discard(session_id)
     # Generate session title from first message if it's still "New Session"
     asyncio.create_task(_generate_session_title(session_id))
     reply_done = asyncio.Event()
@@ -2081,7 +2154,7 @@ async def chat_endpoint(
         # Parse voice_mode from form field (string "true" or "false")
         voice_mode_bool = voice_mode and voice_mode.lower() == "true"
         try:
-            async for event_data in _stream_response(messages, voice_mode=voice_mode_bool):
+            async for event_data in _stream_response(messages, voice_mode=voice_mode_bool, session_id=session_id):
                 if event_data.startswith("data: "):
                     chunk_data = event_data[6:]
                     try:
@@ -2102,7 +2175,7 @@ async def chat_endpoint(
                         stored_response += f"\nMEDIA:{media_path}"
                 _append_message(session_id, "assistant", stored_response)
                 # Append memory confirmation UI to the streamed response if a fact was detected
-                if memory_fact:
+                if memory_fact and session_id not in _agent_saved_turn:
                     confirmation = render_confirmation(memory_fact, session_id)
                     yield f"data: {json.dumps({'content': confirmation})}\n\n"
 
@@ -2434,12 +2507,13 @@ async def cli_chat_endpoint(
     # Store user message in CLI session
     _append_message(session_id, "user", message)
     memory_fact = detect_memory_candidate(message)
+    _agent_saved_turn.discard(session_id)
     asyncio.create_task(_generate_session_title(session_id))
 
     async def event_stream():
         full_response = ""
         try:
-            async for event_data in _stream_response(messages, temperature=0.3, voice_mode=voice_mode_bool):
+            async for event_data in _stream_response(messages, temperature=0.3, voice_mode=voice_mode_bool, session_id=session_id):
                 if event_data.startswith("data: "):
                     chunk_data = event_data[6:]
                     try:
@@ -2453,7 +2527,7 @@ async def cli_chat_endpoint(
 
             if full_response.strip():
                 _append_message(session_id, "assistant", full_response)
-                if memory_fact:
+                if memory_fact and session_id not in _agent_saved_turn:
                     confirmation = render_confirmation(memory_fact, session_id)
                     yield f"data: {json.dumps({'content': confirmation})}\n\n"
 
@@ -3000,8 +3074,14 @@ async def _refresh_timezone_cache():
 
 @app.on_event("startup")
 async def _llm_autostart():
-    """If "autostart": true in runtime/data/llm_models.json, load the active model at boot."""
-    if llm.cfg.get("autostart"):
+    """Load the model chosen in Settings > Model as soon as Lucy Core starts.
+
+    Already running (e.g. after a code reload): left alone. Any other model is unloaded.
+    Disable with "autostart": False in llm_manager.DEFAULT_MODELS_CFG.
+    """
+    if llm.cfg.get("autostart", True):
+        logger.info(f"Autostart: loading {llm.active['label']} on port {llm.active['port']} "
+                    f"(kv={llm.state['kv_cache']}, reasoning={'on' if llm.reasoning else 'off'})")
         asyncio.get_running_loop().create_task(llm.ensure_active())
 
 
@@ -3086,6 +3166,19 @@ async def delete_session(session_id: str, _: bool = Depends(verify_api_key)):
     if _delete_session_db(session_id):
         return {"status": "deleted", "session_id": session_id}
     raise HTTPException(status_code=404, detail="Session not found")
+
+
+@app.get("/api/memory")
+async def list_memories(_ = Depends(verify_api_key)):
+    """Everything in persistent memory (agent-written and user-confirmed)."""
+    return {"memories": _memory_manager.list_all()}
+
+
+@app.delete("/api/memory/{memory_id}")
+async def delete_memory(memory_id: int, _ = Depends(verify_api_key)):
+    if _memory_manager.forget(memory_id):
+        return {"status": "forgotten", "id": memory_id}
+    raise HTTPException(status_code=404, detail="Memory not found")
 
 
 @app.get("/api/memory/save")

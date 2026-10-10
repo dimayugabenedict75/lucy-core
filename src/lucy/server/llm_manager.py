@@ -8,6 +8,9 @@ Responsibilities
   * KV cache Q4 / Q8   -> launch flags --cache-type-k/v, so the active model is restarted
   * api.py reads the live endpoint/temperature from the `llm` singleton at the bottom of this file
 
+Lifetime: the llama-server is tied to this Lucy Core process (Windows Job Object, KILL_ON_JOB_CLOSE),
+so whichever model is loaded unloads whenever Lucy Core stops, even after a crash or a kill.
+
 Config: DEFAULT_MODELS_CFG below (edit it here). If runtime/data/llm_models.json exists it OVERRIDES
 it, so delete that file if you only edit this module.
 State (runtime/data/llm_state.json): what the settings tab saved: active model, temperature,
@@ -46,7 +49,7 @@ DEFAULT_MODELS_CFG: dict[str, Any] = {
     "flash_attn_args": ["--flash-attn", "on"],
     "extra_args": ["--jinja", "--parallel", "1"],
     "ready_timeout_s": 300,
-    "autostart": False,
+    "autostart": True,      # load the Settings > Model selection when Lucy Core (8090) starts
     "models": [
         {"id": "lucy-12b", "label": "Lucy 12B", "port": 8080, "temperature": 0.7,
          "gguf": "C:/Users/dimay/Lucy/Lucy_Core/models/Lucy-12b/Lux-Plus-M12B.i1-QAT_Q4_K.gguf",
@@ -150,6 +153,68 @@ class _suppress:
         return True
 
 
+_JOB_HANDLE = None          # kept for the life of the process; closing it (= process exit) kills the models
+
+
+def _bind_to_lucy_core(pid: int) -> bool:
+    """Windows: put `pid` in a Job Object with KILL_ON_JOB_CLOSE so the llama-server is terminated
+    whenever Lucy Core's process ends (normal exit, crash, Task Manager kill, console closed).
+    Other platforms: handled by the atexit hook only."""
+    global _JOB_HANDLE
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes as wt
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wt.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wt.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wt.DWORD), ("SchedulingClass", wt.DWORD)]
+
+        class EXTENDED(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", BASIC), ("IoInfo", IO_COUNTERS),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wt.HANDLE
+        k32.CreateJobObjectW.argtypes = [wt.LPVOID, wt.LPCWSTR]
+        k32.OpenProcess.restype = wt.HANDLE
+        k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+        k32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, wt.LPVOID, wt.DWORD]
+        k32.CloseHandle.argtypes = [wt.HANDLE]
+
+        if _JOB_HANDLE is None:
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                raise ctypes.WinError(ctypes.get_last_error())
+            info = EXTENDED()
+            info.BasicLimitInformation.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            _JOB_HANDLE = job
+        proc = k32.OpenProcess(0x0100 | 0x0001, False, pid)         # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+        if not proc:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not k32.AssignProcessToJobObject(_JOB_HANDLE, proc):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            k32.CloseHandle(proc)
+        return True
+    except Exception as e:
+        logger.warning(f"Could not bind llama-server (pid {pid}) to Lucy Core's lifetime: {e}")
+        return False
+
+
 def stop_port(port: int) -> list[int]:
     """Stop the llama-server listening on `port`. Refuses to kill anything that isn't llama-server."""
     killed = []
@@ -178,6 +243,8 @@ class LLMManager:
         self._lock = threading.Lock()                     # guards state/phase fields
         self._busy = asyncio.Lock()                       # serialises model transitions
         self._task: asyncio.Task | None = None
+        self._procs: dict[str, subprocess.Popen] = {}
+        self._owned: set[str] = set()                     # models launched by THIS Lucy Core process
         self.phase = "idle"                               # idle | stopping | loading | error
         self.message = ""
         self.load()
@@ -300,14 +367,19 @@ class LLMManager:
             target = self.active
             try:
                 self.phase, self.message = "stopping", "Unloading other model..."
+                # A server we did not launch (e.g. started by hand / by an older Lucy Core) is not tied
+                # to this process and may have different flags: reload it so Settings is what's loaded.
+                restart = restart or target["id"] not in self._owned
                 for m in self.models.values():
                     if m["id"] != target["id"] or restart:
                         await asyncio.to_thread(stop_port, m["port"])
+                        self._owned.discard(m["id"])
                 if await self._healthy(target["port"]):
                     self.phase, self.message = "idle", f"{target['label']} ready"
                     return
                 self.phase, self.message = "loading", f"Loading {target['label']}..."
                 proc = await asyncio.to_thread(self._launch, target)
+                self._owned.add(target["id"])
                 await self._wait_ready(target, proc)
                 self.phase, self.message = "idle", f"{target['label']} ready"
                 logger.info(f"{target['label']} ready on port {target['port']} (kv={self.state['kv_cache']})")
@@ -344,9 +416,13 @@ class LLMManager:
         if sys.platform == "win32":
             flags = 0x08000000 | 0x00000200            # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         logger.info("Launching: " + " ".join(argv))
-        return subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 cwd=str(Path(argv[0]).parent) if Path(argv[0]).is_absolute() else None,
                                 creationflags=flags)
+        if _bind_to_lucy_core(proc.pid):
+            logger.info(f"{m['label']} (pid {proc.pid}) is tied to Lucy Core: it unloads when Lucy Core stops")
+        self._procs[m["id"]] = proc
+        return proc
 
     async def _wait_ready(self, m: dict, proc: subprocess.Popen) -> None:
         deadline = time.time() + float(self.cfg["ready_timeout_s"])
@@ -361,3 +437,15 @@ class LLMManager:
 
 
 llm = LLMManager()
+
+
+def _unload_on_exit() -> None:
+    for mid, proc in list(llm._procs.items()):
+        if proc.poll() is None:
+            logger.info(f"Lucy Core stopping: unloading {llm.models[mid]['label']}")
+            with _suppress():
+                _kill_tree(proc.pid)
+
+
+import atexit as _atexit
+_atexit.register(_unload_on_exit)

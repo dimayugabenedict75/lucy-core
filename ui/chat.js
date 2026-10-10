@@ -945,6 +945,11 @@ filesToSend.forEach(f => formData.append('files', f));
                                         'send': 'Sending...',
                                         'analyze': 'Analyzing...',
                                         'speak': 'Speaking...',
+                                        'load': 'Loading model...',
+                                        'remember': 'Remembering...',
+                                        'recall': 'Recalling...',
+                                        'forget': 'Forgetting...',
+                                        'history': 'Searching past chats...',
                                     };
                                     if (activity.includes(':')) {
                                         const splitIdx = activity.indexOf(':');
