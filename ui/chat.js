@@ -16,7 +16,7 @@ function authHeaders(extra = {}) {
 }
 
 // Render markdown-lite for assistant messages (bullets, bold, italics, line breaks)
-function renderMarkdown(text) {
+function renderMarkdown(text, keepLineBreaks) {
     // Parse MEDIA: markers into image tags BEFORE marked.js processes the text
     // so they survive innerHTML replacements during streaming.
     text = parseMediaMarkers(text);
@@ -29,7 +29,8 @@ function renderMarkdown(text) {
             .replace(/\*(.+?)\*/g, '<em>$1<\/em>')
             .replace(/\n/g, '<br>');
     }
-    return marked.parse(text);
+    // keepLineBreaks: the user's own messages show every Shift+Enter line break as typed
+    return keepLineBreaks ? marked.parse(text, { breaks: true }) : marked.parse(text);
 }
 
 // -- PCM audio playback for streaming TTS --
@@ -428,7 +429,7 @@ function addMessage(text, isUser = false, files = [], timestamp = null) {
         files = [];   // the uploaded copy (for the model) is not shown a second time
     } else {
         bubble.className = `message-bubble ${isUser ? 'user-bubble' : 'assistant-bubble'}`;
-        bubble.innerHTML = renderMarkdown(text);
+        bubble.innerHTML = renderMarkdown(text, isUser);
         enhanceCodeBlocks(bubble);
     }
     contentWrapper.appendChild(bubble);
@@ -619,19 +620,32 @@ function updateSendButtonState() {
 //   idle                      -> "Send"
 //   replying, box is empty    -> "Stop"  (abort the current reply)
 //   replying, text typed      -> "Queue" (sent after the current reply finishes)
+const SEND_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7z"/></svg>';
+const STOP_ICON = '<svg class="fill-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+
+function setSendButton(icon, label, extraClass) {
+    // Only touch the DOM when something changed (this runs on every keystroke)
+    if (sendButton.dataset.state !== label) {
+        sendButton.dataset.state = label;
+        sendButton.innerHTML = icon;
+        sendButton.setAttribute('aria-label', label);
+    }
+    sendButton.classList.toggle('queue-mode', extraClass === 'queue-mode');
+}
+
 function updateSendButton() {
     const hasInput = messageInput.value.trim().length > 0 || selectedFiles.length > 0;
     sendButton.disabled = false;
     sendButton.classList.toggle('stop-mode', isStreaming && !hasInput);
     if (isStreaming && !hasInput) {
-        sendButton.textContent = 'Stop';
+        setSendButton(STOP_ICON, 'Stop');
         sendButton.title = 'Stop the current reply (Esc)';
     } else if (isStreaming) {
-        sendButton.textContent = 'Queue';
-        sendButton.title = 'Send this after the current reply finishes';
+        setSendButton(SEND_ICON, 'Queue', 'queue-mode');
+        sendButton.title = 'Queue: send this after the current reply finishes';
     } else {
-        sendButton.textContent = 'Send';
-        sendButton.title = '';
+        setSendButton(SEND_ICON, 'Send');
+        sendButton.title = 'Send (Enter)';
     }
 }
 
@@ -743,6 +757,7 @@ async function sendMessage(queued) {
         // A reply is still running: park this message instead of dropping it.
         enqueueMessage(message, [...selectedFiles]);
         messageInput.value = '';
+        autosizeInput();
         selectedFiles = [];
         filePreviewContainer.innerHTML = '';
         updateSendButton();
@@ -773,6 +788,7 @@ async function sendMessage(queued) {
         selectedFiles = [];
         filePreviewContainer.innerHTML = '';
         messageInput.value = '';
+        autosizeInput();
     }
     currentAbort = new AbortController();
     setSending(true);
@@ -794,6 +810,25 @@ async function sendMessage(queued) {
     let fullResponse = '';
     let pendingMedia = [];
     let firstContentReceived = false;
+    // Watchdog: the indicator is hidden while text streams. If the stream then goes quiet (the model is
+    // generating a tool call, a retry round is running, a long prompt is being processed...) bring it back,
+    // otherwise the UI looks frozen while the GPU is busy. Tool labels ("Searching: x") are left alone.
+    let stallTimer = null;
+    const STALL_MS = 1500;
+    const armStall = () => {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => {
+            if (currentActivity !== 'think' && currentActivity !== null && currentActivity !== undefined) return;
+            if (window._activityHideTimer) { clearTimeout(window._activityHideTimer); window._activityHideTimer = null; }
+            currentActivity = 'think';
+            const ti = document.getElementById('thinkingIndicator');
+            if (ti) {
+                ti.classList.add('active');
+                const label = ti.querySelector('span:last-child');
+                if (label) label.textContent = 'Thinking...';
+            }
+        }, STALL_MS);
+    };
     const voiceMode = voiceToggle && voiceToggle.checked;
 
     try {
@@ -825,7 +860,8 @@ filesToSend.forEach(f => formData.append('files', f));
 
         while (true) {
             const {done, value} = await reader.read();
-            if (done) break;
+            if (done) { clearTimeout(stallTimer); break; }
+            armStall();
 
             sseBuffer += decoder.decode(value, {stream: true});
             const lines = sseBuffer.split('\n\n');
@@ -1006,6 +1042,7 @@ filesToSend.forEach(f => formData.append('files', f));
             streamingBubble.textContent = `Error: ${error.message || 'Could not connect to Lucy Core.'}`;
         }
     } finally {
+        clearTimeout(stallTimer);
         currentAbort = null;
         setSending(false);
         messageInput.focus();
@@ -2083,13 +2120,33 @@ loadSessions();
 loadVoiceStatus();
 bindAutosave();
 
-messageInput.addEventListener('keypress', (e) => {
-    // Enter while a reply is running queues the message (sendMessage handles it)
-    if (e.key === 'Enter') {
+// Enter sends (or queues while a reply is running); Shift+Enter inserts a new line.
+// Ignored while an IME (Japanese/Chinese/Korean input) is composing, where Enter confirms the text.
+messageInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+        e.preventDefault();
         sendMessage();
     }
 });
-messageInput.addEventListener('input', updateSendButton);
+
+// The message box is a textarea that grows with its content (up to its CSS max-height, then scrolls).
+function autosizeInput() {
+    messageInput.style.height = 'auto';
+    const borders = messageInput.offsetHeight - messageInput.clientHeight;
+    messageInput.style.height = (messageInput.scrollHeight + borders) + 'px';
+}
+messageInput.addEventListener('input', () => {
+    autosizeInput();
+    updateSendButton();
+});
+
+// On narrow phones there is only room for a short placeholder (a textarea would clip the long one mid-word).
+const narrowScreen = window.matchMedia('(max-width: 480px)');
+function updatePlaceholder() {
+    messageInput.placeholder = narrowScreen.matches ? 'Message...' : 'Type a message...';
+}
+updatePlaceholder();
+narrowScreen.addEventListener('change', updatePlaceholder);
 
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {

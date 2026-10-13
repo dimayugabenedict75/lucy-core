@@ -743,9 +743,11 @@ body {
     -webkit-backdrop-filter: blur(10px);
     gap: 8px;
     flex-shrink: 0;
+    align-items: flex-end;   /* the box can grow taller (Shift+Enter); the buttons stay at the bottom */
 }
 
-.input-area input[type="text"] {
+.input-area input[type="text"],
+.input-area textarea#messageInput {
     flex: 1;
     padding: 10px 14px;
     border: 1px solid var(--border-strong);
@@ -758,25 +760,44 @@ body {
     transition: border-color 0.2s;
 }
 
-.input-area input[type="text"]:focus {
+.input-area input[type="text"]:focus,
+.input-area textarea#messageInput:focus {
     border-color: var(--accent);
 }
 
-.input-area input[type="text"]::placeholder {
+.input-area input[type="text"]::placeholder,
+.input-area textarea#messageInput::placeholder {
     color: var(--text-faint);
+    white-space: nowrap;          /* a textarea would wrap the placeholder onto a 2nd line; keep it to one */
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The message box is a textarea: 1 line tall like the 36px buttons, grows with Shift+Enter, then scrolls */
+.input-area textarea#messageInput {
+    display: block;
+    box-sizing: border-box;
+    min-width: 0;
+    resize: none;
+    padding: 8px 14px;          /* 18px line + 16px padding + 2px border = 36px, same as the buttons */
+    line-height: 18px;
+    min-height: 36px;
+    max-height: 160px;
+    overflow-y: auto;
 }
 
 .input-area button#sendButton {
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 10px 20px;
+    flex-shrink: 0;
+    width: 36px;                /* same size as the emoji button */
+    height: 36px;
+    padding: 0;
     border: 1px solid var(--accent);
     background: transparent;
     color: var(--accent);
-    border-radius: var(--radius);
-    font-size: 12px;
-    font-weight: 500;
+    border-radius: 8px;
     cursor: pointer;
     transition: all 0.2s;
 }
@@ -1489,10 +1510,18 @@ body {
         padding: 12px 14px;
     }
 
-    .input-area button#sendButton {
-        min-width: 44px;
+    .input-area textarea#messageInput {
+        font-size: 16px;        /* prevents iOS Safari from auto-zooming on focus */
+        line-height: 20px;
+        padding: 11px 14px;     /* 20 + 22 + 2 = 44px, the touch-target height of the buttons */
         min-height: 44px;
-        padding: 10px 16px;
+        max-height: 140px;
+    }
+
+    .input-area button#sendButton {
+        width: 44px;
+        height: 44px;
+        padding: 0;
     }
 
     .upload-btn {
@@ -1603,7 +1632,8 @@ body {
     position: relative;   /* anchor for the picker popover */
 }
 
-.emoji-btn {
+.emoji-btn,
+.mic-btn {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1620,8 +1650,30 @@ body {
 }
 
 .emoji-btn:hover,
-.emoji-btn.active {
+.emoji-btn.active,
+.mic-btn:hover {
     border-color: var(--accent);
+}
+
+/* Icons inside the round-corner buttons (send / mic) follow the button colour */
+.input-area button svg {
+    width: 18px;
+    height: 18px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    pointer-events: none;
+}
+
+.input-area button svg.fill-icon {      /* the Stop square is solid */
+    fill: currentColor;
+    stroke: none;
+}
+
+.input-area button#sendButton.queue-mode {   /* typing during a reply: dashed = "will be sent after" */
+    border-style: dashed;
 }
 
 .picker-pop {
@@ -1768,7 +1820,8 @@ body {
 
 @media (max-width: 768px) {
     /* same 44px touch target as the attach button */
-    .emoji-btn {
+    .emoji-btn,
+    .mic-btn {
         width: 44px;
         height: 44px;
     }

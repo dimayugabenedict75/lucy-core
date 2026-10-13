@@ -30,6 +30,7 @@ import re
 from typing import Any
 
 _FIXED_MARKERS = ("<tool_call>", "<function=", "[TOOL_CALLS]")
+_SNAKE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+")
 _HOLD_WINDOW = 80          # how far back an undecided marker can start
 
 
@@ -42,20 +43,38 @@ class TextToolCallFilter:
                 self.schemas[fn["name"]] = fn.get("parameters", {}) or {}
         names = sorted(self.schemas, key=len, reverse=True)
         alt = "|".join(re.escape(n) for n in names) or r"(?!)"
+        # "Action: tool(...)", also wrapped in markdown ("**Action:** `tool(...)`"). A snake_case name followed
+        # by "(" counts even if no such tool exists, so the loop can answer "unknown tool" instead of the
+        # model believing it did something.
+        # A line that STARTS with a real tool name + ( or { is also a call attempt:  send_sticker{"emotion": "Happy"}
+        # A snake_case tool name with a bracket attached is a call anywhere in the text ("Sure, send_sticker{...}").
+        us = "|".join(re.escape(n) for n in sorted((n for n in self.schemas if "_" in n), key=len, reverse=True)) or r"(?!)"
+        self._bare = re.compile(r"(?<![^\n])[ \t]*[*_`]{0,4}(" + alt + r")(?=[({])|(?<![\w`*])(" + us + r")(?=[({])")
         self._start = re.compile(
-            r"Action:\s*[`*]*\s*(?:" + alt + r")\b|<tool_call>|<function=|\[TOOL_CALLS\]")
-        self._action_prefix = re.compile(r"Action:\s*[`*]*\s*(\w*)$")
+            r"[*_`]{0,4}[ \t]*Action[ \t]*[*_`]{0,4}[ \t]*:[*_`\s]*(?:(?:" + alt + r")\b|"
+            r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?=[ \t]*\())|<tool_call>|<function=|\[TOOL_CALLS\]"
+            r"|(?<![^\n])[ \t]*[*_`]{0,4}(?:" + alt + r")(?=[({])|(?<![\w`*])(?:" + us + r")(?=[({])")
+        self._action_prefix = re.compile(r"Action[ \t]*[*_`]{0,4}[ \t]*(?::[*_`\s]*([A-Za-z0-9_]*))?$")
         self.buf = ""
         self.emitted = 0
         self.tripped = False
         self.trip_at = 0
 
     # -- streaming ---------------------------------------------------------------
-    def _undecided(self, suffix: str) -> bool:
-        if any(m.startswith(suffix) for m in ("Action:",) + _FIXED_MARKERS):
+    def _undecided(self, suffix: str, bol: bool = False) -> bool:
+        """Could `suffix` (the tail of the text so far) still turn into a tool-call marker?"""
+        s = suffix.lstrip("*_` \t")
+        if not s:
+            return any(c in "*_`" for c in suffix)           # only markup so far: may precede "Action"
+        if any(m.startswith(s) for m in ("Action",) + _FIXED_MARKERS):
             return True
-        m = self._action_prefix.match(suffix)
-        return bool(m and any(n.startswith(m.group(1)) for n in self.schemas))
+        if (bol or len(s) >= 3) and any(n.startswith(s) for n in self.schemas):
+            return True                                        # may be the start of a bare tool call
+        m = self._action_prefix.match(s)
+        if not m:
+            return False
+        name = m.group(1)
+        return name is None or any(n.startswith(name) for n in self.schemas) or bool(re.fullmatch(r"[a-z][a-z0-9_]*", name or "a"))
 
     def feed(self, chunk: str) -> str:
         if self.tripped:
@@ -70,7 +89,7 @@ class TextToolCallFilter:
             return out
         safe_end = len(self.buf)
         for j in range(max(self.emitted, len(self.buf) - _HOLD_WINDOW), len(self.buf)):
-            if self._undecided(self.buf[j:]):
+            if self._undecided(self.buf[j:], bol=(j == 0 or not (self.buf[j - 1].isalnum() or self.buf[j - 1] == "_"))):
                 safe_end = j
                 break
         out = self.buf[self.emitted:safe_end]
@@ -105,12 +124,13 @@ class TextToolCallFilter:
             found += self._parse_json_blocks(text)
             found += self._parse_xml_function(text)
             found += self._parse_action(text)
+            found += self._parse_bare(text)
         except Exception:                      # never let a parsing bug break the chat
             return []
         out, seen = [], set()
         for i, (name, args) in enumerate(found):
-            if name not in self.schemas:
-                continue
+            if name not in self.schemas and not _SNAKE.fullmatch(name or ""):
+                continue                                     # unknown names are passed on only if tool-like
             key = (name, json.dumps(args, sort_keys=True, default=str))
             if key in seen:
                 continue
@@ -157,7 +177,7 @@ class TextToolCallFilter:
     def _parse_action(self, text: str) -> list[tuple[str, dict]]:
         res = []
         for m in self._start.finditer(text):
-            if not m.group(0).startswith("Action:"):
+            if "Action" not in m.group(0):
                 continue
             name = re.search(r"(\w+)\s*$", m.group(0)).group(1)
             pos = m.end()
@@ -178,6 +198,21 @@ class TextToolCallFilter:
                 res.append((name, obj))
             else:
                 res.append((name, {}))
+        return res
+
+    # name(...)  /  name{...}  at the start of a line, for tools that exist
+    def _parse_bare(self, text: str) -> list[tuple[str, dict]]:
+        res = []
+        for m in self._bare.finditer(text):
+            name, pos = m.group(1) or m.group(2), m.end()
+            inner = self._balanced(text[pos:])
+            if inner is None:
+                continue                                       # truncated: don't guess
+            if text[pos] == "{":
+                args = self._load_obj("{" + inner + "}") or self._parse_args(inner, name)
+            else:
+                args = self._parse_args(inner, name)
+            res.append((name, args))
         return res
 
     # -- helpers ------------------------------------------------------------------

@@ -102,11 +102,16 @@
             <button type="button" class="upload-btn" id="uploadBtn"
                 onclick="document.getElementById('fileInput').click()">&#x1F4CE;</button>
             <div class="file-preview-container" id="filePreviewContainer"></div>
-            <input type="text" id="messageInput" name="chat_message" placeholder="Type a message..." autocomplete="off"
-                data-lpignore="true" data-1p-ignore data-bwignore="true">
+            <textarea id="messageInput" name="chat_message" rows="1" placeholder="Type a message..." autocomplete="off"
+                enterkeyhint="send" data-lpignore="true" data-1p-ignore data-bwignore="true"></textarea>
             <button type="button" class="emoji-btn" id="pickerBtn" title="Emoji &amp; stickers"
                 aria-haspopup="dialog" aria-expanded="false" aria-controls="pickerPop">&#x1F642;</button>
-            <button type="button" id="sendButton" onclick="onSendClick()">Send</button>
+            <button type="button" class="mic-btn" id="micButton" title="Voice input (coming soon)" aria-label="Voice input (coming soon)">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v4"/><path d="M8 22h8"/></svg>
+            </button>
+            <button type="button" id="sendButton" onclick="onSendClick()" title="Send" aria-label="Send">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7z"/></svg>
+            </button>
 
             <!-- Emoji & sticker picker: opens just above the input row -->
             <div class="picker-pop" id="pickerPop" role="dialog" aria-label="Emoji and stickers" hidden>

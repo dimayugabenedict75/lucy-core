@@ -106,6 +106,12 @@ def test_text_format_call_recovered():
     r = run([{"content": ['Action: web_search(query="x")'], "finish": "stop"}, ANS()])
     assert r.calls == [("web_search", {"query": "x"})] and "Action:" not in r.text
 
+def test_hallucinated_text_tool_gets_unknown_tool_feedback():
+    r = run([{"content": ['Sure.\n**Action:** `send_sticker(emotion="Attuned")`'], "finish": "stop"}, CALL(), ANS("Sent.")])
+    assert r.calls == [("web_search", {"query": "q"})]                 # send_sticker never ran
+    assert "Unknown tool 'send_sticker'" in tool_msgs(r, 1)[0]["content"] and "Available tools" in tool_msgs(r, 1)[0]["content"]
+    assert "Action" not in r.text and "send_sticker" not in r.text and r.text.startswith("Sure.")
+
 def test_truncated_tool_call_not_executed():
     r = run([{"tool_calls": [{"name": "edit_local_file", "arguments": '{"file_path": "a.py", "old_string": "x", "new_str'}], "finish": "length"},
              CALL(), ANS()])
@@ -164,14 +170,16 @@ def test_length_cutoff_is_continued_without_breaking_words():
 def test_narration_guard_nudges_once_then_acts():
     r = run([{"content": ["Sure, let me search for that."], "finish": "stop"}, CALL(), ANS("Found it.")])
     assert len(r.calls) == 1 and r.text.endswith("Found it.") and "did not call" in r.requests[1]["messages"][-1]["content"]
-    r = run([{"content": ["Let me look that up for you."], "finish": "stop"}, {"content": ["Let me look that up for you."], "finish": "stop"}])
-    assert r.metrics["rounds"] == 2                      # nudged only once
+    # a model that keeps promising without acting is no longer abandoned after one nudge (see test_multistep.py):
+    # 2nd broken promise -> the harness runs the search itself with the user's message as the query
+    r = run([{"content": ["Let me look that up for you."], "finish": "stop"}] * 2 + [ANS("Here you go.")])
+    assert r.calls == [("web_search", {"query": "hi"})] and r.text.endswith("Here you go.")
 
 def test_narration_guard_ignores_offers_and_normal_text():
     for t in ["Do you want me to search for that?", "I'll keep that in mind.", "Paris is the capital of France.",
-              "If you'd like, I can search the web.", "Sure. I will remember that preference."]:
+              "If you'd like, I can search the web."]:
         assert not narrates_without_acting(t), t
-    for t in ["Sure, let me search for that.", "I'll check the file now.", "Okay, I'm going to edit api.py.", "Let me look that up for you.", "I'll take a look at the file."]:
+    for t in ["Sure. I will remember that preference.", "Sure, let me search for that.", "I'll check the file now.", "Okay, I'm going to edit api.py.", "Let me look that up for you.", "I'll take a look at the file."]:
         assert narrates_without_acting(t), t
 
 # ---- the model itself ------------------------------------------------------------------------------------
@@ -221,3 +229,48 @@ def test_helpers():
     assert coerce_args({"n": "7", "b": "true", "l": "[1,2]", "s": 5}, sch) == {"n": 7, "b": True, "l": [1, 2], "s": "5"}
     assert looks_failed("Error: x") and looks_failed("File not found: a") and looks_failed('{"error": "x"}')
     assert not looks_failed("No results found for 'x'") and not looks_failed("ok")
+
+
+# ---- claim guard / narration / media ---------------------------------------------------------------------
+REMEMBER = tool("remember", {"content": S}, ["content"])
+STICKER = tool("send_sticker", {"emotion": S, "theme": S}, ["emotion"])
+
+def test_unbacked_claim_is_challenged_once():
+    r = run([ANS("I've saved that to persistent memory so it carries over."), ANS("Correction: I have not saved it yet.")], tools=TOOLS + [REMEMBER])
+    assert r.metrics["rounds"] == 2 and "no remember call succeeded" in r.requests[1]["messages"][-1]["content"]
+    assert "did not happen" in r.requests[1]["messages"][-1]["content"] and r.text.endswith("I have not saved it yet.")
+
+def test_claim_can_be_made_true_by_calling_the_tool():
+    r = run([ANS("I've saved that to memory."), CALL("remember", {"content": "likes tea"}), ANS("Saved.")], tools=TOOLS + [REMEMBER])
+    assert r.calls == [("remember", {"content": "likes tea"})]
+
+def test_backed_claim_is_not_challenged():
+    r = run([CALL("remember", {"content": "likes tea"}), ANS("I've saved that to memory.")], tools=TOOLS + [REMEMBER])
+    assert r.metrics["rounds"] == 2 and r.text.endswith("I've saved that to memory.")
+
+def test_file_claim_needs_a_successful_edit_not_just_any_tool():
+    r = run([CALL(), ANS("I updated api.py with the new tool.")])               # only web_search ran
+    assert r.metrics["rounds"] == 3 and "edit_local_file/write_local_file" in r.requests[2]["messages"][-1]["content"]
+    async def failing(n, a): return "Error: 'old_string' not found in file"
+    r = run([CALL("edit_local_file", {"file_path": "a", "old_string": "x", "new_string": "y"}), ANS("I edited the file for you.")], execute=failing)
+    assert "no edit_local_file/write_local_file call succeeded" in r.requests[-1]["messages"][-1]["content"]
+
+def test_questions_future_and_earlier_turn_statements_are_not_claims():
+    for t in ["Did you want me to save that to memory?", "I saved it earlier in a previous chat.", "If I update the file you need to restart."]:
+        assert run([ANS(t)]).metrics["rounds"] == 1, t
+
+def test_familiarize_promise_is_nudged_to_actually_read():
+    r = run([{"content": ["Sure, I'll familiarize myself with the Lucy Core harness."], "finish": "stop"}, CALL("read_local_file", {"file_path": ".core/harness.md"}), ANS("Done reading.")])
+    assert r.calls == [("read_local_file", {"file_path": ".core/harness.md"})] and "did not call" in r.requests[1]["messages"][-1]["content"]
+
+def test_media_result_shows_image_but_model_only_sees_a_confirmation():
+    async def sticker(n, a): return "MEDIA:Lucy/Lucy_Core/assets/stickers/Dark/Happy.png hello"
+    r = run([CALL("send_sticker", {"emotion": "Happy"}), ANS("There you go.")], execute=sticker, tools=TOOLS + [STICKER])
+    assert [e.data for e in r.events if e.kind == "media"] == ["Lucy/Lucy_Core/assets/stickers/Dark/Happy.png"]
+    seen = tool_msgs(r)[0]["content"]
+    assert seen.startswith("Delivered to the user's chat via send_sticker") and "Happy.png" not in seen and "MEDIA:" not in seen.split("do not write")[0]
+
+
+def test_remember_promise_after_the_tool_already_ran_is_fine():
+    r = run([CALL("remember", {"content": "likes tea"}), ANS("Got it, I'll remember that.")], tools=TOOLS + [REMEMBER])
+    assert r.metrics["rounds"] == 2
