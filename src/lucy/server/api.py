@@ -30,6 +30,11 @@ from lucy import paths as _paths
 from contextvars import ContextVar
 from lucy.server.llm_manager import llm                      # model switching, temperature, reasoning, KV cache
 from lucy.server.agent_loop import AgentLoop, LoopConfig     # reliable tool-calling loop (retries, validation, ...)
+from lucy.server.tts_filter import TTSStreamFilter, clean_for_speech   # only speakable words reach the voice
+from lucy.server import file_guard                           # path resolution, tolerant edits, syntax checks, backups
+from lucy.server.stickers_tool import StickerLibrary, send_sticker as _send_sticker
+from lucy.server.harness_info import build_harness_digest   # accurate map of Lucy Core for the agent
+from lucy import proactive as _proactive                    # reminders, follow-ups, greetings (Lucy can speak first)
 import base64
 
 # Persona is loaded from file
@@ -198,14 +203,15 @@ _DB_PATH = str(_paths.RUNTIME / "sessions.sqlite")
 _PATH = Path(_DB_PATH)
 _PATH.parent.mkdir(parents=True, exist_ok=True)
 
-_db_lock = threading.Lock()
+_db_lock = threading.RLock()
 _conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
 _conn.row_factory = sqlite3.Row
 
 
 def _get_tz_modifier():
     """Return the SQLite timezone modifier string for the configured timezone."""
-    row = _conn.execute("SELECT value FROM tz_config WHERE key = 'timezone'").fetchone()
+    with _db_lock:
+        row = _conn.execute("SELECT value FROM tz_config WHERE key = 'timezone'").fetchone()
     tz = row["value"] if row else "system"
     if tz == "system":
         return "localtime"
@@ -457,14 +463,19 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_local_file",
-            "description": f"Read a file from the local filesystem. Only safe paths under {_HOME} are allowed.",
+            "description": (f"Read a file from the local filesystem (paths under {_HOME}; relative paths resolve from the "
+                            "Lucy Core folder). Small files are returned whole. For a LARGE file (like api.py) use "
+                            "search='text' to find the lines you need, then start_line/end_line to read just that part."),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": f"Absolute path to the file to read (e.g. {_HOME}/Desktop/Hello.txt)"
-                    }
+                        "description": f"Path to the file (e.g. {_HOME}/Desktop/Hello.txt or src/lucy/server/api.py)"
+                    },
+                    "start_line": {"type": "integer", "description": "First line to return (1-based)."},
+                    "end_line": {"type": "integer", "description": "Last line to return (default: 200 lines after start_line)."},
+                    "search": {"type": "string", "description": "Return only the lines containing this text (case-insensitive), with line numbers."}
                 },
                 "required": ["file_path"]
             }
@@ -817,6 +828,27 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_sticker",
+            "description": (
+                "Send one of YOUR OWN stickers to the user in the chat to express an emotion or reaction. The "
+                "stickers are real image files in Lucy_Core/assets/stickers/<Theme>/ (themes: Dark, Light) - you "
+                "do have a sticker library. Pick the emotion that fits the moment; use it naturally and "
+                "sparingly, with a short remark or none. This tool is the ONLY way to send a sticker: never "
+                "write file paths or MEDIA: lines yourself. Call it as a real tool call, not as text."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emotion": {"type": "string", "enum": StickerLibrary(_paths.ROOT).all_emotions(), "description": "Which sticker (by emotion). Same set in both themes."},
+                    "theme": {"type": "string", "enum": ["Dark", "Light"], "description": "Sticker theme (default Dark)."},
+                    "caption": {"type": "string", "description": "Optional short caption shown with the sticker."}
+                },
+                "required": ["emotion"]
+            }
+        }
+    },
     # --- Persistent memory (the agent decides what to keep) ---
     {
         "type": "function",
@@ -904,6 +936,7 @@ TOOLS = [
 ]
 
 _MEMORY_TOOLS = ("remember", "recall_memory", "forget", "search_conversations")
+TOOLS.extend(_proactive.TOOL_DEFS)       # set_reminder, schedule_task, manage_reminders, proactive_control
 
 # --- Tool Registry (lookup by name for dynamic skill-tool mapping) ---
 TOOL_REGISTRY: Dict[str, dict] = {
@@ -933,6 +966,8 @@ def _resolve_skills_to_tools(skill_list: list[dict]) -> list[dict]:
     tool_names.add("edit_local_file")
     tool_names.add("read_local_file")
     tool_names.update(_MEMORY_TOOLS)          # memory + past-chat search are always available
+    tool_names.update(_proactive.TOOL_NAMES)  # reminders / follow-ups are always available
+    tool_names.add("send_sticker")
     if tool_names:
         return [TOOL_REGISTRY[name] for name in sorted(tool_names)]
     return TOOLS  # fallback: all tools available
@@ -1110,13 +1145,29 @@ async def _analyze_image(image_path: str, question: str = "") -> str:
 # --- Tool Execution ---
 
 def _resolve_path(file_path: str) -> Path:
-    """Resolve a path and verify it's under SAFE_ROOT."""
-    target = Path(file_path).resolve()
+    """Resolve what the model typed to a real path under SAFE_ROOT (None if outside).
+
+    Relative paths resolve from the Lucy Core folder first; "Lucy_Core/src/..." style guesses are understood.
+    See lucy.server.file_guard.resolve_path."""
+    return file_guard.resolve_path(file_path, SAFE_ROOT, _paths.ROOT)
+
+
+def _outside_root(file_path: str) -> str:
+    return file_guard.outside_root_message(file_path, SAFE_ROOT, _paths.ROOT)
+
+
+_STICKERS = StickerLibrary(_paths.ROOT, SAFE_ROOT)
+
+
+def _refresh_sticker_tool() -> None:
+    """Re-read assets/stickers so a newly added <Emotion>.png can be used right away (no restart)."""
     try:
-        target.relative_to(SAFE_ROOT)
-    except ValueError:
-        return None
-    return target
+        emotions = _STICKERS.all_emotions()
+        for t in TOOLS:
+            if t["function"]["name"] == "send_sticker":
+                t["function"]["parameters"]["properties"]["emotion"]["enum"] = emotions
+    except Exception as e:                       # noqa: BLE001 - never break a chat over this
+        logger.warning(f"Could not refresh sticker emotions: {e}")
 
 
 # -- Lucy Audio streaming TTS client (SSE delta stream) --
@@ -1320,6 +1371,9 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
     """Execute a single tool call and return its string result."""
     logger.info(f"Executing tool: {tool_name} with args: {args}")
 
+    if tool_name in _proactive.TOOL_NAMES:
+        return await _proactive.run_tool(tool_name, args, _current_session.get())
+
     if tool_name in _MEMORY_TOOLS:
         return await asyncio.to_thread(_run_memory_tool, tool_name, args)
 
@@ -1327,69 +1381,88 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
         file_path = args.get("file_path", "")
         target = _resolve_path(file_path)
         if target is None:
-            return f"Error: {file_path} is outside the allowed root."
+            return _outside_root(file_path)
         if not target.exists():
             return f"File not found: {file_path}"
         if not target.is_file():
             return f"Not a file: {file_path}"
         try:
-            content = target.read_text(encoding="utf-8", errors="replace")
-            max_chars = 100_000
-            if len(content) > max_chars:
-                content = content[:max_chars] + "\n\n[... truncated ...]"
-            return content
+            try:
+                text, _crlf = file_guard.read_text_keep_style(target)
+            except ValueError:
+                text = target.read_text(encoding="utf-8", errors="replace")
+            lines = text.split("\n")
+            total = len(lines)
+            search = str(args.get("search") or "").strip()
+            start, end = args.get("start_line"), args.get("end_line")
+            if search:
+                hits = [i for i, l in enumerate(lines) if search.lower() in l.lower()]
+                if not hits:
+                    return f"No lines containing '{search}' in {target.as_posix()} ({total} lines)."
+                shown = "\n".join(f"{i + 1}: {lines[i]}" for i in hits[:30])
+                return (f"[{len(hits)} line(s) containing '{search}' in {target.as_posix()} ({total} lines)"
+                        f"{'; showing the first 30' if len(hits) > 30 else ''}. Use start_line/end_line to read around them]\n{shown}")
+            if start is not None or end is not None:
+                s0 = max(1, int(start or 1))
+                e0 = min(total, int(end) if end is not None else s0 + 199)
+                body = "\n".join(lines[s0 - 1:e0])
+                if len(body) > 11000:
+                    body = body[:11000]
+                    e0 = s0 + body.count("\n")
+                    return f"[{target.as_posix()} lines {s0}-{e0} of {total}; cut to fit - ask for fewer lines]\n{body}"
+                return f"[{target.as_posix()} lines {s0}-{e0} of {total}]\n{body}"
+            if len(text) > 10_000:
+                head = text[:10_000]
+                head = head[:head.rfind("\n")] if "\n" in head else head
+                return (f"{head}\n\n[... showing the first {head.count(chr(10)) + 1} of {total} lines of "
+                        f"{target.as_posix()}. It is large: use search='text' to find lines, then "
+                        f"start_line/end_line to read a range ...]")
+            return text
         except Exception as e:
             return f"[error reading file: {e}]"
 
     if tool_name == "edit_local_file":
         file_path = args.get("file_path", "")
-        old_string = args.get("old_string", "")
-        new_string = args.get("new_string", "")
         replace_all = args.get("replace_all", False)
-        # Normalize string booleans to actual Python booleans
-        # (llama-server may emit "true"/"false" strings instead of true/false)
-        if isinstance(replace_all, str):
+        if isinstance(replace_all, str):                      # llama-server may emit "true"/"false" strings
             replace_all = replace_all.lower() == "true"
         target = _resolve_path(file_path)
         if target is None:
-            return f"Error: {file_path} is outside the allowed root."
-        if not target.exists() or not target.is_file():
-            return f"File not found: {file_path}"
+            return _outside_root(file_path)
         try:
-            content = target.read_text(encoding="utf-8", errors="replace")
-            if old_string not in content:
-                return f"Error: 'old_string' not found in file: {file_path}"
-            if not replace_all and content.count(old_string) > 1:
-                return f"Error: 'old_string' matches {content.count(old_string)} times in {file_path}. Use replace_all=true or provide more context."
-            occurrences = content.count(old_string) if replace_all else 1
-            if replace_all:
-                new_content = content.replace(old_string, new_string)
-            else:
-                new_content = content.replace(old_string, new_string, 1)
-            target.write_text(new_content, encoding="utf-8")
-            return f"Replaced {occurrences} occurrence(s) in {file_path}"
-        except Exception as e:
+            result = await asyncio.to_thread(file_guard.edit_file, target, str(args.get("old_string", "")),
+                                             str(args.get("new_string", "")), bool(replace_all), _paths.ROOT)
+        except Exception as e:                                # noqa: BLE001
+            logger.exception("edit_local_file crashed")
             return f"[error editing file: {e}]"
+        if result.startswith(("Error", "Refused", "File not found")):
+            logger.warning(f"edit_local_file {target}: {result[:200]}")
+        else:
+            logger.info(f"edit_local_file {target}: {result[:160]}")
+        return result
 
     if tool_name == "write_local_file":
         file_path = args.get("file_path", "")
-        content = args.get("content", "")
         target = _resolve_path(file_path)
         if target is None:
-            return f"Error: {file_path} is outside the allowed root."
+            return _outside_root(file_path)
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            return f"Written {len(content)} characters to {file_path}"
-        except Exception as e:
+            result = await asyncio.to_thread(file_guard.write_file, target, str(args.get("content", "")), _paths.ROOT)
+        except Exception as e:                                # noqa: BLE001
+            logger.exception("write_local_file crashed")
             return f"[error writing file: {e}]"
+        (logger.warning if result.startswith(("Error", "Refused")) else logger.info)(f"write_local_file {target}: {result[:160]}")
+        return result
+
+    if tool_name == "send_sticker":
+        return await asyncio.to_thread(_send_sticker, args, _STICKERS)
 
     elif tool_name == "list_local_files":
         dir_path = args.get("dir_path", "")
         pattern = args.get("pattern", "*")
         target = _resolve_path(dir_path)
         if target is None:
-            return f"Error: {dir_path} is outside the allowed root."
+            return _outside_root(dir_path)
         if not target.exists():
             return f"Directory not found: {dir_path}"
         if not target.is_dir():
@@ -1406,7 +1479,8 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
     elif tool_name == "run_shell_command":
         command = args.get("command", "")
         try:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 ["bash", "-c", command],
                 capture_output=True,
                 text=True,
@@ -1429,14 +1503,15 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
         dir_path = args.get("dir_path", str(SAFE_ROOT))
         target = _resolve_path(dir_path)
         if target is None:
-            return f"Error: {dir_path} is outside the allowed root."
+            return _outside_root(dir_path)
         # Validate file_name — reject shell-dangerous characters to prevent
         # command injection in the find command below
         _dangerous = [';', '|', '&', '$', '`', '"', "'"]
         if not file_name or any(c in file_name for c in _dangerous):
             return "Error: file_name contains invalid characters"
         try:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 ["bash", "-c", f'find "{target}" -name "{file_name}" -maxdepth 4 2>/dev/null | head -20'],
                 capture_output=True,
                 text=True,
@@ -1457,7 +1532,7 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
         caption = args.get("caption")
         target = _resolve_path(file_path)
         if target is None:
-            return f"Error: {file_path} is outside the allowed root."
+            return _outside_root(file_path)
         if not target.exists() or not target.is_file():
             return f"File not found: {file_path}"
         # Return MEDIA: marker so Hermes/Discord sends it as an attachment
@@ -1499,6 +1574,9 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
         voice = args.get("voice", "frieren")
         if not text:
             return "send_tts requires 'text' parameter"
+        text = clean_for_speech(text, _tool_names())   # no tool calls / file paths / markdown in the voice
+        if not text:
+            return "send_tts: nothing speakable left after removing tool calls, file paths and markup"
         # Save the text to a temp input file for the wrapper to read
         import uuid as _uuid
         _ts = time.strftime("%Y%m%d_%H%M%S")
@@ -1534,7 +1612,8 @@ async def execute_tool_call(tool_name: str, args: dict) -> str:
 
         _log_deltastream("started", text)
         try:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 ["cmd", "/c", str(wrapper), str(input_file), str(output_file)],
                 capture_output=True, text=True, timeout=120,
             )
@@ -1680,6 +1759,11 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
         "remembered something if the tool call succeeded."
     )})
 
+    try:                                   # accurate map of Lucy Core: paths, files, tools, stickers, how to edit
+        messages.append({"role": "system", "content": build_harness_digest(TOOLS, _paths.ROOT, SAFE_ROOT)})
+    except Exception as e:
+        logger.warning(f"Failed to build harness digest: {e}")
+
     # Inject relevant skills
     try:
         relevant_skills = _skills_manager.get_relevant_skills(user_message)
@@ -1702,11 +1786,22 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
         "sections without rewriting the whole file. "
         "(3) read_local_file — for viewing file contents. "
         "When you need to know what's in a file, call read_local_file first, "
-        "then use edit_local_file with the correct old_string."
+        "then use edit_local_file with the correct old_string. "
+        "(4) REMINDERS & FOLLOW-UPS: when the user asks to be reminded of something, or you say you will "
+        "remind them or check back later, CALL set_reminder (plain reminder) or schedule_task (you run a "
+        "read-only task later and report) - never just promise, and only say it is set after the tool "
+        "confirms. Messages you send on your own initiative (reminders, greetings, check-ins) appear in the "
+        "chat as your own earlier messages. If the user wants fewer of them, call proactive_control."
     )})
 
     # Session history (limit to last N messages to avoid context overflow)
-    messages.extend(_get_messages(session_id)[-MAX_CONTEXT_MESSAGES:])
+    # Lucy can now speak first, so stored history may hold two assistant messages in a row: repair for the template
+    _hist = _get_messages(session_id)
+    messages.extend(_proactive.normalize_history(_hist[-MAX_CONTEXT_MESSAGES:], truncated=len(_hist) > MAX_CONTEXT_MESSAGES))
+    # The clock goes on the LAST message only, and only when the message is about time (keeps the KV cache valid, avoids noise)
+    _note = _proactive.now_note() if _proactive.wants_clock(user_message) else ""
+    if _note:
+        user_message = f"{user_message}\n\n[Harness note - internal, do not mention or quote it] {_note}"
 
     # New user message — embed images as multimodal content if present
     image_paths = image_paths or []
@@ -1794,6 +1889,8 @@ _TOOL_ACTIVITY_MAP = {
     "recall_memory": "recall",
     "forget": "forget",
     "search_conversations": "history",
+    "set_reminder": "remember", "schedule_task": "remember", "manage_reminders": "recall",
+    "proactive_control": "remember",       # reuse existing UI labels: no chat.html change needed
 }
 
 _ACTIVITY_DETAIL_MAX = 60  # truncate long detail (queries/commands) so the UI stays one line
@@ -1832,6 +1929,8 @@ def _tool_to_activity(tool_name: str, args: dict) -> str:
         return f"analyze:{args['image_path']}"
     if tool_name == "send_tts" and args.get("text"):
         return f"speak:{_truncate(args['text'], 40)}"
+    if tool_name == "send_sticker" and args.get("emotion"):
+        return f"send:{args['emotion']} sticker"
     if tool_name == "remember" and args.get("content"):
         return f"remember:{_truncate(args['content'], 40)}"
     if tool_name == "recall_memory" and args.get("query"):
@@ -1855,6 +1954,11 @@ def _tool_to_activity(tool_name: str, args: dict) -> str:
             return f"type:{_truncate(args.get('text',''), 40)}"
         return f"keys:{args['action']}"
 
+    if tool_name == "set_reminder" and args.get("message"):
+        return f"remember:reminder: {_truncate(args['message'], 32)}"
+    if tool_name == "schedule_task" and args.get("task"):
+        return f"remember:follow-up: {_truncate(args['task'], 32)}"
+
     # No usable detail in args — fall back to a plain category label.
     if tool_name in _TOOL_ACTIVITY_MAP:
         return _TOOL_ACTIVITY_MAP[tool_name]
@@ -1870,25 +1974,14 @@ _session_inflight: Dict[str, asyncio.Event] = {}
 
 import re
 
-def _clean_text_for_tts(text: str) -> str:
-    """Remove Action: prefixes, markdown bold/italic markers, and emojis
-    from text before it is sent to the TTS engine.
+def _tool_names() -> tuple:
+    return tuple(t["function"]["name"] for t in TOOLS)
 
-    This prevents the voice from reading out 'Action: send_tts' or stuttering
-    on **bold** markers like 'star star Hello star star'.
-    """
-    import re
-    # Remove ReAct-style "Action:" / "Action Input:" prefixes (multiline)
-    text = re.sub(r'^(Action|Action Input):\s*', '', text, flags=re.MULTILINE | re.IGNORECASE)
-    # Strip markdown bold and italic markers (** and __ or * and _)
-    text = text.replace('**', '').replace('__', '')
-    text = text.replace('*', '').replace('_', '')
-    # Remove emojis and other non-speech Unicode symbols
-    # Using a simple approach: remove anything not a word char, space, or basic punctuation.
-    text = re.sub(r'[^\w\s.,!?;:\'"()\n-]', '', text, flags=re.UNICODE)
-    # Collapse multiple spaces/tabs into one
-    text = re.sub(r'[ \t]+', ' ', text)
-    return text.strip()
+
+def _clean_text_for_tts(text: str) -> str:
+    """Final cleanup of text before it is spoken: tool-call chatter ("Action: ..."), MEDIA: markers,
+    file paths, URLs, code blocks, markdown and emoji are removed. See lucy.server.tts_filter."""
+    return clean_for_speech(text, _tool_names())
 
 
 
@@ -1969,9 +2062,11 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
     _stats: dict = {}
 
     _current_session.set(session_id)          # lets search_conversations skip the live conversation
+    _refresh_sticker_tool()                   # new sticker files are picked up without a restart
     if temperature is None:
         temperature = llm.temperature          # Settings > Model value (preset per model)
     available_tools = _resolve_skills_to_tools(skill_list) if skill_list else TOOLS
+    _tts_filter = TTSStreamFilter(tuple(t["function"]["name"] for t in available_tools))   # strips tool calls, paths, MEDIA: ...
     agent = AgentLoop(
         brain=_BRAIN, tools=available_tools,
         execute=lambda name, args: execute_tool_call(name, args),   # looked up at call time
@@ -1994,7 +2089,8 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
     async for ev in agent.run(messages):
         if ev.kind == "content":
             _full_response_text += ev.data
-            _tts_buffer += ev.data
+            if voice_mode:
+                _tts_buffer += _tts_filter.feed(ev.data)      # the chat shows everything; the voice only speech
             yield f"data: {json.dumps({'content': ev.data})}\n\n"
             # Incremental TTS: speak each finished sentence while the model is still generating.
             if voice_mode and re.search(r'[。．！？！？.!?…\n]\s*$', _tts_buffer):
@@ -2003,6 +2099,12 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
                     async for line in _speak(chunk):
                         yield line
         elif ev.kind == "activity":
+            if voice_mode:                    # a round just ended (tools are about to run): speak what's pending
+                _tts_buffer += _tts_filter.flush()
+                if _tts_buffer.strip():
+                    chunk, _tts_buffer = _tts_buffer.strip(), ""
+                    async for line in _speak(chunk):
+                        yield line
             yield f"data: {json.dumps({'activity': ev.data})}\n\n"
         elif ev.kind == "media":
             yield f"data: {json.dumps({'media': ev.data})}\n\n"
@@ -2014,6 +2116,8 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
 
     # --- Final TTS for any remaining buffered text (voice_mode) ---
     # Catches the last sentence fragment that didn't end with punctuation.
+    if voice_mode:
+        _tts_buffer += _tts_filter.flush()
     if voice_mode and _tts_buffer.strip():
         async for line in _speak(_tts_buffer.strip()):
             yield line
@@ -2087,6 +2191,10 @@ async def chat_endpoint(
         except Exception:
             pass
 
+    if message:
+        # Browsers encode line breaks in form data as CRLF (Shift+Enter in the chat box): store plain \n
+        message = message.replace("\r\n", "\n").replace("\r", "\n")
+
     # Allow empty message when files are attached (the model can reason about the image)
     if not message and not files and not file_paths:
         raise HTTPException(status_code=400, detail="No message provided")
@@ -2141,6 +2249,7 @@ async def chat_endpoint(
         pass
     # Store user message in session
     _append_message(session_id, "user", message)
+    _proactive.touch(session_id)
     # Check for memory-worthy fact in the user message
     memory_fact = detect_memory_candidate(message)
     _agent_saved_turn.discard(session_id)
@@ -2200,6 +2309,7 @@ async def chat_endpoint(
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
         finally:
             reply_done.set()
+            _proactive.touch(session_id)
             if _session_inflight.get(session_id) is reply_done:
                 _session_inflight.pop(session_id, None)
 
@@ -2506,6 +2616,7 @@ async def cli_chat_endpoint(
 
     # Store user message in CLI session
     _append_message(session_id, "user", message)
+    _proactive.touch(session_id)
     memory_fact = detect_memory_candidate(message)
     _agent_saved_turn.discard(session_id)
     asyncio.create_task(_generate_session_title(session_id))
@@ -2572,6 +2683,7 @@ async def root(request: Request):
     # editing the version number by hand.
     html = html.replace("__CSS_VERSION__", _asset_version("chat.css"))
     html = html.replace("__JS_VERSION__", _asset_version("chat.js"))
+    html = _proactive.inject_client(html, DEV_API_KEY)      # shows what Lucy says first (toast / notification)
     return HTMLResponse(content=html)
 
 
@@ -2619,10 +2731,11 @@ async def list_skills(_ = Depends(verify_api_key)):
 
     Returns skills with: id, name, trigger, instructions, tools, category, source.
     """
-    rows = _conn.execute(
-        "SELECT skill_id, name, trigger, instructions, tools, category, source, "
-        "created_at, updated_at FROM skills ORDER BY category, name"
-    ).fetchall()
+    with _db_lock:
+        rows = _conn.execute(
+            "SELECT skill_id, name, trigger, instructions, tools, category, source, "
+            "created_at, updated_at FROM skills ORDER BY category, name"
+        ).fetchall()
     skills = []
     for row in rows:
         tools_list = []
@@ -2853,7 +2966,8 @@ async def create_session(_: bool = Depends(verify_api_key)):
     session_id = str(uuid.uuid4())
     _ensure_session(session_id)
     # Set updated_at immediately so the session sorts to the top of the list
-    row = _conn.execute("SELECT strftime('%Y-%m-%d %H:%M:%S', 'now', ?) AS now", (_get_tz_modifier(),)).fetchone()
+    with _db_lock:
+        row = _conn.execute("SELECT strftime('%Y-%m-%d %H:%M:%S', 'now', ?) AS now", (_get_tz_modifier(),)).fetchone()
     now = row["now"] if row else time.strftime('%Y-%m-%d %H:%M:%S')
     with _db_lock:
         _conn.execute(
@@ -3120,7 +3234,8 @@ async def get_timezone_setting(_ = Depends(verify_api_key)):
     and cached for 24h. Falls back to TimeAPI.io if zoneinfo/tzdata is unavailable,
     then to a static list if the network is unreachable.
     """
-    row = _conn.execute("SELECT value FROM tz_config WHERE key = 'timezone'").fetchone()
+    with _db_lock:
+        row = _conn.execute("SELECT value FROM tz_config WHERE key = 'timezone'").fetchone()
     tz = row["value"] if row else "system"
 
     # Try cache first (in-memory or on-disk)
@@ -3220,3 +3335,123 @@ async def _shutdown_after_delay():
     import asyncio
     await asyncio.sleep(1)
     os._exit(0)
+
+
+# =====================================================================================================
+# === Proactive system: reminders, follow-up tasks, greetings, check-ins, alerts (lucy/proactive/) ===
+# Lucy can message FIRST. Everything it needs from this file is handed over in one ProactiveHost below.
+# =====================================================================================================
+def _proactive_pick_session() -> str:
+    """Where unprompted messages go: the most recently used chat (never the CLI sessions)."""
+    with _db_lock:
+        row = _conn.execute("SELECT session_id FROM sessions WHERE session_id NOT LIKE 'cli-%' "
+                            "ORDER BY updated_at DESC LIMIT 1").fetchone()
+    sid = row["session_id"] if row else "default"
+    _ensure_session(sid)
+    return sid
+
+
+def _proactive_is_busy() -> bool:
+    return any(not ev.is_set() for ev in list(_session_inflight.values()))
+
+
+async def _proactive_llm_ready() -> bool:
+    """The model is already up (we never start or wait for it just to say hello)."""
+    return llm.phase not in ("loading", "stopping") and await llm._healthy(llm.active["port"])
+
+
+async def _proactive_llm_complete(messages: list, opts: dict) -> str:
+    payload = {"model": llm.model_name, "messages": messages, "temperature": opts.get("temperature", 0.7),
+               "max_tokens": opts.get("max_tokens", 200), "stream": False, **llm.request_extras()}
+    async with httpx.AsyncClient(timeout=opts.get("timeout", 45.0)) as client:
+        resp = await client.post(f"{llm.api_url}/chat/completions", json=payload)
+    if resp.status_code != 200:
+        raise RuntimeError(f"model returned HTTP {resp.status_code}")
+    return resp.json()["choices"][0]["message"].get("content") or ""
+
+
+async def _proactive_run_agent(messages: list, allowed: list, timeout: float, max_rounds: int) -> str:
+    """A scheduled follow-up task: the normal agent loop, but with ONLY the allowed (read-only) tools."""
+    allowed_set = set(allowed)
+    tools = [TOOL_REGISTRY[n] for n in allowed if n in TOOL_REGISTRY]
+    if not tools:
+        raise RuntimeError("none of the allowed task tools exist")
+
+    async def guarded(name: str, args: dict) -> str:
+        if name not in allowed_set:
+            return f"Error: {name} is not available in a background task."
+        return await execute_tool_call(name, args)
+
+    agent = AgentLoop(
+        brain=_BRAIN, tools=tools, execute=guarded, activity_for=_tool_to_activity, count_tokens=_count_tokens,
+        temperature=min(llm.temperature, 0.5),
+        cfg=LoopConfig(max_rounds=max_rounds, max_tokens=LUCY_MAX_TOKENS, tool_timeout=LUCY_TOOL_TIMEOUT,
+                       ctx_tokens=int(llm.cfg.get("context_length", 100000)), http_timeout=LUCY_TIMEOUT,
+                       plan_tool=False),
+        trace=_agent_trace, session_id="proactive-task")
+    text = ""
+
+    async def consume():
+        nonlocal text
+        async for ev in agent.run(messages):
+            if ev.kind == "content":
+                text += ev.data
+            elif ev.kind == "error":
+                raise RuntimeError(str((ev.data or {}).get("detail") or (ev.data or {}).get("error")))
+
+    _current_session.set(None)
+    await asyncio.wait_for(consume(), timeout=timeout)
+    return text
+
+
+def _proactive_sticker(emotion: str):
+    try:
+        res = _send_sticker({"emotion": emotion, "theme": "Dark"}, _STICKERS)
+    except Exception:                                     # noqa: BLE001
+        return None
+    return res.split(" ", 1)[0].replace("MEDIA:", "") if isinstance(res, str) and res.startswith("MEDIA:") else None
+
+
+async def _proactive_speak(text: str) -> None:
+    """Speak through Lucy Audio on this PC - only when the DirectSound player is available."""
+    if _get_native_player() is None:
+        return
+    clean = _clean_text_for_tts(text)
+    if clean:
+        async for _ in _stream_tts_to_sse(clean, "frieren"):
+            pass
+
+
+def _proactive_app_timezone() -> str:
+    with _db_lock:
+        row = _conn.execute("SELECT value FROM tz_config WHERE key = 'timezone'").fetchone()
+    return row["value"] if row else "system"
+
+
+def _proactive_health() -> dict:
+    return {"llm_phase": llm.phase, "llm_error": llm.message if llm.phase == "error" else None,
+            "llm_label": llm.active["label"]}
+
+
+@app.on_event("startup")
+async def _proactive_start():
+    try:
+        _proactive.init(_proactive.ProactiveHost(
+            root=_paths.ROOT, runtime=_paths.RUNTIME, append_message=_append_message,
+            pick_session=_proactive_pick_session, recent_messages=lambda sid, n: _get_messages(sid)[-n:],
+            is_busy=_proactive_is_busy, health=_proactive_health, app_timezone=_proactive_app_timezone,
+            persona=lambda: _persona_prompt, llm_ready=_proactive_llm_ready, llm_complete=_proactive_llm_complete,
+            run_agent=_proactive_run_agent, memory_context=_memory_manager.get_contextual_memory,
+            sticker=_proactive_sticker, speak=_proactive_speak))
+        await _proactive.start()
+    except Exception as e:                                # noqa: BLE001 - Lucy must start even if this cannot
+        logger.error(f"Proactive system failed to start: {e}", exc_info=True)
+
+
+@app.on_event("shutdown")
+async def _proactive_stop():
+    await _proactive.stop()
+
+
+app.include_router(_proactive.router, dependencies=[Depends(verify_api_key)])
+app.include_router(_proactive.public_router)

@@ -1,0 +1,79 @@
+# Lucy proactive system - settings.  Edit, then restart Lucy Core.
+# Defaults are shown; delete any line you do not want to change.
+# A few things can also be changed live by asking Lucy (proactive_control): pause, mute, quiet hours.
+
+enabled: true
+user_name: Benny
+
+# "app" follows Settings > Timezone. Your Settings value was UTC; if you live elsewhere set it here,
+# otherwise quiet hours are off by your UTC offset. Examples: "Asia/Manila" (needs `pip install tzdata`
+# on Windows), "+08:00" (always works), "utc", "system".
+timezone: app
+
+startup_delay_seconds: 5
+tick_seconds: 10                  # how often due reminders are checked
+watch_interval_seconds: 60        # how often greetings / check-ins / alerts are considered
+
+quiet_hours: {enabled: true, start: "23:00", end: "07:00"}   # no unprompted messages; tasks wait; reminders still fire
+rest_days: [thursday]             # no check-ins, gentle greeting
+
+reminders:
+  compose: template               # template = instant | llm = Lucy rephrases (costs a model call)
+  ignore_quiet_hours: true
+  min_interval_minutes: 10
+  max_active: 200
+  catchup_recurring_minutes: 180  # a repeating reminder missed by longer than this is skipped, not replayed
+
+delivery:
+  session: active                 # active = most recently used chat | default | <session id>
+  voice: "off"                    # off | reminders | all   (speaks on this PC through Lucy Audio)
+  sticker: true
+  sticker_chance: 0.35
+  stickers:
+    greeting: [Happy, Cozy, Hopeful]
+    checkin: [Cozy, Confused, Hopeful]
+    alert: [Annoyed, Shocked]
+    task: [Smug, Confident]
+    reminder: []
+  max_defer_seconds: 180          # how long a reminder waits for a running reply to finish
+
+limits:
+  max_per_hour: 3                 # greetings / check-ins / alerts (reminders are exempt)
+  max_per_day: 8
+  ignored_backoff: true           # each unanswered message doubles the silence before the next
+  stop_after_ignored: 4           # this many unanswered in a row -> no check-ins until you write
+
+greeting: {enabled: true, min_gap_hours: 6, compose: llm}
+
+checkin:
+  enabled: true
+  idle_minutes: 180
+  idle_max_hours: 48
+  hours: ["10:00", "20:00"]
+  max_per_day: 1
+  cooldown_minutes: 240
+  skip_cooldown_minutes: 120
+  on_rest_days: false
+
+alerts:
+  enabled: true
+  model_error: true
+  model_error_after_seconds: 90
+  disk_free_gb: 5
+  log_mb: 50
+  cooldown_hours: 6
+
+tasks:                            # schedule_task: Lucy works unattended, so tools are READ-ONLY
+  enabled: true
+  allowed_tools: [web_search, web_extract, read_local_file, list_local_files, find_file, recall_memory, search_conversations]
+  max_rounds: 6
+  timeout_seconds: 300
+  retry_minutes: 10
+  max_attempts: 3
+  max_runs_per_day: 6
+
+llm:
+  timeout_seconds: 45
+  max_tokens: 200
+  temperature: 0.7
+  idle_before_llm_seconds: 20     # never borrow the model while you are chatting
