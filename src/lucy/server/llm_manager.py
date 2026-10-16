@@ -58,7 +58,7 @@ DEFAULT_MODELS_CFG: dict[str, Any] = {
         {"id": "lucy-4b", "label": "Lucy 4B", "port": 8081, "temperature": 0.5,
          "gguf": "C:/Users/dimay/Lucy/Lucy_Core/models/Lucy-4b/Lucy-4B-it-qat-q4_0.i1-Q4_K_M.gguf",
          "mmproj": "C:/Users/dimay/Lucy/Lucy_Core/models/Lucy-4b/Lucy-4B-it-qat-q4_0.mmproj-Q8_0.gguf",
-         "extra_args": []},
+         "extra_args": ["--reasoning", "off"]},
     ],
 }
 
@@ -294,8 +294,9 @@ class LLMManager:
         return bool(self.state["reasoning"])
 
     def request_extras(self) -> dict:
-        """Extra fields for chat/completions payloads. Reasoning is a launch flag now, so none."""
-        return {}
+        """Extra fields for chat/completions payloads. Reasoning is a launch flag now. cache_prompt makes llama-server
+        reuse the KV cache of the unchanged start of the prompt (persona, rules, history) instead of re-reading it."""
+        return {"cache_prompt": True}
 
     # -- health -----------------------------------------------------------------
     async def _healthy(self, port: int) -> bool:

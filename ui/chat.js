@@ -138,7 +138,7 @@ let isStreaming = false;
 let currentAbort = null;   // AbortController for the in-flight /api/chat request
 let messageQueue = [];     // messages typed while a reply is still being produced
 let queueSeq = 0;
-let currentSessionId = 'default';
+let currentSessionId = null;   // null = the start page (a draft). No session exists until the first message is sent.
 let sessions = {};
 let currentActivity = null;
 let sidebarCollapsed = false;
@@ -206,7 +206,11 @@ async function loadSessions() {
         const resp = await fetch('/api/sessions', {headers: authHeaders()});
         if (resp.ok) {
             const data = await resp.json();
-            Object.assign(sessions, data.sessions || {});
+            // Merge instead of replace: keeps messages already loaded for a session. The list carries no messages.
+            for (const [id, meta] of Object.entries(data.sessions || {})) {
+                const prev = sessions[id] || {};
+                sessions[id] = Object.assign({messages: prev.messages || []}, prev, meta);
+            }
             renderHistory();
         }
     } catch (e) {
@@ -214,35 +218,39 @@ async function loadSessions() {
     }
 }
 
-async function newSession() {
-    try {
-        const resp = await fetch('/api/sessions', {method: 'POST', headers: authHeaders()});
-        if (resp.ok) {
-            const data = await resp.json();
-            currentSessionId = data.session_id;
-            sessions[currentSessionId] = {
-                title: 'New Session',
-                message_count: 0,
-                messages: [],
-                updated_at: data.updated_at || new Date().toISOString().replace('T', ' ').slice(0, 19)
-            };
-        } else {
-            throw new Error('Failed to create session');
-        }
-    } catch (e) {
-        console.error('Failed to create session:', e);
-        currentSessionId = 'session_' + Date.now();
-        sessions[currentSessionId] = {
-            title: 'New Session',
-            message_count: 0,
-            messages: [],
-            updated_at: new Date().toISOString().replace('T', ' ').slice(0, 19)
-        };
-    }
+// The start page. Nothing is created on the server here: a session only exists once you send a message
+// from it (see ensureSession), so refreshing the page or clicking "Create New Session" leaves no empty sessions.
+function newSession() {
+    closeLibrary();
+    switchSeq++;                       // cancel a session load that may still be in flight
+    currentSessionId = null;
     chatContainer.innerHTML = '';
     renderHistory();
     messageInput.focus();
     if (mobileQuery.matches) closeMobileSidebar();
+}
+
+async function ensureSession() {
+    if (currentSessionId) return currentSessionId;
+    let id = null, updated = null;
+    try {
+        const resp = await fetch('/api/sessions', {method: 'POST', headers: authHeaders()});
+        if (resp.ok) {
+            const data = await resp.json();
+            id = data.session_id;
+            updated = data.updated_at;
+        }
+    } catch (e) {
+        console.error('Failed to create session:', e);
+    }
+    if (!id) id = 'session_' + Date.now();
+    currentSessionId = id;
+    sessions[id] = {
+        title: 'New Session', message_count: 0, messages: [],
+        updated_at: updated || new Date().toISOString().replace('T', ' ').slice(0, 19)
+    };
+    renderHistory();
+    return id;
 }
 
 function formatTime(ts) {
@@ -296,56 +304,85 @@ async function renderHistory() {
         const item = document.createElement('div');
         item.className = 'history-item' + (session.id === currentSessionId ? ' active' : '');
         item.onclick = () => switchSession(session.id);
-        const title = session.title || 'New Session';
+        item.tabIndex = 0;
+        item.setAttribute('role', 'button');
+        item.addEventListener('keydown', (e) => {
+            if (e.target === item && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); switchSession(session.id); }
+        });
+        const title = escapeHtml(session.title || 'New Session');
         const timeDisplay = formatTimestamp(session.updated_at) || '';
         item.innerHTML = `
-            <div class="history-title">${title}</div>
-            <div class="history-meta">
-                ${timeDisplay ? `<span class="history-time">${timeDisplay}</span>` : ``}
-                <div class="delete-session-btn" title="Delete session" onclick="deleteSession('${session.id}', event)">🗑</div>
+            <span class="history-icon"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1.1-4.4A8 8 0 1 1 21 12z"/><path d="M8.5 12h.01M12 12h.01M15.5 12h.01"/></svg></span>
+            <div class="history-body">
+                <div class="history-title">${title}</div>
+                <div class="history-meta">${timeDisplay ? `<span class="history-time">${timeDisplay}</span>` : ``}</div>
+            </div>
+            <button type="button" class="session-menu-btn" title="Session options" aria-label="Session options" aria-haspopup="menu" onclick="toggleSessionMenu(event)">
+                <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="12" cy="19" r="1.6"/></svg>
+            </button>
+            <div class="session-menu" role="menu">
+                <button type="button" class="session-menu-item danger" role="menuitem" onclick="deleteSession('${session.id}', event)">
+                    <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>Delete session
+                </button>
             </div>
         `;
         chatHistoryEl.appendChild(item);
     });
 }
 
-async function switchSession(id) {
-    if (id === currentSessionId) return;
+// A message's saved attachments (files, images, code) -> the file objects the chat renders.
+function attachmentToFile(a) {
+    if (!a) return null;
+    if (a.kind === 'sticker') {                       // Lucy's stickers are not cached: they live in assets/stickers
+        const rel = pathToRelative(a.path || '');
+        return {sticker: true, path: a.path, name: a.name || 'sticker', type: 'image/png',
+                url: `/api/file/${encodeURIComponent(rel)}?api_key=${encodeURIComponent(API_KEY)}`};
+    }
+    const name = a.name || 'file';
+    if (a.missing) return {name: `${name} (removed)`, size: a.size, missing: true, type: 'application/octet-stream', url: null};
+    return {name, size: a.size, sha: a.sha, type: a.type || getMimeType(name), url: libraryFileUrl(a.sha)};
+}
+
+function renderStoredMessage(msg) {
+    const isUser = msg.role === 'user';
+    const content = msg.content || '';
+    const files = (msg.attachments || []).map(attachmentToFile).filter(Boolean);
+    // history written by older versions kept delivered files as "MEDIA:path" lines in the text
+    const legacy = (content.match(/MEDIA:[^\s]+/g) || []).filter(m => !/\.pcm$/i.test(m));
+    legacy.forEach(m => {
+        const mediaPath = m.replace('MEDIA:', '');
+        const relativePath = pathToRelative(mediaPath);
+        const fileName = mediaPath.split(/[\\/]/).pop();
+        files.push({path: mediaPath, name: fileName, type: getMimeType(fileName),
+                    url: `/api/file/${encodeURIComponent(relativePath)}?api_key=${encodeURIComponent(API_KEY)}`});
+    });
+    addMessage(content.replace(/\nMEDIA:[^\s]+/g, '').trim(), isUser, files, msg.timestamp);
+}
+
+let switchSeq = 0;
+async function switchSession(id, force) {
+    closeLibrary();
+    if (id === currentSessionId && !force) return;
+    const mySeq = ++switchSeq;
     currentSessionId = id;
     try {
-        const resp = await fetch(`/api/sessions/${id}`, {headers: authHeaders()});
+        // The server answers with an ETag: a session you already opened comes back as a tiny 304 (browser cache).
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {headers: authHeaders()});
         if (resp.ok) {
             const data = await resp.json();
-            const session = sessions[id] || {title: 'Session', messages: []};
+            const session = sessions[id] || {title: data.title || 'Session', messages: []};
+            if (data.title) session.title = data.title;
             session.messages = data.messages || [];
             sessions[id] = session;
         }
     } catch (e) {
         console.error('Failed to load session:', e);
     }
+    if (mySeq !== switchSeq) return;                  // you clicked something else meanwhile
 
     const session = sessions[id];
     chatContainer.innerHTML = '';
-
-    if (session && session.messages) {
-        session.messages.forEach(msg => {
-            const content = msg.content || '';
-            const mediaMatches = (content.match(/MEDIA:[^\s]+/g) || []).filter(m => !/\.pcm$/i.test(m));
-            const cleanContent = content.replace(/\nMEDIA:[^\s]+/g, '').trim();
-            if (mediaMatches.length) {
-                const fileData = mediaMatches.map(m => {
-                    const mediaPath = m.replace('MEDIA:', '');
-                    const relativePath = pathToRelative(mediaPath);
-                    const fileName = mediaPath.split(/[\\/]/).pop();
-                    const mimeType = getMimeType(fileName);
-                    return {path: mediaPath, name: fileName, url: `/api/file/${encodeURIComponent(relativePath)}?api_key=${encodeURIComponent(API_KEY)}`, type: mimeType};
-                });
-                addMessage(cleanContent, msg.role === 'user', fileData, msg.timestamp);
-            } else {
-                addMessage(cleanContent, msg.role === 'user', [], msg.timestamp);
-            }
-        });
-    }
+    if (session && session.messages) session.messages.forEach(renderStoredMessage);
 
     scrollToBottom();
     messageInput.focus();
@@ -357,20 +394,13 @@ async function deleteSession(id, event) {
     event.stopPropagation();
     if (!confirm('Delete this session?')) return;
     try {
-        const resp = await fetch(`/api/sessions/${id}`, {
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
             method: 'DELETE',
             headers: authHeaders()
         });
         if (resp.ok) {
             delete sessions[id];
-            if (currentSessionId === id) {
-                const newResp = await fetch('/api/sessions', {headers: authHeaders()});
-                const data = newResp.json ? await newResp.json() : {sessions: {}};
-                const sessionList = data.sessions || {};
-                const firstId = Object.keys(sessionList)[0];
-                currentSessionId = firstId || 'default';
-                chatContainer.innerHTML = '';
-            }
+            if (currentSessionId === id) newSession();       // back to the start page
             await renderHistory();
         } else {
             console.error('Failed to delete session:', resp.statusText);
@@ -416,6 +446,8 @@ function addMessage(text, isUser = false, files = [], timestamp = null) {
     contentWrapper.style.justifyContent = isUser ? 'flex-end' : 'flex-start';
 
     const stickerName = isUser ? parseStickerMessage(text) : null;
+    // A message that is only files (no text) gets no empty text bubble.
+    const skipBubble = !stickerName && !(text || '').trim() && files && files.length > 0 && !files.some(f => f.pendingText);
     const bubble = document.createElement('div');
     if (stickerName) {
         bubble.className = 'sticker-bubble';
@@ -432,7 +464,7 @@ function addMessage(text, isUser = false, files = [], timestamp = null) {
         bubble.innerHTML = renderMarkdown(text, isUser);
         enhanceCodeBlocks(bubble);
     }
-    contentWrapper.appendChild(bubble);
+    if (!skipBubble) contentWrapper.appendChild(bubble);
     row.appendChild(contentWrapper);
 
     if (files && files.length > 0) {
@@ -445,7 +477,17 @@ function addMessage(text, isUser = false, files = [], timestamp = null) {
         fileGroup.style.marginTop = '4px';
         if (files.some(f => f.url && isTextFile(f.name || f.path || ''))) fileGroup.style.flexBasis = '100%';
         files.forEach(f => {
+            if (f.sticker) {                               // Lucy's stickers: shown as stickers, not as files
+                const st = document.createElement('img');
+                st.className = 'sticker-img';
+                st.src = f.url;
+                st.alt = f.name || 'sticker';
+                st.draggable = false;
+                fileGroup.appendChild(st);
+                return;
+            }
             const fileEl = renderFilePreview(f);
+            if (f.missing) fileEl.classList.add('is-removed');
             fileGroup.appendChild(fileEl);
         });
         contentWrapper.appendChild(fileGroup);
@@ -481,7 +523,6 @@ function renderFilePreview(fileData, isOutgoing = false) {
         img.style.maxHeight = '200px';
         img.style.borderRadius = '12px';
         img.style.border = '1px solid var(--border)';
-        img.onclick = () => window.open(img.src, '_blank');
         img.style.cursor = 'pointer';
         wrapper.appendChild(img);
 
@@ -524,9 +565,16 @@ function renderFilePreview(fileData, isOutgoing = false) {
         downloadLink.style.textDecoration = 'none';
         downloadLink.style.cursor = 'pointer';
         downloadLink.onclick = (e) => {
+            e.stopPropagation();   // the arrow downloads; the rest of the chip opens the preview
             if (downloadLink.href === '#') e.preventDefault();
         };
 
+        el.style.cursor = 'pointer';
+        el.tabIndex = 0;
+        el.setAttribute('role', 'button');
+        el.title = 'Tap to preview';
+        el.addEventListener('click', () => openGenericFileViewer(fileData));
+        el.addEventListener('keydown', (e) => { if (e.target === el && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openGenericFileViewer(fileData); } });
         el.appendChild(iconSpan);
         el.appendChild(nameSpan);
         el.appendChild(downloadLink);
@@ -764,6 +812,9 @@ async function sendMessage(queued) {
         return;
     }
 
+    // The start page is a draft: the session is only created now, by the first message you send.
+    const sendSid = await ensureSession();
+
     currentActivity = null;
     window._toolShownAt = 0;
     if (window._pendingThink) { clearTimeout(window._pendingThink); window._pendingThink = null; }
@@ -776,6 +827,7 @@ async function sendMessage(queued) {
         size: f.size,
         type: f.type,
         data_url: f.type.startsWith('image/') ? f._dataUrl : undefined,
+        url: f.type.startsWith('image/') ? undefined : URL.createObjectURL(f),   // lets you preview / download what you just sent
         path: f._savedPath || null
     })).filter(f => f);
 
@@ -834,7 +886,7 @@ async function sendMessage(queued) {
     try {
         const formData = new FormData();
 formData.append('message', message);
-formData.append('session_id', currentSessionId);
+formData.append('session_id', sendSid);
 formData.append('stream', 'true');
 formData.append('voice_mode', voiceMode ? 'true' : 'false');
 filesToSend.forEach(f => formData.append('files', f));
@@ -1009,27 +1061,13 @@ filesToSend.forEach(f => formData.append('files', f));
         // streamed chunk would re-colour the growing block hundreds of times).
         enhanceCodeBlocks(streamingBubble);
 
-        if (!sessions[currentSessionId]) {
-            sessions[currentSessionId] = {title: 'New Session', message_count: 0, messages: [], updated_at: now};
-        }
-        sessions[currentSessionId].messages.push({role: 'user', content: message, timestamp: now});
+        const sess = sessions[sendSid] || (sessions[sendSid] = {title: 'New Session', message_count: 0, messages: [], updated_at: now});
+        sess.messages = sess.messages || [];
+        sess.messages.push({role: 'user', content: message, timestamp: now});
         const assistantResponse = fullResponse + (pendingMedia.length > 0 ? '\n' + pendingMedia.join('\n') : '');
-        sessions[currentSessionId].messages.push({role: 'assistant', content: assistantResponse, timestamp: now});
-        sessions[currentSessionId].updated_at = now;
+        sess.messages.push({role: 'assistant', content: assistantResponse, timestamp: now});
+        sess.updated_at = now;
         renderHistory();
-        // Re-fetch session title after async backend title generation completes
-        setTimeout(() => {
-            fetch(`/api/sessions/${currentSessionId}`, {headers: authHeaders()})
-                .then(r => r.ok ? r.json() : null)
-                .then(data => {
-                    if (data && data.session_id && sessions[currentSessionId]) {
-                        sessions[currentSessionId].title = data.title || sessions[currentSessionId].title;
-                        sessions[currentSessionId].messages = data.messages || sessions[currentSessionId].messages;
-                        renderHistory();
-                    }
-                })
-                .catch(() => {});
-        }, 2000);
 
     } catch (error) {
         if (error && error.name === 'AbortError') {
@@ -1046,6 +1084,11 @@ filesToSend.forEach(f => formData.append('files', f));
         currentAbort = null;
         setSending(false);
         messageInput.focus();
+        // The session is listed by the server once it has a message; titles are generated a moment later.
+        loadSessions();
+        [3000, 9000].forEach(ms => setTimeout(() => {
+            if (sessions[sendSid] && sessions[sendSid].title === 'New Session') loadSessions();
+        }, ms));
         // Send the next queued message, if any (also how "Send now" interrupts).
         setTimeout(processQueue, 0);
     }
@@ -1110,11 +1153,11 @@ function bindAutosave() {
 }
 
 // ---- Theme (Light / Dark) ----
-// Dark = scarlet + silver on black. Light = cerulean + gold on white. The choice is
+// Dark = cyan neon on deep navy. Light = azure on near-white. The choice is
 // remembered in this browser (localStorage); an inline script in chat.html applies it
 // before the page paints so there is no flash of the wrong theme.
 const THEME_KEY = 'lucy.theme';
-const THEME_BAR_COLOR = {dark: '#000000', light: '#ffffff'};   // browser/phone address bar
+const THEME_BAR_COLOR = {dark: '#020a18', light: '#f4f8ff'};   // browser/phone address bar
 
 function getSavedTheme() {
     try {
@@ -1832,8 +1875,17 @@ function renderFileCard(fileData) {
     return card;
 }
 
-// ---- The full viewer (opened from a card) ----
+// ---- The preview modal (opened by tapping an image or a file in the chat) ----
+// One modal in the same style as the Logs modal, with three modes:
+//   image : zoom (buttons, wheel, pinch, double-tap), drag to pan, download
+//   text  : line numbers + syntax colours for text and code files, copy, download
+//   other : file details and a Download button (no preview exists for that kind of file)
 let fileViewerEl = null;
+let fvLastFocus = null;
+const fvImg = {scale: 1, fit: 1, tx: 0, ty: 0, nw: 0, nh: 0, isFit: true,
+               pointers: new Map(), pinch: null, downAt: null, moved: false, lastTap: 0, lastTapX: 0, lastTapY: 0};
+const FV_MIN_FACTOR = 0.5;   // may zoom out to half of "fit"
+const FV_MAX_SCALE = 16;     // 1600%
 
 function ensureFileViewer() {
     if (fileViewerEl) return fileViewerEl;
@@ -1841,35 +1893,83 @@ function ensureFileViewer() {
     overlay.className = 'fv-overlay';
     overlay.id = 'fileViewer';
     overlay.innerHTML =
-        '<div class="fv-modal" role="dialog" aria-modal="true" aria-label="File viewer">' +
-            '<div class="fv-head">' +
+        '<div class="token-modal fv-modal" role="dialog" aria-modal="true" aria-label="Preview">' +
+            '<div class="token-modal-header fv-header">' +
                 '<span class="file-card-icon fv-badge"></span>' +
-                '<div class="file-card-title"><span class="file-card-name fv-name"></span><span class="file-card-meta fv-meta"></span></div>' +
-                '<div class="file-card-actions">' +
-                    '<button type="button" class="fc-btn" data-act="copy" title="Copy the whole file">Copy</button>' +
-                    '<a class="fc-btn" data-act="download" title="Download the file">Download</a>' +
-                    '<button type="button" class="fc-btn" data-act="close" title="Close (Esc)">\u2715</button>' +
-                '</div>' +
+                '<div class="fv-titlebox"><span class="token-modal-title fv-name"></span><span class="fv-meta"></span></div>' +
+                '<button type="button" class="token-modal-close" data-act="close" aria-label="Close" title="Close (Esc)">\u00d7</button>' +
             '</div>' +
             '<div class="fv-body"></div>' +
+            '<div class="token-modal-footer fv-footer">' +
+                '<div class="fv-zoom" role="group" aria-label="Zoom">' +
+                    '<button type="button" class="token-modal-btn fv-zoom-btn" data-act="zoom-out" title="Zoom out (-)" aria-label="Zoom out">\u2212</button>' +
+                    '<button type="button" class="token-modal-btn fv-zoom-readout" data-act="zoom-toggle" title="Switch between fit and 100%">100%</button>' +
+                    '<button type="button" class="token-modal-btn fv-zoom-btn" data-act="zoom-in" title="Zoom in (+)" aria-label="Zoom in">+</button>' +
+                    '<button type="button" class="token-modal-btn" data-act="zoom-fit" title="Fit to window (0)">Fit</button>' +
+                '</div>' +
+                '<button type="button" class="token-modal-btn" data-act="copy" title="Copy the whole file">Copy</button>' +
+                '<a class="token-modal-btn token-modal-save fv-download" data-act="download" title="Download">Download</a>' +
+                '<button type="button" class="token-modal-btn" data-act="close">Close</button>' +
+            '</div>' +
         '</div>';
     overlay.addEventListener('click', (e) => { if (e.target === overlay) closeFileViewer(); });
-    overlay.querySelector('[data-act="close"]').addEventListener('click', closeFileViewer);
+    overlay.querySelectorAll('[data-act="close"]').forEach(b => b.addEventListener('click', closeFileViewer));
+    const stageCenter = () => { const s = fvStageSize(); return {x: s.w / 2, y: s.h / 2}; };
+    overlay.querySelector('[data-act="zoom-in"]').addEventListener('click', () => { const c = stageCenter(); fvZoomAt(1.25, c.x, c.y); });
+    overlay.querySelector('[data-act="zoom-out"]').addEventListener('click', () => { const c = stageCenter(); fvZoomAt(0.8, c.x, c.y); });
+    overlay.querySelector('[data-act="zoom-fit"]').addEventListener('click', fvFit);
+    overlay.querySelector('[data-act="zoom-toggle"]').addEventListener('click', () => { const c = stageCenter(); fvToggleZoom(c.x, c.y); });
     document.body.appendChild(overlay);
     fileViewerEl = overlay;
     return overlay;
 }
 
 function isFileViewerOpen() { return !!fileViewerEl && fileViewerEl.style.display === 'flex'; }
+function fvMode() { return fileViewerEl ? fileViewerEl.dataset.mode : ''; }
 
-function openFileViewer(file) {
+// Common set-up for every mode: title, badge, meta line, Download link, empty body.
+function prepFileViewer(mode, info) {
     const el = ensureFileViewer();
-    el.querySelector('.fv-badge').textContent = fileBadge(file.name);
-    el.querySelector('.fv-name').textContent = file.name;
-    el.querySelector('.fv-meta').textContent = fileMetaText(file);
+    el.dataset.mode = mode;
+    el.querySelector('.fv-badge').textContent = info.badge || 'FILE';
+    const nameEl = el.querySelector('.fv-name');
+    nameEl.textContent = info.name;
+    nameEl.title = info.name;
+    el.querySelector('.fv-meta').textContent = info.meta || '';
     const dl = el.querySelector('[data-act="download"]');
-    dl.href = file.url;
-    dl.download = file.name;
+    if (info.url) {
+        dl.href = info.url;
+        dl.download = info.name;
+        dl.style.display = '';
+    } else {
+        dl.removeAttribute('href');
+        dl.style.display = 'none';
+    }
+    el.querySelector('.fv-body').innerHTML = '';
+    return el;
+}
+
+function showFileViewer() {
+    const el = fileViewerEl;
+    if (el.style.display !== 'flex') fvLastFocus = document.activeElement;
+    el.style.display = 'flex';
+    el.querySelector('.token-modal-close').focus();
+}
+
+function closeFileViewer() {
+    if (!fileViewerEl) return;
+    fileViewerEl.style.display = 'none';
+    fileViewerEl.querySelector('.fv-body').innerHTML = '';   // free the DOM of big files and images
+    fvImg.pointers.clear();
+    fvImg.pinch = null;
+    fvImg.nw = fvImg.nh = 0;
+    if (fvLastFocus && fvLastFocus.focus && document.contains(fvLastFocus)) { try { fvLastFocus.focus(); } catch (e) {} }
+    fvLastFocus = null;
+}
+
+// ---- text / code ----
+function openFileViewer(file) {
+    const el = prepFileViewer('text', {name: file.name, badge: fileBadge(file.name), meta: fileMetaText(file), url: file.url});
     // fresh Copy button each time, so a previous file's handler can't linger
     const oldCopy = el.querySelector('[data-act="copy"]');
     const copyBtn = oldCopy.cloneNode(true);
@@ -1881,7 +1981,6 @@ function openFileViewer(file) {
         flashButton(copyBtn, (await copyText(file.text)) ? 'Copied \u2713' : 'Copy failed');
     });
     const body = el.querySelector('.fv-body');
-    body.innerHTML = '';
     body.appendChild(buildCodeView(file.lines, file.info.lang));
     if (file.truncated) {
         const note = document.createElement('div');
@@ -1889,16 +1988,230 @@ function openFileViewer(file) {
         note.textContent = `Only the first ${formatFileSize(TEXT_PREVIEW_LIMIT)} is shown. Use Download for the whole file.`;
         body.appendChild(note);
     }
-    el.style.display = 'flex';
+    showFileViewer();
     body.scrollTop = 0;
-    el.querySelector('[data-act="close"]').focus();
 }
 
-function closeFileViewer() {
-    if (!fileViewerEl) return;
-    fileViewerEl.style.display = 'none';
-    fileViewerEl.querySelector('.fv-body').innerHTML = '';   // free the DOM of big files
+// ---- files with no preview ----
+function openGenericFileViewer(file) {
+    const name = file.name || String(file.path || 'file').split(/[\\/]/).pop();
+    const dot = name.lastIndexOf('.');
+    const badge = (dot > 0 ? name.slice(dot + 1) : 'FILE').slice(0, 4).toUpperCase();
+    const meta = [file.type && file.type !== 'application/octet-stream' ? file.type : '', file.size ? formatFileSize(file.size) : '']
+        .filter(Boolean).join(' \u00B7 ');
+    const el = prepFileViewer('other', {name, badge, meta, url: file.url});
+    const box = document.createElement('div');
+    box.className = 'fv-other';
+    const big = document.createElement('span');
+    big.className = 'file-card-icon';
+    big.textContent = badge;
+    const nm = document.createElement('div');
+    nm.className = 'fv-other-name';
+    nm.textContent = name;
+    const note = document.createElement('div');
+    note.className = 'fv-other-note';
+    note.textContent = file.url
+        ? 'There is no preview for this kind of file. Use Download to open it on your device.'
+        : 'There is no preview for this kind of file, and its copy is not available to download from here.';
+    box.append(big, nm, note);
+    el.querySelector('.fv-body').appendChild(box);
+    showFileViewer();
 }
+
+// ---- images ----
+function fvImageName(info) {
+    let name = (info.name || '').split(/[\\/]/).pop();
+    if (/\.[A-Za-z0-9]{2,5}$/.test(name)) return name;
+    let ext = '';
+    const m = /^data:image\/([a-z0-9.+-]+)/i.exec(info.url || '');
+    if (m) ext = m[1].replace('jpeg', 'jpg').replace('svg+xml', 'svg');
+    else {
+        const p = /\.([A-Za-z0-9]{2,5})(?:[?#]|$)/.exec(decodeURIComponent((info.url || '').split('?')[0]));
+        if (p) ext = p[1].toLowerCase();
+    }
+    return (name || 'image') + (ext ? '.' + ext : '.png');
+}
+
+function fvStageSize() {
+    const st = fileViewerEl && fileViewerEl.querySelector('.fv-stage');
+    return st ? {w: st.clientWidth, h: st.clientHeight} : {w: 0, h: 0};
+}
+
+function fvApply() {
+    const img = fileViewerEl && fileViewerEl.querySelector('.fv-img');
+    if (!img || !fvImg.nw) return;
+    img.style.transform = `translate(${fvImg.tx}px, ${fvImg.ty}px) scale(${fvImg.scale})`;
+    fileViewerEl.querySelector('.fv-zoom-readout').textContent = Math.round(fvImg.scale * 100) + '%';
+}
+
+// keep the picture on screen: centred when smaller than the window, edge-bound when larger
+function fvClamp() {
+    const {w, h} = fvStageSize();
+    const iw = fvImg.nw * fvImg.scale, ih = fvImg.nh * fvImg.scale;
+    fvImg.tx = iw <= w ? (w - iw) / 2 : Math.min(0, Math.max(w - iw, fvImg.tx));
+    fvImg.ty = ih <= h ? (h - ih) / 2 : Math.min(0, Math.max(h - ih, fvImg.ty));
+}
+
+function fvFit() {
+    const {w, h} = fvStageSize();
+    if (!fvImg.nw || !w || !h) return;
+    fvImg.fit = Math.min(w / fvImg.nw, h / fvImg.nh, 1);
+    fvImg.scale = fvImg.fit;
+    fvImg.isFit = true;
+    fvClamp();
+    fvApply();
+}
+
+// Zoom by a factor, keeping the point (px, py) of the stage fixed under the cursor / fingers.
+function fvZoomAt(factor, px, py) {
+    if (!fvImg.nw) return;
+    const s = fvImg.scale;
+    const ns = Math.min(FV_MAX_SCALE, Math.max(fvImg.fit * FV_MIN_FACTOR, s * factor));
+    if (ns === s) return;
+    fvImg.tx = px - (px - fvImg.tx) * (ns / s);
+    fvImg.ty = py - (py - fvImg.ty) * (ns / s);
+    fvImg.scale = ns;
+    fvImg.isFit = Math.abs(ns - fvImg.fit) < 0.001;
+    fvClamp();
+    fvApply();
+}
+
+// Fit <-> zoomed in (100%, or 2x fit when the picture is already shown at 100%)
+function fvToggleZoom(px, py) {
+    if (!fvImg.isFit) { fvFit(); return; }
+    const target = fvImg.fit < 0.999 ? 1 : fvImg.fit * 2;
+    fvZoomAt(target / fvImg.scale, px, py);
+}
+
+function fvBindStage(stage) {
+    const rel = (e) => { const r = stage.getBoundingClientRect(); return {x: e.clientX - r.left, y: e.clientY - r.top}; };
+    const pinchState = () => {
+        const [a, b] = [...fvImg.pointers.values()];
+        const r = stage.getBoundingClientRect();
+        return {dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, scale: fvImg.scale, tx: fvImg.tx, ty: fvImg.ty,
+                cx: (a.x + b.x) / 2 - r.left, cy: (a.y + b.y) / 2 - r.top};
+    };
+
+    stage.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const p = rel(e);
+        fvZoomAt(Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0015)), p.x, p.y);   // ctrl = trackpad pinch
+    }, {passive: false});
+
+    stage.addEventListener('pointerdown', (e) => {
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        stage.setPointerCapture(e.pointerId);
+        fvImg.pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+        if (fvImg.pointers.size === 1) { fvImg.downAt = {x: e.clientX, y: e.clientY}; fvImg.moved = false; }
+        if (fvImg.pointers.size === 2) { fvImg.pinch = pinchState(); fvImg.moved = true; }
+        stage.classList.add('dragging');
+    });
+
+    stage.addEventListener('pointermove', (e) => {
+        const p = fvImg.pointers.get(e.pointerId);
+        if (!p) return;
+        if (fvImg.pointers.size === 2 && fvImg.pinch) {
+            p.x = e.clientX; p.y = e.clientY;
+            const [a, b] = [...fvImg.pointers.values()];
+            const r = stage.getBoundingClientRect();
+            const st = fvImg.pinch;
+            const ns = Math.min(FV_MAX_SCALE, Math.max(fvImg.fit * FV_MIN_FACTOR, st.scale * (Math.hypot(a.x - b.x, a.y - b.y) / st.dist)));
+            const cx = (a.x + b.x) / 2 - r.left, cy = (a.y + b.y) / 2 - r.top;
+            fvImg.tx = cx - (st.cx - st.tx) * (ns / st.scale);
+            fvImg.ty = cy - (st.cy - st.ty) * (ns / st.scale);
+            fvImg.scale = ns;
+            fvImg.isFit = Math.abs(ns - fvImg.fit) < 0.001;
+            fvClamp(); fvApply();
+            return;
+        }
+        fvImg.tx += e.clientX - p.x;
+        fvImg.ty += e.clientY - p.y;
+        p.x = e.clientX; p.y = e.clientY;
+        if (fvImg.downAt && Math.hypot(e.clientX - fvImg.downAt.x, e.clientY - fvImg.downAt.y) > 6) fvImg.moved = true;
+        fvClamp(); fvApply();
+    });
+
+    const release = (e) => {
+        if (!fvImg.pointers.has(e.pointerId)) return;
+        fvImg.pointers.delete(e.pointerId);
+        if (fvImg.pointers.size < 2) fvImg.pinch = null;
+        if (fvImg.pointers.size > 0) return;
+        stage.classList.remove('dragging');
+        if (e.type === 'pointerup' && !fvImg.moved) {            // a tap: two quick taps toggle the zoom
+            const now = Date.now(), p = rel(e);
+            if (now - fvImg.lastTap < 320 && Math.hypot(p.x - fvImg.lastTapX, p.y - fvImg.lastTapY) < 30) {
+                fvImg.lastTap = 0;
+                fvToggleZoom(p.x, p.y);
+            } else {
+                fvImg.lastTap = now; fvImg.lastTapX = p.x; fvImg.lastTapY = p.y;
+            }
+        }
+    };
+    stage.addEventListener('pointerup', release);
+    stage.addEventListener('pointercancel', release);
+}
+
+function openImageViewer(info) {
+    const url = info.url;
+    if (!url) return;
+    const name = fvImageName(info);
+    const ext = (name.split('.').pop() || 'IMG').slice(0, 4).toUpperCase();
+    const baseMeta = info.size ? formatFileSize(info.size) : '';
+    const el = prepFileViewer('image', {name, badge: ext, meta: baseMeta || 'Loading\u2026', url});
+    const body = el.querySelector('.fv-body');
+    const stage = document.createElement('div');
+    stage.className = 'fv-stage';
+    const img = document.createElement('img');
+    img.className = 'fv-img';
+    img.alt = name;
+    img.draggable = false;
+    stage.appendChild(img);
+    body.appendChild(stage);
+    fvImg.pointers.clear(); fvImg.pinch = null; fvImg.nw = fvImg.nh = 0; fvImg.lastTap = 0;
+    fvBindStage(stage);
+    el.querySelector('.fv-zoom-readout').textContent = '\u2014';
+    img.onload = () => {
+        fvImg.nw = img.naturalWidth || 1;
+        fvImg.nh = img.naturalHeight || 1;
+        img.style.width = fvImg.nw + 'px';
+        img.style.height = fvImg.nh + 'px';
+        el.querySelector('.fv-meta').textContent = [`${fvImg.nw} \u00D7 ${fvImg.nh}`, baseMeta].filter(Boolean).join(' \u00B7 ');
+        fvFit();
+    };
+    img.onerror = () => {
+        body.innerHTML = '';
+        const note = document.createElement('div');
+        note.className = 'fv-other';
+        note.innerHTML = '<div class="fv-other-note"></div>';
+        note.firstChild.textContent = 'Could not load this image. You can still try Download.';
+        body.appendChild(note);
+        el.querySelector('.fv-meta').textContent = 'preview unavailable';
+    };
+    showFileViewer();       // show first, so the stage has a size when the image arrives
+    img.src = url;
+}
+
+// Tapping any picture in the chat opens it in the viewer (stickers stay as they are).
+chatContainer.addEventListener('click', (e) => {
+    const img = e.target.closest ? e.target.closest('img') : null;
+    if (!img || img.classList.contains('sticker-img') || !chatContainer.contains(img)) return;
+    e.preventDefault();
+    openImageViewer({url: img.currentSrc || img.src, name: img.getAttribute('alt') || ''});
+});
+
+document.addEventListener('keydown', (e) => {
+    if (!isFileViewerOpen() || fvMode() !== 'image' || e.ctrlKey || e.metaKey || e.altKey) return;
+    const {w, h} = fvStageSize();
+    if (e.key === '+' || e.key === '=') { e.preventDefault(); fvZoomAt(1.25, w / 2, h / 2); }
+    else if (e.key === '-' || e.key === '_') { e.preventDefault(); fvZoomAt(0.8, w / 2, h / 2); }
+    else if (e.key === '0') { e.preventDefault(); fvFit(); }
+    else if (e.key === '1') { e.preventDefault(); fvZoomAt(1 / fvImg.scale, w / 2, h / 2); }
+});
+
+window.addEventListener('resize', () => {
+    if (!isFileViewerOpen() || fvMode() !== 'image' || !fvImg.nw) return;
+    if (fvImg.isFit) fvFit(); else { fvClamp(); fvApply(); }
+});
 
 // ---- Fenced code blocks inside messages: highlighting + a Copy button ----
 function enhanceCodeBlocks(root) {
@@ -2160,4 +2473,600 @@ document.addEventListener('keydown', (e) => {
             stopGeneration();
         }
     }
+});
+
+
+// ---- Neon UI helpers: empty-state hero, quick actions, session menu, Recent Sessions fold ----
+function closeSessionMenus() {
+    document.querySelectorAll('.history-item.menu-open').forEach(i => i.classList.remove('menu-open'));
+}
+
+function toggleSessionMenu(ev) {
+    ev.stopPropagation();
+    const item = ev.currentTarget.closest('.history-item');
+    const wasOpen = item.classList.contains('menu-open');
+    closeSessionMenus();
+    if (!wasOpen) item.classList.add('menu-open');
+}
+
+document.addEventListener('click', closeSessionMenus);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSessionMenus(); });
+
+(function neonUi() {
+    // The hero (logo + quick actions) shows whenever the open session has no messages.
+    const stage = document.getElementById('chatStage');
+    if (stage) {
+        const syncEmpty = () => stage.classList.toggle(
+            'is-empty', !chatContainer.querySelector('.message-row, .thinking-indicator'));
+        new MutationObserver(syncEmpty).observe(chatContainer, {childList: true});
+        syncEmpty();
+    }
+
+    // Quick actions only start a message: they fill the box and focus it, nothing is sent.
+    document.querySelectorAll('.quick-chip').forEach(btn => {
+        btn.addEventListener('click', () => {
+            messageInput.value = btn.dataset.prompt || '';
+            messageInput.dispatchEvent(new Event('input'));
+            messageInput.focus();
+            messageInput.setSelectionRange(messageInput.value.length, messageInput.value.length);
+        });
+    });
+
+    // Recent Sessions folds the list away.
+    const recentToggle = document.getElementById('recentToggle');
+    if (recentToggle) {
+        recentToggle.addEventListener('click', () => {
+            const open = recentToggle.getAttribute('aria-expanded') !== 'true';
+            recentToggle.setAttribute('aria-expanded', String(open));
+            chatHistoryEl.hidden = !open;
+        });
+    }
+})();
+
+// ---- Voice input (mic button) ----
+// Tap the mic and talk. Tap again (or just stop talking) and the recording is turned into text by Lucy's
+// language model (POST /api/stt, see stt.py). The text is sent as your message.
+//   tap while listening = stop and send      Esc while listening = cancel
+const MIC_AUTO_SEND = true;      // true: the transcript is sent right away. false: it only fills the message box so you can check it first.
+const MIC_SILENCE_MS = 1800;     // stop by itself after this much quiet once you have spoken (0 = only stop when you tap)
+const MIC_MAX_MS = 30000;        // hard limit for one voice message (audio encoders in LLMs usually handle about 30 s per clip)
+const MIC_RATE = 16000;          // what the speech model wants: 16 kHz mono
+
+const micButton = document.getElementById('micButton');
+const mic = {state: 'idle', stream: null, pcm: [], rate: 48000, ctx: null, analyser: null, tap: null, mute: null, raf: 0,
+             startedAt: 0, heardSpeech: false, lastVoiceAt: 0, cancelled: false, placeholder: ''};
+
+// ---- little pop-up message above the input ----
+let micToastTimer = 0;
+function showMicToast(text, kind) {
+    let el = document.getElementById('micToast');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'micToast';
+        el.className = 'mic-toast';
+        el.setAttribute('role', 'status');
+        (document.getElementById('chatStage') || document.body).appendChild(el);
+    }
+    el.textContent = text;
+    el.dataset.kind = kind || 'info';
+    el.classList.add('show');
+    clearTimeout(micToastTimer);
+    micToastTimer = setTimeout(() => el.classList.remove('show'), kind === 'error' ? 9000 : 4000);
+}
+
+function micUnavailableReason() {
+    if (!window.isSecureContext) {
+        return 'Your browser only allows the microphone on secure pages (https:// or localhost), and this page is on ' +
+               location.origin + '. Open Lucy over HTTPS (for example with Tailscale Serve), or use http://localhost:' +
+               (location.port || '80') + ' on the PC.';
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return 'This browser cannot use the microphone.';
+    if (!(window.AudioContext || window.webkitAudioContext) || typeof OfflineAudioContext === 'undefined') return 'This browser cannot record audio.';
+    return '';
+}
+
+function micPermissionMessage(err) {
+    const name = err && err.name;
+    if (name === 'NotAllowedError' || name === 'SecurityError') return 'Microphone permission was blocked. Allow it in your browser\u2019s site settings, then tap the mic again.';
+    if (name === 'NotFoundError' || name === 'OverconstrainedError') return 'No microphone was found.';
+    if (name === 'NotReadableError') return 'The microphone is busy (another app may be using it).';
+    return 'Could not start the microphone.';
+}
+
+function setMicUi(state) {
+    mic.state = state;
+    micButton.classList.toggle('recording', state === 'recording');
+    micButton.classList.toggle('busy', state === 'transcribing');
+    micButton.setAttribute('aria-pressed', String(state === 'recording'));
+    micButton.disabled = state === 'transcribing';
+    document.getElementById('chatForm').classList.toggle('is-listening', state === 'recording');
+    if (state === 'recording') {
+        micButton.title = 'Tap to stop and send';
+        micButton.setAttribute('aria-label', 'Stop recording and send');
+    } else if (state === 'transcribing') {
+        micButton.title = 'Transcribing\u2026';
+        messageInput.placeholder = 'Transcribing\u2026';
+    } else {
+        micButton.title = 'Voice message (tap to talk)';
+        micButton.setAttribute('aria-label', 'Voice message');
+        messageInput.placeholder = mic.placeholder || messageInput.placeholder;
+        micButton.style.removeProperty('--lvl');
+    }
+}
+
+function releaseMicHardware() {
+    cancelAnimationFrame(mic.raf);
+    try { if (mic.tap) { mic.tap.onaudioprocess = null; if (mic.tap.port) mic.tap.port.onmessage = null; mic.tap.disconnect(); } } catch (_) {}
+    try { if (mic.mute) mic.mute.disconnect(); } catch (_) {}
+    mic.tap = mic.mute = null;
+    if (mic.stream) mic.stream.getTracks().forEach(t => t.stop());   // turns off the browser's "recording" indicator
+    mic.stream = null;
+    if (mic.ctx) { mic.ctx.close().catch(() => {}); mic.ctx = null; }
+    mic.analyser = null;
+}
+
+// Raw microphone samples, collected straight from the audio graph (no compressed recording, so nothing has to be decoded later).
+const MIC_TAP_WORKLET = `
+class LucyPcmTap extends AudioWorkletProcessor {
+    constructor() { super(); this.buf = new Float32Array(2048); this.n = 0; }
+    process(inputs) {
+        const ch = inputs[0] && inputs[0][0];
+        if (ch) for (let i = 0; i < ch.length; i++) {
+            this.buf[this.n++] = ch[i];
+            if (this.n === this.buf.length) { this.port.postMessage(this.buf.slice(0)); this.n = 0; }
+        }
+        return true;
+    }
+}
+registerProcessor('lucy-pcm-tap', LucyPcmTap);
+`;
+
+async function attachPcmTap(ctx, source) {
+    const mute = ctx.createGain();            // the tap must be connected somewhere to run; silent, so no feedback
+    mute.gain.value = 0;
+    mute.connect(ctx.destination);
+    if (ctx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+        try {
+            const url = URL.createObjectURL(new Blob([MIC_TAP_WORKLET], {type: 'application/javascript'}));
+            try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+            const node = new AudioWorkletNode(ctx, 'lucy-pcm-tap', {numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1, channelCountMode: 'explicit'});
+            node.port.onmessage = (e) => { if (mic.state === 'recording') mic.pcm.push(e.data); };
+            source.connect(node);
+            node.connect(mute);
+            return {tap: node, mute};
+        } catch (e) { console.warn('AudioWorklet unavailable, falling back:', e); }
+    }
+    const proc = ctx.createScriptProcessor(4096, 1, 1);       // older browsers
+    proc.onaudioprocess = (e) => { if (mic.state === 'recording') mic.pcm.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    source.connect(proc);
+    proc.connect(mute);
+    return {tap: proc, mute};
+}
+
+async function startMic() {
+    if (mic.state !== 'idle') return;
+    const why = micUnavailableReason();
+    if (why) { showMicToast(why, 'error'); return; }
+
+    let stream;
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true}});
+    } catch (e) {
+        showMicToast(micPermissionMessage(e), 'error');
+        return;
+    }
+    mic.stream = stream;
+    mic.pcm = [];
+    mic.cancelled = false;
+    mic.heardSpeech = false;
+    mic.placeholder = messageInput.placeholder;
+
+    try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        mic.ctx = new AC();
+        if (mic.ctx.state === 'suspended') await mic.ctx.resume();
+        mic.rate = mic.ctx.sampleRate;
+        const source = mic.ctx.createMediaStreamSource(stream);
+        mic.analyser = mic.ctx.createAnalyser();            // level meter: the glow on the button, and "you stopped talking"
+        mic.analyser.fftSize = 1024;
+        source.connect(mic.analyser);
+        const t = await attachPcmTap(mic.ctx, source);
+        mic.tap = t.tap;
+        mic.mute = t.mute;
+    } catch (e) {
+        console.error('Could not start recording:', e);
+        releaseMicHardware();
+        showMicToast('This browser could not start recording.', 'error');
+        return;
+    }
+
+    mic.startedAt = performance.now();
+    mic.lastVoiceAt = mic.startedAt;
+    setMicUi('recording');
+    mic.raf = requestAnimationFrame(micTick);
+}
+
+function micTick() {
+    if (mic.state !== 'recording') return;
+    const now = performance.now();
+    if (mic.analyser) {
+        const buf = new Uint8Array(mic.analyser.fftSize);
+        mic.analyser.getByteTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
+        const rms = Math.sqrt(sum / buf.length);
+        micButton.style.setProperty('--lvl', Math.min(1, rms * 6).toFixed(3));
+        if (rms > 0.02) { mic.heardSpeech = true; mic.lastVoiceAt = now; }
+        else if (MIC_SILENCE_MS && mic.heardSpeech && now - mic.lastVoiceAt > MIC_SILENCE_MS) { stopMic(false); return; }
+    }
+    const secs = Math.floor((now - mic.startedAt) / 1000);
+    messageInput.placeholder = `Listening\u2026 ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}  \u00B7  tap the mic to send  \u00B7  Esc to cancel`;
+    if (now - mic.startedAt > MIC_MAX_MS) { stopMic(false); return; }
+    mic.raf = requestAnimationFrame(micTick);
+}
+
+function stopMic(cancel) {
+    if (mic.state !== 'recording') return;
+    mic.cancelled = !!cancel;
+    const heldMs = performance.now() - mic.startedAt;
+    const chunks = mic.pcm, rate = mic.rate;
+    mic.pcm = [];
+    releaseMicHardware();           // stops collecting and frees the microphone
+    onMicStopped(chunks, rate, heldMs);
+}
+
+async function onMicStopped(chunks, rate, heldMs) {
+    if (mic.cancelled || !chunks.length || heldMs < 400) {
+        setMicUi('idle');
+        if (!mic.cancelled && heldMs < 400) showMicToast('Hold on a little longer: tap the mic, speak, then tap it again.');
+        return;
+    }
+    setMicUi('transcribing');
+    try {
+        const wav = await pcmToWav16k(chunks, rate);
+        if (!wav) { showMicToast('That was too short to understand. Try again.'); return; }
+        const form = new FormData();
+        form.append('file', wav, 'voice.wav');
+        const res = await fetch('/api/stt', {method: 'POST', headers: authHeaders(), body: form});
+        if (!res.ok) {
+            let detail = `Transcription failed (HTTP ${res.status}).`;
+            try { const j = await res.json(); if (j && j.detail) detail = String(j.detail); } catch (_) {}
+            showMicToast(detail, 'error');
+            return;
+        }
+        const text = ((await res.json()).text || '').trim();
+        if (!text) { showMicToast('I did not catch anything. Try again a little closer to the mic.'); return; }
+        const existing = messageInput.value.trim();
+        messageInput.value = existing ? existing + ' ' + text : text;
+        messageInput.dispatchEvent(new Event('input'));
+        if (MIC_AUTO_SEND) onSendClick(); else messageInput.focus();
+    } catch (e) {
+        console.error('Voice input failed:', e);
+        showMicToast('Voice input failed: ' + (e && e.message ? e.message : 'unknown error'), 'error');
+    } finally {
+        setMicUi('idle');
+    }
+}
+
+// Collected samples (at the microphone's own rate, usually 44.1 or 48 kHz) -> 16 kHz mono 16-bit WAV.
+async function pcmToWav16k(chunks, rate) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const all = new Float32Array(total);
+    for (let i = 0, o = 0; i < chunks.length; o += chunks[i].length, i++) all.set(chunks[i], o);
+    const outLen = Math.round(total * MIC_RATE / rate);
+    if (outLen < MIC_RATE * 0.3) return null;
+    if (rate === MIC_RATE) return encodeWav(all, MIC_RATE);
+    try {
+        const off = new OfflineAudioContext(1, outLen, MIC_RATE);       // the browser's own resampler
+        const buf = off.createBuffer(1, total, rate);
+        buf.copyToChannel(all, 0);
+        const src = off.createBufferSource();
+        src.buffer = buf;
+        src.connect(off.destination);
+        src.start();
+        return encodeWav((await off.startRendering()).getChannelData(0), MIC_RATE);
+    } catch (e) {
+        console.warn('Browser resampler failed, using the simple one:', e);
+        const ratio = rate / MIC_RATE, out = new Float32Array(outLen);
+        for (let i = 0; i < outLen; i++) {                              // average the samples that fall into each output sample
+            const a = Math.floor(i * ratio), b = Math.min(total, Math.max(a + 1, Math.floor((i + 1) * ratio)));
+            let s = 0;
+            for (let j = a; j < b; j++) s += all[j];
+            out[i] = s / (b - a);
+        }
+        return encodeWav(out, MIC_RATE);
+    }
+}
+
+function encodeWav(samples, rate) {
+    const buf = new ArrayBuffer(44 + samples.length * 2);
+    const v = new DataView(buf);
+    const tag = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    tag(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); tag(8, 'WAVE');
+    tag(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    tag(36, 'data'); v.setUint32(40, samples.length * 2, true);
+    for (let i = 0, o = 44; i < samples.length; i++, o += 2) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return new Blob([buf], {type: 'audio/wav'});
+}
+
+micButton.addEventListener('click', () => {
+    if (mic.state === 'idle') startMic();
+    else if (mic.state === 'recording') stopMic(false);
+});
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && mic.state === 'recording') { e.preventDefault(); stopMic(true); }
+});
+
+
+// =====================================================================================================
+// Library: everything that was shared in your chats (your uploads, files and images Lucy delivered).
+// The server keeps one cached copy of each in Lucy_Core/cache (see src/lucy/server/library.py), so this
+// works after a refresh or restart. Stickers are deliberately not in here: they live in assets/stickers.
+// =====================================================================================================
+const LIB_TABS = [
+    {id: 'all', label: 'All', cats: []},
+    {id: 'images', label: 'Images', cats: ['Images']},
+    {id: 'code', label: 'Code', cats: ['Code']},
+    {id: 'documents', label: 'Documents', cats: ['Documents']},
+    {id: 'media', label: 'Audio & video', cats: ['Audio', 'Video']},
+    {id: 'other', label: 'Other', cats: ['Archives', 'Other']},
+];
+const LIB_PAGE = 60;
+const lib = {open: false, tab: 'all', items: [], total: 0, counts: {}, loading: false, seq: 0, error: '', io: null, searchTimer: 0};
+
+function libraryFileUrl(sha) {
+    return `/api/library/file/${sha}?api_key=${encodeURIComponent(API_KEY)}`;
+}
+
+function libraryEl(id) { return document.getElementById(id); }
+
+function openLibrary() {
+    lib.open = true;
+    document.querySelector('.main-chat').classList.add('library-open');
+    document.body.classList.add('library-open');
+    const btn = libraryEl('libraryBtn');
+    btn.classList.add('active');
+    btn.setAttribute('aria-pressed', 'true');
+    // "This session" only makes sense when a session exists (the start page has none yet)
+    const scope = libraryEl('libScope');
+    scope.disabled = !currentSessionId;
+    if (!currentSessionId) scope.checked = false;
+    libraryEl('libScopeRow').classList.toggle('disabled', !currentSessionId);
+    if (mobileQuery.matches) closeMobileSidebar();
+    loadLibrary(true);
+}
+
+function closeLibrary() {
+    if (!lib.open) return;
+    lib.open = false;
+    document.querySelector('.main-chat').classList.remove('library-open');
+    document.body.classList.remove('library-open');
+    const btn = libraryEl('libraryBtn');
+    btn.classList.remove('active');
+    btn.setAttribute('aria-pressed', 'false');
+    if (lib.io) { lib.io.disconnect(); lib.io = null; }
+}
+
+async function loadLibrary(reset = true) {
+    if (reset) lib.items = [];
+    const seq = ++lib.seq;
+    lib.loading = true;
+    lib.error = '';
+    const tab = LIB_TABS.find(t => t.id === lib.tab) || LIB_TABS[0];
+    const p = new URLSearchParams({limit: LIB_PAGE, offset: lib.items.length});
+    if (tab.cats.length) p.set('category', tab.cats.join(','));
+    const origin = libraryEl('libOrigin').value;
+    if (origin) p.set('origin', origin);
+    const q = libraryEl('libSearch').value.trim();
+    if (q) p.set('q', q);
+    if (libraryEl('libScope').checked && currentSessionId) p.set('session_id', currentSessionId);
+    try {
+        const resp = await fetch('/api/library?' + p.toString(), {headers: authHeaders()});
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        if (seq !== lib.seq) return;                   // a newer request replaced this one
+        lib.items = lib.items.concat(data.items || []);
+        lib.total = data.total || 0;
+        lib.counts = data.counts || {};
+    } catch (e) {
+        if (seq !== lib.seq) return;
+        lib.error = e.message || 'Could not load the library.';
+    } finally {
+        if (seq === lib.seq) { lib.loading = false; renderLibrary(); }
+    }
+}
+
+function libTabCount(tab) {
+    if (!tab.cats.length) return lib.counts._all || 0;
+    return tab.cats.reduce((n, c) => n + (lib.counts[c] || 0), 0);
+}
+
+function renderLibrary() {
+    // tabs (with counts)
+    const tabsEl = libraryEl('libTabs');
+    tabsEl.innerHTML = '';
+    LIB_TABS.forEach(t => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'lib-tab' + (t.id === lib.tab ? ' active' : '');
+        b.setAttribute('role', 'tab');
+        b.setAttribute('aria-selected', t.id === lib.tab ? 'true' : 'false');
+        const n = libTabCount(t);
+        b.innerHTML = `<span>${escapeHtml(t.label)}</span><span class="n">${n}</span>`;
+        b.addEventListener('click', () => { lib.tab = t.id; loadLibrary(true); });
+        tabsEl.appendChild(b);
+    });
+    libraryEl('libSub').textContent = lib.counts._all ? `${lib.counts._all} item${lib.counts._all === 1 ? '' : 's'}` : '';
+
+    // grid
+    if (lib.io) { lib.io.disconnect(); lib.io = null; }
+    const grid = libraryEl('libGrid');
+    grid.innerHTML = '';
+    lib.items.forEach(item => grid.appendChild(libCard(item)));
+
+    const empty = libraryEl('libEmpty');
+    const filtered = !!(libraryEl('libSearch').value.trim() || libraryEl('libOrigin').value || libraryEl('libScope').checked || lib.tab !== 'all');
+    empty.classList.toggle('show', !lib.items.length && !lib.loading);
+    if (lib.error) {
+        empty.innerHTML = '<strong>Could not load the library</strong>';
+        empty.appendChild(document.createTextNode(lib.error));
+    } else if (!lib.items.length) {
+        empty.innerHTML = filtered
+            ? '<strong>Nothing matches</strong>Try another filter or search.'
+            : '<strong>Your library is empty</strong>Images and files you send, and code or files Lucy creates, show up here.<br>Stickers are not saved here (they already live in assets/stickers).';
+    }
+    libraryEl('libMore').classList.toggle('show', lib.items.length < lib.total);
+}
+
+function libSvg(path) {
+    return `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">${path}</svg>`;
+}
+
+function libCard(item) {
+    const card = document.createElement('div');
+    card.className = 'lib-card';
+    card.tabIndex = 0;
+    card.setAttribute('role', 'button');
+    card.title = item.name;
+
+    const fileUrl = `${item.url}?api_key=${encodeURIComponent(API_KEY)}`;
+    const thumb = document.createElement('div');
+    thumb.className = 'lib-thumb';
+    if (item.kind === 'images' && item.thumb_url) {
+        const img = document.createElement('img');
+        img.loading = 'lazy';
+        img.decoding = 'async';
+        img.alt = item.name;
+        img.src = `${item.thumb_url}?api_key=${encodeURIComponent(API_KEY)}`;
+        img.onerror = () => { img.onerror = null; img.src = fileUrl; };
+        thumb.appendChild(img);
+    } else {
+        const badge = document.createElement('span');
+        badge.className = 'lib-badge';
+        badge.textContent = fileBadge(item.name);
+        thumb.appendChild(badge);
+        if (isTextFile(item.name) && item.size < 50 * 1024 * 1024) {
+            thumb.classList.add('has-snippet');
+            thumb._loadSnippet = () => {               // first lines of the file, loaded only when the card scrolls into view
+                fetchTextFile(fileUrl, 3000).then(res => {
+                    if (res.binary || !res.text) return;
+                    const pre = document.createElement('pre');
+                    pre.className = 'lib-snippet';
+                    pre.textContent = splitLines(res.text).slice(0, 9).join('\n');
+                    thumb.insertBefore(pre, thumb.firstChild);
+                }).catch(() => {});
+            };
+            if ('IntersectionObserver' in window) {
+                if (!lib.io) {
+                    lib.io = new IntersectionObserver(entries => entries.forEach(en => {
+                        if (en.isIntersecting) { lib.io.unobserve(en.target); en.target._loadSnippet && en.target._loadSnippet(); }
+                    }), {root: libraryEl('libBody'), rootMargin: '200px'});
+                }
+                lib.io.observe(thumb);
+            } else {
+                thumb._loadSnippet();
+            }
+        }
+    }
+    card.appendChild(thumb);
+
+    const info = document.createElement('div');
+    info.className = 'lib-info';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'lib-name';
+    nameEl.textContent = item.name;
+    const meta = document.createElement('div');
+    meta.className = 'lib-meta';
+    const typeLabel = (fileTypeInfo(item.name) || {}).label || item.category;
+    meta.textContent = [typeLabel, item.size ? formatFileSize(item.size) : '', formatTimestamp(item.created_at)].filter(Boolean).join(' \u00B7 ');
+    info.append(nameEl, meta);
+    card.appendChild(info);
+
+    const foot = document.createElement('div');
+    foot.className = 'lib-foot';
+    const origin = document.createElement('span');
+    origin.className = 'lib-origin' + (item.origin === 'assistant' ? ' lucy' : '');
+    origin.textContent = item.origin === 'assistant' ? 'Lucy' : 'You';
+    const sess = document.createElement('button');
+    sess.type = 'button';
+    sess.className = 'lib-session';
+    sess.textContent = item.session_title;
+    sess.title = 'Open the session this came from';
+    sess.addEventListener('click', (e) => { e.stopPropagation(); switchSession(item.session_id); });
+    const dl = document.createElement('a');
+    dl.className = 'lib-act';
+    dl.title = 'Download';
+    dl.href = `${item.url}?download=1&api_key=${encodeURIComponent(API_KEY)}`;
+    dl.download = item.name;
+    dl.innerHTML = libSvg('<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>');
+    dl.addEventListener('click', (e) => e.stopPropagation());
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'lib-act danger';
+    del.title = 'Remove from the library';
+    del.innerHTML = libSvg('<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>');
+    del.addEventListener('click', (e) => { e.stopPropagation(); deleteLibraryItem(item); });
+    foot.append(origin, sess, dl, del);
+    card.appendChild(foot);
+
+    const open = () => openLibraryItem(item);
+    card.addEventListener('click', open);
+    card.addEventListener('keydown', (e) => { if (e.target === card && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); open(); } });
+    return card;
+}
+
+// Same viewers as in the chat: zoomable images, line-numbered code, plain details for everything else.
+async function openLibraryItem(item) {
+    const url = libraryFileUrl(item.sha);
+    const file = {name: item.name, type: item.type, size: item.size, url};
+    if (item.kind === 'images') { openImageViewer(file); return; }
+    if (isTextFile(item.name)) {
+        try {
+            const res = await fetchTextFile(url);
+            if (!res.binary) {
+                openFileViewer({name: item.name, info: fileTypeInfo(item.name) || {lang: 'plaintext', label: 'Text'},
+                                text: res.text, lines: splitLines(res.text), truncated: res.truncated, bytes: res.bytes, url});
+                return;
+            }
+        } catch (e) { /* fall through to the details view, which still offers Download */ }
+    }
+    openGenericFileViewer(file);
+}
+
+async function deleteLibraryItem(item) {
+    if (!confirm(`Remove "${item.name}" from the library?\nIt disappears from the chats that used it too.`)) return;
+    try {
+        const resp = await fetch(`/api/library/${item.sha}`, {method: 'DELETE', headers: authHeaders()});
+        if (!resp.ok && resp.status !== 404) throw new Error(`HTTP ${resp.status}`);
+        loadLibrary(true);
+    } catch (e) {
+        alert('Could not remove it: ' + (e.message || e));
+    }
+}
+
+libraryEl('libSearch').addEventListener('input', () => {
+    clearTimeout(lib.searchTimer);
+    lib.searchTimer = setTimeout(() => loadLibrary(true), 250);
+});
+libraryEl('libOrigin').addEventListener('change', () => loadLibrary(true));
+libraryEl('libScope').addEventListener('change', () => loadLibrary(true));
+libraryEl('libMore').addEventListener('click', () => loadLibrary(false));
+// capture phase: runs BEFORE the viewer's own Escape handler, so Escape closes only the viewer when one is open
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && lib.open && !isFileViewerOpen()) closeLibrary();
+}, true);
+
+// A proactive message ("Open" on Lucy's toast): the page used to reload to show it, but a reload now lands on the
+// start page, so open the session the message was written into instead.
+window.addEventListener('lucy:proactive-open', async (e) => {
+    const sid = e.detail && e.detail.session_id;
+    if (!sid) return;
+    e.preventDefault();
+    await loadSessions();
+    switchSession(sid, true);
 });

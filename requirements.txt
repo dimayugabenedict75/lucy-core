@@ -1,0 +1,15 @@
+# Runtime deps, collected from actual imports in src/. Python 3.11+.
+fastapi
+uvicorn
+httpx
+pydantic
+python-multipart  # needed by FastAPI for file uploads / form data (not imported directly)
+pyyaml
+psutil
+numpy
+pillow
+scikit-learn
+tiktoken
+tzdata      # Windows needs this for zoneinfo (e.g. "Asia/Manila")
+google-api-python-client
+google-auth-oauthlib

@@ -18,6 +18,8 @@ ROOT = Path(os.environ.get("LUCY_ROOT") or Path(__file__).resolve().parents[2]).
 SRC = ROOT / "src"
 RUNTIME = ROOT / "runtime"
 UI_DIR = ROOT / "ui"
+# Library cache: files/images shared in chats (created on demand, see lucy/server/library.py)
+CACHE_DIR = Path(os.environ.get("LUCY_CACHE_DIR") or (ROOT / "cache")).resolve()
 PERSONA_PATH = ROOT / ".core" / "personas" / "lucy.md"
 
 # Sandbox root for the file tools and /api/file.

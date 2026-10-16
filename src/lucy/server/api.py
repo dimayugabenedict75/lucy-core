@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
-from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any, Iterator, Iterable
 import httpx
@@ -9,6 +9,7 @@ import time
 import json
 import os
 import subprocess
+import zlib
 from pathlib import Path
 
 # --- Lucy Core Imports ---
@@ -33,6 +34,7 @@ from lucy.server.agent_loop import AgentLoop, LoopConfig     # reliable tool-cal
 from lucy.server.tts_filter import TTSStreamFilter, clean_for_speech   # only speakable words reach the voice
 from lucy.server import file_guard                           # path resolution, tolerant edits, syntax checks, backups
 from lucy.server.stickers_tool import StickerLibrary, send_sticker as _send_sticker
+from lucy.server import library as _library_mod            # persistent file/image cache + Library view
 from lucy.server.harness_info import build_harness_digest   # accurate map of Lucy Core for the agent
 from lucy import proactive as _proactive                    # reminders, follow-ups, greetings (Lucy can speak first)
 import base64
@@ -113,7 +115,7 @@ MAX_CONTEXT_MESSAGES = 50      # hard ceiling on messages loaded (safety)
 COMPRESSION_THRESHOLD = 0.75   # start summarizing when 75% of budget is used
 SUMMARY_RESERVE_TOKENS = 2048  # keep this many tokens free for the response
 DEFAULT_TEMPERATURE = 0.5
-MAX_TOOL_ROUNDS = int(os.environ.get("LUCY_MAX_TOOL_ROUNDS", "8"))    # tool rounds per turn
+MAX_TOOL_ROUNDS = int(os.environ.get("LUCY_MAX_TOOL_ROUNDS", "0"))    # safety ceiling on tool rounds per turn; 0 = none (a task runs until it is done or you stop it)
 LUCY_MAX_TOKENS = int(os.environ.get("LUCY_MAX_TOKENS", "4096"))      # per model call (big tool args need room)
 LUCY_TOOL_TIMEOUT = float(os.environ.get("LUCY_TOOL_TIMEOUT", "120")) # seconds before a hung tool is abandoned
 # Timeout for llama-server streaming requests (seconds)
@@ -187,6 +189,10 @@ from lucy.cua.lucy_cua import (
 # Voice control (Lucy Audio Server) — /api/voice/start, /stop, /status.
 # Protected the same way as the other /api/* routes.
 app.include_router(voice_router, dependencies=[Depends(verify_api_key)])
+
+# Speech-to-text for the chat UI's microphone button: POST /api/stt (see stt.py).
+from lucy.server.stt import router as stt_router
+app.include_router(stt_router, dependencies=[Depends(verify_api_key)])
 
 # Emoji/sticker picker: lists and serves PNGs from assets/stickers/User (see stickers.py)
 try:
@@ -267,6 +273,34 @@ _conn.execute("""
     )
 """)
 _conn.commit()
+
+# --- Attachments + Library (see lucy/server/library.py) ---
+try:
+    _conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT")     # JSON list of files/images on a message
+except sqlite3.OperationalError:
+    pass                                                                  # column already exists
+_conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
+_conn.commit()
+
+
+def _now_str() -> str:
+    with _db_lock:
+        row = _conn.execute("SELECT strftime('%Y-%m-%d %H:%M:%S', 'now', ?) AS now", (_get_tz_modifier(),)).fetchone()
+    return row["now"] if row else time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+_library = _library_mod.Library(_paths.CACHE_DIR, _conn, _db_lock, _paths.ROOT / "assets" / "stickers", _now_str)
+try:
+    # Sessions that were created but never used (old behaviour created one per click / per refresh)
+    with _db_lock:
+        _conn.execute(
+            "DELETE FROM sessions WHERE session_id NOT IN (SELECT DISTINCT session_id FROM messages) "
+            "AND updated_at < strftime('%Y-%m-%d %H:%M:%S', 'now', ?, '-1 hour')", (_get_tz_modifier(),))
+        _conn.commit()
+    _library.reconcile()
+except Exception as _e:                                                   # housekeeping must never block startup
+    logger.warning(f"Library housekeeping skipped: {_e}")
+app.include_router(_library_mod.build_router(lambda: _library), dependencies=[Depends(verify_api_key)])
 
 
 def _mask_token(token: str) -> str:
@@ -405,34 +439,67 @@ def _get_messages(session_id: str) -> list[dict]:
     return [{"role": r["role"], "content": r["content"], "timestamp": r["created_at"]} for r in rows]
 
 
-def _append_message(session_id: str, role: str, content: str):
-    _ensure_session(session_id)
+def _get_messages_full(session_id: str) -> list[dict]:
+    """Messages for the web UI: like _get_messages, plus each message's attachments (files, images, stickers)."""
     with _db_lock:
-        _conn.execute(
-            "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
-            (session_id, role, content),
+        rows = _conn.execute(
+            "SELECT role, content, created_at, attachments FROM messages WHERE session_id = ? ORDER BY rowid ASC",
+            (session_id,),
+        ).fetchall()
+    out, all_shas = [], set()
+    for r in rows:
+        atts = []
+        if r["attachments"]:
+            try:
+                atts = json.loads(r["attachments"])
+            except (ValueError, TypeError):
+                atts = []
+        all_shas.update(a.get("sha") for a in atts if a.get("sha"))
+        out.append({"role": r["role"], "content": r["content"], "timestamp": r["created_at"], "attachments": atts})
+    alive = _library.existing_shas(all_shas)
+    for m in out:
+        for a in m["attachments"]:
+            if a.get("sha"):
+                a["missing"] = a["sha"] not in alive
+    return out
+
+
+def _append_message(session_id: str, role: str, content: str, attachments: list | None = None) -> int:
+    """Store one message. `attachments` = records from the Library (or sticker references). Returns its rowid."""
+    _ensure_session(session_id)
+    atts = [a for a in (attachments or []) if a]
+    with _db_lock:
+        cur = _conn.execute(
+            "INSERT INTO messages (session_id, role, content, attachments) VALUES (?, ?, ?, ?)",
+            (session_id, role, content, json.dumps(atts, ensure_ascii=False) if atts else None),
         )
+        rowid = cur.lastrowid
         _conn.execute(
             f"UPDATE sessions SET updated_at = strftime('%Y-%m-%d %H:%M:%S', 'now', '{_get_tz_modifier()}') WHERE session_id = ?",
             (session_id,),
         )
         _conn.commit()
+    if atts:
+        _library.add_refs(session_id, rowid, "user" if role == "user" else "assistant", atts)
+    return rowid
 
 
-def _list_sessions_db() -> dict:
+def _list_sessions_db(include_messages: bool = False, hide_empty: bool = False) -> dict:
+    """Session list for the sidebar. Messages are NOT loaded unless asked (the UI fetches them per session)."""
     with _db_lock:
         rows = _conn.execute(
-            "SELECT session_id, title, message_count, updated_at FROM (SELECT s.session_id, s.title, COUNT(m.rowid) AS message_count, s.updated_at FROM sessions s LEFT JOIN messages m ON s.session_id = m.session_id GROUP BY s.session_id ORDER BY s.updated_at DESC)"
+            "SELECT s.session_id, s.title, COUNT(m.rowid) AS message_count, s.updated_at FROM sessions s "
+            "LEFT JOIN messages m ON s.session_id = m.session_id GROUP BY s.session_id ORDER BY s.updated_at DESC"
         ).fetchall()
-    return {
-        r["session_id"]: {
-            "title": r["title"],
-            "message_count": r["message_count"],
-            "updated_at": r["updated_at"],
-            "messages": _get_messages(r["session_id"]),
-        }
-        for r in rows
-    }
+    out = {}
+    for r in rows:
+        if hide_empty and not r["message_count"]:
+            continue                      # an unused "New Session" is not a conversation yet
+        entry = {"title": r["title"], "message_count": r["message_count"], "updated_at": r["updated_at"]}
+        if include_messages:
+            entry["messages"] = _get_messages(r["session_id"])
+        out[r["session_id"]] = entry
+    return out
 
 
 def _delete_session_db(session_id: str) -> bool:
@@ -440,7 +507,9 @@ def _delete_session_db(session_id: str) -> bool:
         cur = _conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         _conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         _conn.commit()
-        return cur.rowcount > 0
+        deleted = cur.rowcount > 0
+    _library.delete_session(session_id)       # drop cached files that only this session used
+    return deleted
 
 # --- Instantiating Core Systems ---
 _memory_manager = MemoryManager()
@@ -459,396 +528,6 @@ except FileNotFoundError:
 # can use the same tool vocabulary whether running in the SDK harness or
 # via this API server.
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_local_file",
-            "description": (f"Read a file from the local filesystem (paths under {_HOME}; relative paths resolve from the "
-                            "Lucy Core folder). Small files are returned whole. For a LARGE file (like api.py) use "
-                            "search='text' to find the lines you need, then start_line/end_line to read just that part."),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": f"Path to the file (e.g. {_HOME}/Desktop/Hello.txt or src/lucy/server/api.py)"
-                    },
-                    "start_line": {"type": "integer", "description": "First line to return (1-based)."},
-                    "end_line": {"type": "integer", "description": "Last line to return (default: 200 lines after start_line)."},
-                    "search": {"type": "string", "description": "Return only the lines containing this text (case-insensitive), with line numbers."}
-                },
-                "required": ["file_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_local_file",
-            "description": "Edit a file on the local filesystem. Reads the existing content, makes string replacements, and writes the updated result back to the same path. Use this for partial edits (adding/removing/modifying specific text sections) rather than overwriting the entire file. For each replacement, old_string must match exactly and uniquely (or use replace_all=true to replace all matches). Parent directories must already exist. Use \\\"replace_all\\\": true to replace all occurrences of a pattern.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": f"Absolute path to the file to edit (e.g. {_HOME}/Desktop/Hello.txt)"
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "Exact text to find in the file content"
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "Replacement text to substitute for old_string"
-                    },
-                    "replace_all": {
-                        "type": "boolean",
-                        "description": "If true, replace all occurrences of old_string. If false (default), only the first occurrence is replaced",
-                        "default": False
-                    }
-                },
-                "required": ["file_path", "old_string", "new_string"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_local_file",
-            "description": f"Write content to a file on the local filesystem. Overwrites if the file exists. Only safe paths under {_HOME} are allowed. Parent directories are created automatically. Use this to write/create a brand new file. For editing an existing file, prefer edit_local_file to avoid accidental data loss.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": f"Absolute path to the file to write (e.g. {_HOME}/Desktop/Hello.txt)"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The text content to write to the file"
-                    }
-                },
-                "required": ["file_path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_local_files",
-            "description": f"List files in a local directory. Only safe paths under {_HOME} are allowed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "dir_path": {
-                        "type": "string",
-                        "description": "Absolute path to the directory to list"
-                    },
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern for filtering files (default: *)"
-                    }
-                },
-                "required": ["dir_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_shell_command",
-            "description": "Run a shell command on the local machine. Use bash syntax. Timeout is 10 seconds. Use this ONLY for system inspection (listing files, checking processes, etc.). Do NOT use this for web fetching — use web_search and web_extract tools instead.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The bash command to execute"
-                    }
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "find_file",
-            "description": f"Find a file by name within a specific directory and subdirectories. Only safe paths under {_HOME} are allowed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_name": {
-                        "type": "string",
-                        "description": "Name of the file to search for"
-                    },
-                    "dir_path": {
-                        "type": "string",
-                        "description": f"Root directory to search in (default: {_HOME})"
-                    }
-                },
-                "required": ["file_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_file",
-            "description": f"Signal to the client that a file is ready for the user to view or download. The file must already exist on disk under {_HOME}.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": f"Absolute path to the file to send (e.g. {_HOME}/data/uploads/screenshot.png)"
-                    },
-                    "caption": {
-                        "type": "string",
-                        "description": "Optional caption for the file"
-                    }
-                },
-                "required": ["file_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_image",
-            "description": "Analyze an image file that was uploaded in this conversation. The image must have been sent as a file upload. Returns a detailed description of what is seen in the image, including objects, text, colors, layout, and any notable details. Use this whenever the user attaches an image and asks you to describe, explain, read, or analyze it.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_path": {
-                        "type": "string",
-                        "description": f"Path to the uploaded image file on disk (e.g. {_ROOT_POSIX}/runtime/tmp/screenshot.png)"
-                    },
-                    "question": {
-                        "type": "string",
-                        "description": "What to analyze or ask about in the image (e.g. 'describe this code', 'read the text', 'what colors are used')"
-                    }
-                },
-                "required": ["image_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for information. Returns top results with titles, URLs, and snippets. Use this to discover current information, research topics, find articles, and gather background context.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query (e.g. 'health benefits of mandarin oranges')"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of results to return (default: 5, max: 10)",
-                        "default": 5
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_extract",
-            "description": "Extract clean, readable text content from one or more web pages. Converts HTML to markdown. Use after web_search to read the full content of the most relevant result.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "urls": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of URLs to extract content from. Only extract from the most relevant 1-2 URLs, never all 5 search results."
-                    },
-                    "char_limit": {
-                        "type": "integer",
-                        "description": "Maximum characters to return per page (default: 15000). Full text is saved to file for large pages.",
-                        "default": 15000
-                    }
-                },
-                "required": ["urls"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_tts",
-            "description": "Synthesize speech from text using the CielVox 2.6 TTS model (via the Lucy Audio server on port 8091). Returns a MEDIA: path to a WAV file that the client plays automatically.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "The text to synthesize. Keep under ~500 characters per call for best quality and streaming behavior."
-                    },
-                    "voice": {
-                        "type": "string",
-                        "description": "Voice preset to use (e.g. 'frieren'). Defaults to the model's configured default.",
-                        "default": "frieren"
-                    }
-                },
-                "required": ["text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cua_cursor",
-            "description": "Get or set the real OS cursor position via Win32 API. Pass action 'get' to read current position, or 'move' with x/y to move the cursor. Returns {'x': X, 'y': Y}.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["get", "move"],
-                        "description": "'get' returns current cursor position; 'move' requires x and y"
-                    },
-                    "x": {
-                        "type": "integer",
-                        "description": "Target X coordinate (required for action='move')"
-                    },
-                    "y": {
-                        "type": "integer",
-                        "description": "Target Y coordinate (required for action='move')"
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cua_mouse",
-            "description": "Control mouse: click, drag, or move. action='click' requires x,y and optional button ('left'/'right'/'middle'). action='drag' requires x1,y1,x2,y2. action='move' requires x,y.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["click", "drag", "move"],
-                        "description": "The mouse action to perform"
-                    },
-                    "x": {"type": "integer"},
-                    "y": {"type": "integer"},
-                    "x1": {"type": "integer", "description": "Drag start X (for drag action)"},
-                    "y1": {"type": "integer", "description": "Drag start Y (for drag action)"},
-                    "x2": {"type": "integer", "description": "Drag end X (for drag action)"},
-                    "y2": {"type": "integer", "description": "Drag end Y (for drag action)"},
-                    "button": {
-                        "type": "string",
-                        "enum": ["left", "right", "middle"],
-                        "default": "left"
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cua_keyboard",
-            "description": "Send keyboard input. action='hotkey' requires keys list (e.g. ['win','d']). action='type' requires text string. action='press' requires a single key name.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["hotkey", "type", "press", "minimize", "enter", "escape"],
-                        "description": "The keyboard action to perform"
-                    },
-                    "keys": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Key combo components (for hotkey action, e.g. ['win','d'])"
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "Text to type (for type action)"
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_drive_files",
-            "description": "List the most recent files in your Google Drive.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_google_doc",
-            "description": "Create a new Google Doc with the given title and return its name and ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "The title for the new Google Doc"
-                    }
-                },
-                "required": ["title"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_doc_content",
-            "description": "Retrieve the full text content of a Google Doc by its title.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "The title of the Google Doc to retrieve"
-                    }
-                },
-                "required": ["title"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_sticker",
-            "description": (
-                "Send one of YOUR OWN stickers to the user in the chat to express an emotion or reaction. The "
-                "stickers are real image files in Lucy_Core/assets/stickers/<Theme>/ (themes: Dark, Light) - you "
-                "do have a sticker library. Pick the emotion that fits the moment; use it naturally and "
-                "sparingly, with a short remark or none. This tool is the ONLY way to send a sticker: never "
-                "write file paths or MEDIA: lines yourself. Call it as a real tool call, not as text."),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "emotion": {"type": "string", "enum": StickerLibrary(_paths.ROOT).all_emotions(), "description": "Which sticker (by emotion). Same set in both themes."},
-                    "theme": {"type": "string", "enum": ["Dark", "Light"], "description": "Sticker theme (default Dark)."},
-                    "caption": {"type": "string", "description": "Optional short caption shown with the sticker."}
-                },
-                "required": ["emotion"]
-            }
-        }
-    },
     # --- Persistent memory (the agent decides what to keep) ---
     {
         "type": "function",
@@ -938,6 +617,18 @@ TOOLS = [
 _MEMORY_TOOLS = ("remember", "recall_memory", "forget", "search_conversations")
 TOOLS.extend(_proactive.TOOL_DEFS)       # set_reminder, schedule_task, manage_reminders, proactive_control
 
+# Tools living in src/lucy/tools/ (one file per tool, auto-discovered). A registry tool replaces an old inline
+# schema of the same name in place; new ones are appended.
+from lucy.tools import registry as _tool_registry
+from lucy.tools import routing as _routing
+_tool_registry.default.discover()
+for _spec in _tool_registry.default.all_specs():
+    _idx = next((i for i, t in enumerate(TOOLS) if t["function"]["name"] == _spec.name), None)
+    if _idx is None:
+        TOOLS.append(_spec.schema)
+    else:
+        TOOLS[_idx] = _spec.schema
+
 # --- Tool Registry (lookup by name for dynamic skill-tool mapping) ---
 TOOL_REGISTRY: Dict[str, dict] = {
     tool_def["function"]["name"]: tool_def for tool_def in TOOLS
@@ -973,175 +664,6 @@ def _resolve_skills_to_tools(skill_list: list[dict]) -> list[dict]:
     return TOOLS  # fallback: all tools available
 
 
-# --- Web Search Helpers ---
-
-async def _web_search(query: str, limit: int = 5) -> str:
-    """Search Bing and return top results as formatted text."""
-    import re
-    import html as html_module
-    import base64
-    try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            resp = await client.get(
-                "https://www.bing.com/search",
-                params={"q": query, "count": limit, "setlang": "en-US"},
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-                    "Accept": "text/html,application/xhtml+xml",
-                    "Accept-Language": "en-US,en;q=0.5",
-                },
-            )
-            if resp.status_code != 200:
-                return f"Search failed with status {resp.status_code}"
-            html_text = resp.text
-    except Exception as e:
-        return f"Search error: {e}"
-
-    results = []
-    links = re.findall(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html_text, re.DOTALL)
-    cites = re.findall(r'<cite[^>]*>(.*?)</cite>', html_text, re.DOTALL)
-    snippets = re.findall(r'class="b_caption"[^>]*>(.*?)</div>', html_text, re.DOTALL)
-
-    for i in range(min(limit, len(links))):
-        href, title_raw = links[i]
-        title = html_module.unescape(re.sub(r'<[^>]+>', '', title_raw).strip())
-        result_url = ""
-        # Try to decode Bing redirect URL
-        match = re.search(r'u=a1([A-Za-z0-9+/=]+)', href)
-        if match:
-            try:
-                decoded = base64.b64decode(match.group(1)).decode('utf-8', errors='replace')
-                result_url = decoded
-            except Exception:
-                pass
-        # Fall back to cite for URL
-        if not result_url and i < len(cites):
-            cite_text = html_module.unescape(re.sub(r'<[^>]+>', '', cites[i]).strip())
-            url_match = re.search(r'https?://[^\s]+', cite_text)
-            if url_match:
-                result_url = url_match.group(0).replace('&nbsp;', '').replace(' › ', '/').strip()
-        # Also try extracting URL from the href itself if it's a direct link
-        if not result_url:
-            direct_url = re.search(r'https?://[^\s&]+', href)
-            if direct_url:
-                result_url = direct_url.group(0)
-        snippet = ""
-        if i < len(snippets):
-            snippet = html_module.unescape(re.sub(r'<[^>]+>', '', snippets[i]).strip())
-            snippet = snippet.replace('\n', ' ')[:200]
-        results.append(f"[{i+1}] {title}\n    URL: {result_url}\n    {snippet}")
-
-    if not results:
-        return f"No results found for '{query}'"
-    return "\n\n".join(results)
-
-
-async def _web_extract(urls: list, char_limit: int = 15000) -> str:
-    """Extract clean content from web pages using Jina Reader API, with fallback to direct scraping."""
-    if isinstance(urls, str):
-        urls = [urls]
-    results = []
-    try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            for url in urls:
-                jina_url = f"https://r.jina.ai/{url}"
-                try:
-                    resp = await client.get(jina_url, timeout=30.0)
-                    if resp.status_code == 200:
-                        content = resp.text
-                        if len(content) > char_limit:
-                            content = content[:char_limit] + "\n\n[... truncated, full page was longer ...]"
-                        results.append(f"=== {url} ===\n{content}")
-                    else:
-                        # Fallback: try Wikipedia API for Wikipedia URLs
-                        if "wikipedia.org" in url:
-                            api_url = url.replace("/wiki/", "/w/api.php").replace("/w/api.php", "/w/api.php")
-                            # Better: use the REST API summary endpoint
-                            title = url.split("/wiki/")[-1] if "/wiki/" in url else ""
-                            if title:
-                                rest_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
-                                resp2 = await client.get(rest_url, headers={"User-Agent": "LucyCore/1.0"})
-                                if resp2.status_code == 200:
-                                    import json
-                                    data = json.loads(resp2.text)
-                                    extract = data.get("extract", "")
-                                    content = f"# {data.get('title', title)}\n\n{extract}"
-                                    if len(content) > char_limit:
-                                        content = content[:char_limit] + "\n\n[... truncated ...]"
-                                    results.append(f"=== {url} ===\n{content}")
-                                else:
-                                    results.append(f"=== {url} ===\n[Failed to extract Wikipedia page: status {resp2.status_code}]")
-                            else:
-                                results.append(f"=== {url} ===\n[Could not parse Wikipedia URL]")
-                        else:
-                            results.append(f"=== {url} ===\n[Failed to extract — Jina status {resp.status_code}]")
-                except Exception as e:
-                    results.append(f"=== {url} ===\n[Error extracting: {e}]")
-    except Exception as e:
-        return f"Extraction error: {e}"
-
-    return "\n\n".join(results) if results else "No content extracted"
-
-
-async def _analyze_image(image_path: str, question: str = "") -> str:
-    """Analyze an image using the local llama-server multimodal model."""
-    import base64
-
-    # Read the image and encode as base64 data URL
-    target = Path(image_path)
-    if not target.exists():
-        return f"Image not found: {image_path}"
-
-    # Determine MIME type from extension
-    mime_map = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-        ".bmp": "image/bmp",
-    }
-    mime_type = mime_map.get(target.suffix.lower(), "image/png")
-
-    image_b64 = base64.b64encode(target.read_bytes()).decode("utf-8")
-    data_url = f"data:{mime_type};base64,{image_b64}"
-
-    # Build the prompt for image analysis
-    prompt = question if question else "Describe this image in detail. Include all visible text, objects, colors, layout, and any notable details."
-
-    # Send to llama-server multimodal endpoint
-    payload = {
-        "model": llm.model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ],
-        "max_tokens": 2048,
-        "temperature": 0.3,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{llm.api_url}/chat/completions",
-                json=payload,
-            )
-            if resp.status_code == 200:
-                result = resp.json()
-                if "choices" in result and result["choices"]:
-                    return result["choices"][0]["message"]["content"]
-                return "[No content returned from image analysis]"
-            else:
-                return f"[Image analysis failed: status {resp.status_code} — {resp.text[:500]}]"
-    except Exception as e:
-        return f"[Image analysis error: {e}]"
-
-
 # --- Tool Execution ---
 
 def _resolve_path(file_path: str) -> Path:
@@ -1157,6 +679,32 @@ def _outside_root(file_path: str) -> str:
 
 
 _STICKERS = StickerLibrary(_paths.ROOT, SAFE_ROOT)
+
+# The chat UI sends a sticker as the text "[sticker: 7.png]" plus the PNG itself (so the model can see it).
+_STICKER_TEXT_RE = re.compile(r"^\s*\[sticker:\s*[^\]\n]+?\.png\s*\]\s*$", re.IGNORECASE)
+
+
+def _ingest_generated_media(media_path: str, voice_mode: bool = False) -> dict | None:
+    """A file Lucy delivered to the chat (MEDIA: event) -> attachment record for the message history.
+
+    * stickers are NOT cached (they live in assets/stickers): a light path reference is stored instead
+    * streaming-TTS chunks (.pcm) and voice-mode speech are not files the user wants in the Library
+    * everything else is snapshotted into cache/ as it is right now
+    """
+    if not media_path or media_path.lower().endswith(".pcm"):
+        return None
+    target = _resolve_path(media_path)
+    if target is None or not target.is_file():
+        return None
+    if _library.is_sticker_path(target):
+        return {"kind": "sticker", "name": target.name, "path": media_path}
+    if voice_mode:
+        try:
+            target.resolve().relative_to((_paths.HERMES_HOME / "cache" / "audio").resolve())
+            return None
+        except ValueError:
+            pass
+    return _library.ingest_path(target, "assistant")
 
 
 def _refresh_sticker_tool() -> None:
@@ -1367,341 +915,43 @@ def _run_memory_tool(tool_name: str, args: dict) -> str:
     return f"Unknown memory tool: {tool_name}"
 
 
+# Memory + reminder tools keep their state in this module (memory manager, sessions DB, current session) or in the
+# proactive package, so they are registered as thin adapters instead of moving the code. They still get a tier and a
+# label like every other tool, and go through the same registry dispatch (one place for permissions later).
+def _register_adapter_tools() -> None:
+    def memory_handler(name):
+        return lambda args, ctx: _run_memory_tool(name, args)          # sync -> registry runs it in a worker thread
+
+    def proactive_handler(name):
+        async def handler(args, ctx):
+            return await _proactive.run_tool(name, args, ctx.session_id)
+        return handler
+
+    memory = (("remember", "write", "remember"), ("recall_memory", "read", "recall"),
+              ("forget", "write", "forget"), ("search_conversations", "read", "history"))
+    proactive = {"set_reminder": ("write", "remember"), "schedule_task": ("write", "remember"),
+                 "manage_reminders": ("write", "recall"), "proactive_control": ("write", "remember")}   # UI labels that already exist
+    items = [(n, memory_handler(n), t, l) for n, t, l in memory]
+    for n in _proactive.TOOL_NAMES:
+        t, l = proactive.get(n, ("write", "remember"))
+        items.append((n, proactive_handler(n), t, l))
+    for name, handler, tier, label in items:
+        _tool_registry.default.unregister(name)
+        _tool_registry.default.register(_tool_registry.ToolSpec(name, TOOL_REGISTRY[name], handler, tier, label, "lucy.server.api"))
+
+
+_register_adapter_tools()
+
+
 async def execute_tool_call(tool_name: str, args: dict) -> str:
     """Execute a single tool call and return its string result."""
     logger.info(f"Executing tool: {tool_name} with args: {args}")
 
-    if tool_name in _proactive.TOOL_NAMES:
-        return await _proactive.run_tool(tool_name, args, _current_session.get())
+    _reg_spec = _tool_registry.default.get(tool_name)
+    if _reg_spec is not None:
+        return await _reg_spec.run(args, _tool_registry.ToolContext(session_id=_current_session.get(), tool_names=_tool_names()))
 
-    if tool_name in _MEMORY_TOOLS:
-        return await asyncio.to_thread(_run_memory_tool, tool_name, args)
-
-    if tool_name == "read_local_file":
-        file_path = args.get("file_path", "")
-        target = _resolve_path(file_path)
-        if target is None:
-            return _outside_root(file_path)
-        if not target.exists():
-            return f"File not found: {file_path}"
-        if not target.is_file():
-            return f"Not a file: {file_path}"
-        try:
-            try:
-                text, _crlf = file_guard.read_text_keep_style(target)
-            except ValueError:
-                text = target.read_text(encoding="utf-8", errors="replace")
-            lines = text.split("\n")
-            total = len(lines)
-            search = str(args.get("search") or "").strip()
-            start, end = args.get("start_line"), args.get("end_line")
-            if search:
-                hits = [i for i, l in enumerate(lines) if search.lower() in l.lower()]
-                if not hits:
-                    return f"No lines containing '{search}' in {target.as_posix()} ({total} lines)."
-                shown = "\n".join(f"{i + 1}: {lines[i]}" for i in hits[:30])
-                return (f"[{len(hits)} line(s) containing '{search}' in {target.as_posix()} ({total} lines)"
-                        f"{'; showing the first 30' if len(hits) > 30 else ''}. Use start_line/end_line to read around them]\n{shown}")
-            if start is not None or end is not None:
-                s0 = max(1, int(start or 1))
-                e0 = min(total, int(end) if end is not None else s0 + 199)
-                body = "\n".join(lines[s0 - 1:e0])
-                if len(body) > 11000:
-                    body = body[:11000]
-                    e0 = s0 + body.count("\n")
-                    return f"[{target.as_posix()} lines {s0}-{e0} of {total}; cut to fit - ask for fewer lines]\n{body}"
-                return f"[{target.as_posix()} lines {s0}-{e0} of {total}]\n{body}"
-            if len(text) > 10_000:
-                head = text[:10_000]
-                head = head[:head.rfind("\n")] if "\n" in head else head
-                return (f"{head}\n\n[... showing the first {head.count(chr(10)) + 1} of {total} lines of "
-                        f"{target.as_posix()}. It is large: use search='text' to find lines, then "
-                        f"start_line/end_line to read a range ...]")
-            return text
-        except Exception as e:
-            return f"[error reading file: {e}]"
-
-    if tool_name == "edit_local_file":
-        file_path = args.get("file_path", "")
-        replace_all = args.get("replace_all", False)
-        if isinstance(replace_all, str):                      # llama-server may emit "true"/"false" strings
-            replace_all = replace_all.lower() == "true"
-        target = _resolve_path(file_path)
-        if target is None:
-            return _outside_root(file_path)
-        try:
-            result = await asyncio.to_thread(file_guard.edit_file, target, str(args.get("old_string", "")),
-                                             str(args.get("new_string", "")), bool(replace_all), _paths.ROOT)
-        except Exception as e:                                # noqa: BLE001
-            logger.exception("edit_local_file crashed")
-            return f"[error editing file: {e}]"
-        if result.startswith(("Error", "Refused", "File not found")):
-            logger.warning(f"edit_local_file {target}: {result[:200]}")
-        else:
-            logger.info(f"edit_local_file {target}: {result[:160]}")
-        return result
-
-    if tool_name == "write_local_file":
-        file_path = args.get("file_path", "")
-        target = _resolve_path(file_path)
-        if target is None:
-            return _outside_root(file_path)
-        try:
-            result = await asyncio.to_thread(file_guard.write_file, target, str(args.get("content", "")), _paths.ROOT)
-        except Exception as e:                                # noqa: BLE001
-            logger.exception("write_local_file crashed")
-            return f"[error writing file: {e}]"
-        (logger.warning if result.startswith(("Error", "Refused")) else logger.info)(f"write_local_file {target}: {result[:160]}")
-        return result
-
-    if tool_name == "send_sticker":
-        return await asyncio.to_thread(_send_sticker, args, _STICKERS)
-
-    elif tool_name == "list_local_files":
-        dir_path = args.get("dir_path", "")
-        pattern = args.get("pattern", "*")
-        target = _resolve_path(dir_path)
-        if target is None:
-            return _outside_root(dir_path)
-        if not target.exists():
-            return f"Directory not found: {dir_path}"
-        if not target.is_dir():
-            return f"Not a directory: {dir_path}"
-        try:
-            entries = sorted(target.glob(pattern))
-            if not entries:
-                return f"No files matching '{pattern}' in {dir_path}"
-            lines = [f"{e.name}{'/' if e.is_dir() else ''}" for e in entries]
-            return "\n".join(lines)
-        except Exception as e:
-            return f"[error listing files: {e}]"
-
-    elif tool_name == "run_shell_command":
-        command = args.get("command", "")
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["bash", "-c", command],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                cwd=str(SAFE_ROOT),
-            )
-            output = result.stdout
-            if result.stderr:
-                output += f"\n[stderr]\n{result.stderr}"
-            if len(output) > 100_000:
-                output = output[:100_000] + "\n\n[... truncated ...]"
-            return output if output else "[command produced no output]"
-        except subprocess.TimeoutExpired:
-            return "[command timed out after 10s]"
-        except Exception as e:
-            return f"[error running command: {e}]"
-
-    elif tool_name == "find_file":
-        file_name = args.get("file_name", "")
-        dir_path = args.get("dir_path", str(SAFE_ROOT))
-        target = _resolve_path(dir_path)
-        if target is None:
-            return _outside_root(dir_path)
-        # Validate file_name — reject shell-dangerous characters to prevent
-        # command injection in the find command below
-        _dangerous = [';', '|', '&', '$', '`', '"', "'"]
-        if not file_name or any(c in file_name for c in _dangerous):
-            return "Error: file_name contains invalid characters"
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["bash", "-c", f'find "{target}" -name "{file_name}" -maxdepth 4 2>/dev/null | head -20'],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                cwd=str(SAFE_ROOT),
-            )
-            output = result.stdout.strip()
-            if output:
-                return output
-            return f"No files matching '{file_name}' found in {dir_path}"
-        except subprocess.TimeoutExpired:
-            return f"[find timed out after 10s in {dir_path}]"
-        except Exception as e:
-            return f"[error: {e}]"
-
-    elif tool_name == "send_file":
-        file_path = args.get("file_path", "")
-        caption = args.get("caption")
-        target = _resolve_path(file_path)
-        if target is None:
-            return _outside_root(file_path)
-        if not target.exists() or not target.is_file():
-            return f"File not found: {file_path}"
-        # Return MEDIA: marker so Hermes/Discord sends it as an attachment
-        # Use forward slashes in the path for cross-platform frontend compatibility
-        # Calculate path relative to SAFE_ROOT
-        try:
-            relative_path = target.relative_to(SAFE_ROOT)
-            media_path_str = relative_path.as_posix()
-        except ValueError:
-            # Fallback: use the absolute path if relative fails
-            media_path_str = target.as_posix()
-            
-        # Ensure we have a clean string for the MEDIA marker
-        result = f"MEDIA:{media_path_str}"
-        if caption:
-            result += f" {caption}"
-        return result
-
-    elif tool_name == "web_search":
-        query = args.get("query", "")
-        limit = args.get("limit", 5)
-        return await _web_search(query, limit)
-
-    elif tool_name == "web_extract":
-        urls = args.get("urls", [])
-        char_limit = args.get("char_limit", 15000)
-        return await _web_extract(urls, char_limit)
-
-    elif tool_name == "analyze_image":
-        image_path = args.get("image_path", "")
-        question = args.get("question", "")
-        target = _resolve_path(image_path)
-        if target is None or not target.exists():
-            return f"Image not found or outside allowed path: {image_path}"
-        return await _analyze_image(str(target), question)
-
-    elif tool_name == "send_tts":
-        text = args.get("text", "")
-        voice = args.get("voice", "frieren")
-        if not text:
-            return "send_tts requires 'text' parameter"
-        text = clean_for_speech(text, _tool_names())   # no tool calls / file paths / markdown in the voice
-        if not text:
-            return "send_tts: nothing speakable left after removing tool calls, file paths and markup"
-        # Save the text to a temp input file for the wrapper to read
-        import uuid as _uuid
-        _ts = time.strftime("%Y%m%d_%H%M%S")
-        input_file = _paths.HERMES_HOME / "cache" / "scratch" / f"tts_input_{_uuid.uuid4().hex[:8]}.txt"
-        input_file.parent.mkdir(parents=True, exist_ok=True)
-        input_file.write_text(text, encoding="utf-8")
-        # Call the wrapper which proxies to lucy audio server on 8091
-        # Use the baked-in wrapper inside Lucy_Core/lucy_audio/ first;
-        # fall back to the Hermes scripts dir for backwards compat.
-        baked_wrapper = _paths.ROOT / "lucy_audio" / "build" / "windows-vulkan-release" / "bin" / "tts-wrapper-lucy-cielvox26.bat"
-        hermes_wrapper = _paths.HERMES_HOME / "scripts" / "tts-wrapper-lucy-cielvox26.bat"
-        wrapper = baked_wrapper if baked_wrapper.exists() else hermes_wrapper
-        output_file = _paths.HERMES_HOME / "cache" / "audio" / f"tts_lucy_{_uuid.uuid4().hex[:8]}.wav"
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # --- Delta stream log ---
-        log_path = _paths.RUNTIME / "logs" / "deltastream_tts.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        def _log_deltastream(status: str, msg: str = "", media_path: str = ""):
-            entry = {
-                "timestamp": _ts,
-                "session": "current",
-                "tool": "send_tts",
-                "status": status,
-                "voice": voice,
-                "text_preview": text[:80] + ("..." if len(text) > 80 else ""),
-                "message": msg,
-                "media": media_path,
-            }
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-        _log_deltastream("started", text)
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["cmd", "/c", str(wrapper), str(input_file), str(output_file)],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode != 0:
-                _log_deltastream("error", f"wrapper exit {result.returncode}: {result.stderr[:200]}")
-                logger.error(f"TTS wrapper failed: {result.stderr}")
-                return f"TTS failed: {result.stderr[:200]}"
-            if output_file.exists() and output_file.stat().st_size > 1000:
-                _log_deltastream("success", f"WAV {output_file.stat().st_size} bytes", str(output_file).replace("\\", "/"))
-                # Return MEDIA: path with forward slashes for frontend compatibility
-                return f"MEDIA:{str(output_file).replace(chr(92), '/')}"
-            _log_deltastream("error", f"output missing/too small (size={output_file.stat().st_size if output_file.exists() else 0})")
-            return f"TTS error: output file missing or too small"
-        except subprocess.TimeoutExpired:
-            _log_deltastream("timeout", "wrapper exceeded 120s")
-            logger.error("TTS wrapper timed out after 120s")
-            return f"TTS error: lucy audio server timeout (120s)"
-        except Exception as e:
-            _log_deltastream("error", str(e))
-            logger.error(f"TTS call error: {e}")
-            return f"TTS error: {e}"
-
-    elif tool_name in ("cua_cursor", "cua_mouse", "cua_keyboard"):
-        # Dispatch CUA tools to the lucy_cua module (Win32 API backend)
-        from lucy.cua.lucy_cua import (
-            get_cursor_pos, set_cursor_pos, mouse_click,
-            mouse_drag, key_combo, type_text, minimize_all,
-        )
-        try:
-            if tool_name == "cua_cursor":
-                action = args.get("action", "get")
-                if action == "get":
-                    return json.dumps(get_cursor_pos())
-                elif action == "move":
-                    x, y = args["x"], args["y"]
-                    return json.dumps(set_cursor_pos(x, y))
-                return json.dumps({"error": f"Unknown cursor action: {action}"})
-
-            elif tool_name == "cua_mouse":
-                action = args.get("action", "click")
-                if action == "click":
-                    x, y = args["x"], args["y"]
-                    button = args.get("button", "left")
-                    return json.dumps(mouse_click(x, y, button))
-                elif action == "move":
-                    x, y = args["x"], args["y"]
-                    return json.dumps(set_cursor_pos(x, y))
-                elif action == "drag":
-                    x1, y1, x2, y2 = args["x1"], args["y1"], args["x2"], args["y2"]
-                    return json.dumps(mouse_drag(x1, y1, x2, y2))
-                return json.dumps({"error": f"Unknown mouse action: {action}"})
-
-            elif tool_name == "cua_keyboard":
-                action = args.get("action", "press")
-                if action == "hotkey":
-                    keys = args.get("keys", [])
-                    return json.dumps(key_combo(keys))
-                elif action == "type":
-                    text_content = args.get("text", "")
-                    return json.dumps(type_text(text_content))
-                elif action in ("minimize", "enter", "escape"):
-                    key_map = {"minimize": ["win", "d"], "enter": ["enter"], "escape": ["escape"]}
-                    return json.dumps(key_combo(key_map[action]))
-                return json.dumps({"error": f"Unknown keyboard action: {action}"})
-
-        except Exception as e:
-            logger.error(f"CUA tool error ({tool_name}): {e}")
-            return json.dumps({"error": str(e)})
-
-    if tool_name == "list_drive_files":
-        from lucy.tools import Toolset
-        toolset = Toolset()
-        return toolset.list_drive_files()
-
-    if tool_name == "create_google_doc":
-        from lucy.tools import Toolset
-        toolset = Toolset()
-        title = args.get("title", "")
-        return toolset.create_google_doc(title)
-
-    if tool_name == "get_doc_content":
-        from lucy.tools import Toolset
-        toolset = Toolset()
-        title = args.get("title", "")
-        return toolset.get_doc_content(title)
-
-    else:
-        return f"Unknown tool: {tool_name}"
+    return f"Unknown tool: {tool_name}"
 
 
 # --- Request Models ---
@@ -1733,19 +983,25 @@ async def health_check():
     return {"status": api_status, "llama_server": "online" if llama_online else "offline"}
 
 
+def _prompt_order() -> str:
+    order = os.environ.get("LUCY_PROMPT_ORDER", "static_first").strip().lower()
+    return order if order in ("static_first", "late", "legacy") else "static_first"
+
+
 def _build_messages(session_id: str, user_message: str, image_paths: List[str] = None) -> List[Dict[str, Any]]:
     """Build the full message list for the llama-server request."""
-    messages = [{"role": "system", "content": _persona_prompt}]
+    persona = {"role": "system", "content": _persona_prompt}
+    facts = digest = skills = None        # facts + skills change with every message: see the assembly below
 
     # Inject long-term memory
     try:
         memory_context = _memory_manager.get_contextual_memory(user_message)
         if memory_context:
-            messages.append({"role": "system", "content": f"[USER FACTS]: {memory_context}"})
+            facts = {"role": "system", "content": f"[USER FACTS]: {memory_context}"}
     except Exception as e:
         logger.warning(f"Failed to retrieve memory context: {e}")
 
-    messages.append({"role": "system", "content": (
+    memory_rules = {"role": "system", "content": (
         "MEMORY: You have persistent memory that survives across conversations; [USER FACTS] (if shown) "
         "is what you already remember. On your own initiative - never ask permission and keep any "
         "mention of it to a few words - call `remember` when the user shares a lasting preference, a "
@@ -1757,10 +1013,10 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
         "'what did I say about') or you lack background you need, call `search_conversations` (past "
         "chats) or `recall_memory` BEFORE answering instead of guessing. Only say you saved or "
         "remembered something if the tool call succeeded."
-    )})
+    )}
 
     try:                                   # accurate map of Lucy Core: paths, files, tools, stickers, how to edit
-        messages.append({"role": "system", "content": build_harness_digest(TOOLS, _paths.ROOT, SAFE_ROOT)})
+        digest = {"role": "system", "content": build_harness_digest(TOOLS, _paths.ROOT, SAFE_ROOT)}
     except Exception as e:
         logger.warning(f"Failed to build harness digest: {e}")
 
@@ -1769,7 +1025,7 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
         relevant_skills = _skills_manager.get_relevant_skills(user_message)
         if relevant_skills:
             skill_instructions = "\n".join([f"[{s['name']}]: {s['instructions']}" for s in relevant_skills])
-            messages.append({"role": "system", "content": f"[ACTIVE SKILLS]: {skill_instructions}"})
+            skills = {"role": "system", "content": f"[ACTIVE SKILLS]: {skill_instructions}"}
     except Exception as e:
         logger.warning(f"Failed to retrieve skills: {e}")
 
@@ -1777,7 +1033,7 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
     # Reinforce that edit/update/patch all map to edit_local_file,
     # and edit should always be called (not just narrated) when the user
     # asks to modify an existing file.
-    messages.append({"role": "system", "content": (
+    tool_rules = {"role": "system", "content": (
         "TOOL USAGE RULES: (1) write_local_file — for creating NEW files only. "
         "(2) edit_local_file — for modifying EXISTING files. "
         "When the user says 'edit', 'update', 'patch', 'modify', or 'change' a file, "
@@ -1791,8 +1047,29 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
         "remind them or check back later, CALL set_reminder (plain reminder) or schedule_task (you run a "
         "read-only task later and report) - never just promise, and only say it is set after the tool "
         "confirms. Messages you send on your own initiative (reminders, greetings, check-ins) appear in the "
-        "chat as your own earlier messages. If the user wants fewer of them, call proactive_control."
-    )})
+        "chat as your own earlier messages. If the user wants fewer of them, call proactive_control. "
+        "(5) FINISH WHAT YOU START: work on the user's request until it is completely done. Never end a reply by "
+        "saying what you are about to do ('I'll send the file', 'Now I will edit...') - do it, by calling the tool "
+        "in that same turn. If a step needs a file sent, send it with send_file; if it needs an edit, call "
+        "edit_local_file. If a tool fails or something blocks you, do not stop and do not give up: read the error, "
+        "and try another way (a corrected path, a smaller edit, write_local_file, run_shell_command, a different "
+        "search). Say you are blocked only after trying at least two different approaches, and then still finish "
+        "everything else. Never repeat a sentence you already wrote. Only give your final answer once the whole "
+        "task is done."
+    )}
+
+    # Prompt order = KV-cache reuse. llama-server only re-reads the part of the prompt that changed since the last
+    # request, counted from the START. So the parts that never change come first and what changes every message
+    # (recalled facts, matching skills) comes after them. LUCY_PROMPT_ORDER: static_first (default) | late (facts and
+    # skills ride on the last user message, so even the history stays cached) | legacy (the old order).
+    order = _prompt_order()
+    if order == "legacy":
+        messages = [m for m in (persona, facts, memory_rules, digest, skills, tool_rules) if m]
+    else:
+        messages = [m for m in (persona, memory_rules, digest, tool_rules) if m]
+        if order != "late":
+            messages += [m for m in (facts, skills) if m]
+    late_context = [m["content"] for m in (facts, skills) if m] if order == "late" else []
 
     # Session history (limit to last N messages to avoid context overflow)
     # Lucy can now speak first, so stored history may hold two assistant messages in a row: repair for the template
@@ -1802,6 +1079,10 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
     _note = _proactive.now_note() if _proactive.wants_clock(user_message) else ""
     if _note:
         user_message = f"{user_message}\n\n[Harness note - internal, do not mention or quote it] {_note}"
+
+    if late_context:
+        user_message = (f"{user_message}\n\n[Harness note - internal, do not mention or quote it] Context for this "
+                        "message:\n" + "\n".join(late_context))
 
     # New user message — embed images as multimodal content if present
     image_paths = image_paths or []
@@ -1869,29 +1150,7 @@ async def _collect_full_response(messages: List[Dict[str, Any]]) -> Dict[str, An
 
 
 # --- Activity Indicator Helpers ---
-# Maps tool names to a plain fallback activity label (no detail available).
-_TOOL_ACTIVITY_MAP = {
-    "web_search": "search",
-    "web_extract": "read",
-    "list_local_files": "list",
-    "find_file": "search",
-    "run_shell_command": "run",
-    "send_file": "send",
-    "analyze_image": "analyze",
-    "send_tts": "speak",
-    "cua_cursor": "control",
-    "cua_mouse": "control",
-    "cua_keyboard": "control",
-    "list_drive_files": "drive",
-    "create_google_doc": "docs",
-    "get_doc_content": "docs",
-    "remember": "remember",
-    "recall_memory": "recall",
-    "forget": "forget",
-    "search_conversations": "history",
-    "set_reminder": "remember", "schedule_task": "remember", "manage_reminders": "recall",
-    "proactive_control": "remember",       # reuse existing UI labels: no chat.html change needed
-}
+# The plain fallback label for a tool (when its args give no detail) is the LABEL its registry entry declares.
 
 _ACTIVITY_DETAIL_MAX = 60  # truncate long detail (queries/commands) so the UI stays one line
 
@@ -1960,8 +1219,9 @@ def _tool_to_activity(tool_name: str, args: dict) -> str:
         return f"remember:follow-up: {_truncate(args['task'], 32)}"
 
     # No usable detail in args — fall back to a plain category label.
-    if tool_name in _TOOL_ACTIVITY_MAP:
-        return _TOOL_ACTIVITY_MAP[tool_name]
+    _reg_spec = _tool_registry.default.get(tool_name)
+    if _reg_spec is not None:
+        return _reg_spec.label
     return tool_name  # last resort: raw tool name
 
 
@@ -2045,6 +1305,45 @@ def _agent_trace(entry: dict) -> None:
         pass
 
 
+# The tool list is part of the prompt (the chat template puts it at the very start), so a list that flips every turn throws
+# the whole KV cache away. Keep it stable: fixed order, and tools picked in the last 3 turns of a chat stay in the list.
+_RECENT_TOOLS: Dict[str, list] = {}
+_STICKY_TURNS = 3
+
+
+def _sticky_tool_names(session_id: str | None, names: list) -> set:
+    hist = _RECENT_TOOLS.setdefault(session_id or "_", [])
+    hist.append(list(names))
+    del hist[:-_STICKY_TURNS]
+    while len(_RECENT_TOOLS) > 200:
+        _RECENT_TOOLS.pop(next(iter(_RECENT_TOOLS)))
+    return set().union(*hist)
+
+
+def _note_added_tools(session_id: str | None, names: list) -> None:
+    """Tools the model pulled in mid-turn (tool_search / by name) stay available for the next turns."""
+    hist = _RECENT_TOOLS.setdefault(session_id or "_", [[]])
+    hist[-1] = sorted(set(hist[-1]) | set(names))
+
+
+def _tools_for_turn(messages: List[Dict[str, Any]], skill_list: list[dict] | None = None, session_id: str | None = None):
+    """(tools shown to the model this turn, catalog of every tool for tool_search / auto-add).
+
+    Small models get worse as the tool list grows, so only a few schemas are shown (see lucy.tools.routing); the rest are one
+    tool_search away. LUCY_TOOL_ROUTING=0 turns this off (all tools every turn, like before)."""
+    if os.environ.get("LUCY_TOOL_ROUTING", "1").strip().lower() in ("0", "false", "off", "no"):
+        return (_resolve_skills_to_tools(skill_list) if skill_list else TOOLS), None
+    last_user = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), None)
+    text = _routing._text_of(messages[last_user].get("content")) if last_user is not None else ""
+    history = messages[:last_user] if last_user is not None else []
+    names = _routing.select_tools(text, history, available=TOOL_REGISTRY)
+    if skill_list:                                           # skills can still pull their tools in
+        names += [t["function"]["name"] for t in _resolve_skills_to_tools(skill_list) if t["function"]["name"] not in names]
+    keep = _sticky_tool_names(session_id, names)
+    shown = [t for t in TOOLS if t["function"]["name"] in keep] + [_routing.TOOL_SEARCH]      # TOOLS order = stable prompt
+    return shown, _routing.ToolCatalog(TOOLS)
+
+
 async def _stream_response(messages: List[Dict[str, Any]], temperature: float | None = None, skill_list: list[dict] = None, voice_mode: bool = False, session_id: str | None = None):
     """Stream a response from llama-server, handling tool calls in a loop.
 
@@ -2065,15 +1364,16 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
     _refresh_sticker_tool()                   # new sticker files are picked up without a restart
     if temperature is None:
         temperature = llm.temperature          # Settings > Model value (preset per model)
-    available_tools = _resolve_skills_to_tools(skill_list) if skill_list else TOOLS
-    _tts_filter = TTSStreamFilter(tuple(t["function"]["name"] for t in available_tools))   # strips tool calls, paths, MEDIA: ...
+    available_tools, _catalog = _tools_for_turn(messages, skill_list, session_id)
+    _tts_filter = TTSStreamFilter(_tool_names())    # strips tool calls, paths, MEDIA: ... (all tools, not just the ones shown)
     agent = AgentLoop(
         brain=_BRAIN, tools=available_tools,
         execute=lambda name, args: execute_tool_call(name, args),   # looked up at call time
         activity_for=_tool_to_activity, count_tokens=_count_tokens, temperature=temperature,
         cfg=LoopConfig(max_rounds=MAX_TOOL_ROUNDS, max_tokens=LUCY_MAX_TOKENS, tool_timeout=LUCY_TOOL_TIMEOUT,
                        ctx_tokens=int(llm.cfg.get("context_length", 100000)), http_timeout=LUCY_TIMEOUT),
-        trace=_agent_trace, session_id=session_id)
+        trace=_agent_trace, session_id=session_id, tool_catalog=_catalog,
+        on_tools_added=lambda names: _note_added_tools(session_id, names))
 
     async def _speak(text: str):
         """Yield SSE lines that speak `text` through Lucy Audio (voice mode)."""
@@ -2202,6 +1502,8 @@ async def chat_endpoint(
     # Handle uploaded files — save them to a temp upload dir
     uploaded_file_paths = []
     image_paths = []
+    upload_records: list[tuple[bytes, str]] = []     # (bytes, name) of what the user attached -> Library
+    relay_paths: list[Path] = []                      # files passed by path (Discord relay) -> Library
     if files:
         upload_dir = _paths.RUNTIME / "tmp"
         upload_dir.mkdir(parents=True, exist_ok=True)
@@ -2214,6 +1516,7 @@ async def chat_endpoint(
             fpath = upload_dir / safe_name
             content = await f.read()
             fpath.write_bytes(content)
+            upload_records.append((content, safe_name))
             uploaded_file_paths.append(str(fpath))
             # If this is an image, pass it for multimodal embedding
             if str(fpath).lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp')):
@@ -2230,6 +1533,7 @@ async def chat_endpoint(
                 logger.warning(f"File path from relay not found or unsafe: {fp}")
                 continue
             uploaded_file_paths.append(str(target))
+            relay_paths.append(target)
             if str(target).lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp')):
                 image_paths.append(str(target))
 
@@ -2247,8 +1551,19 @@ async def chat_endpoint(
     elif image_paths:
         # Let the model know images were received (redundant but harmless)
         pass
-    # Store user message in session
-    _append_message(session_id, "user", message)
+    # Store user message in session, with its files/images cached so they survive a page refresh.
+    # (Stickers - "[sticker: N.png]" - are skipped: they already live in assets/stickers.)
+    user_atts: list[dict] = []
+    if not _STICKER_TEXT_RE.match(message or ""):
+        for _data, _nm in upload_records:
+            _a = await asyncio.to_thread(_library.ingest_bytes, _data, _nm, "user")
+            if _a:
+                user_atts.append(_a)
+        for _rp in relay_paths:
+            _a = await asyncio.to_thread(_library.ingest_path, _rp, "user")
+            if _a:
+                user_atts.append(_a)
+    _append_message(session_id, "user", message or "", user_atts)
     _proactive.touch(session_id)
     # Check for memory-worthy fact in the user message
     memory_fact = detect_memory_candidate(message)
@@ -2260,6 +1575,7 @@ async def chat_endpoint(
 
     async def event_stream():
         full_response = ""
+        media_atts: list[dict] = []          # files Lucy delivered this turn (kept with her reply)
         # Parse voice_mode from form field (string "true" or "false")
         voice_mode_bool = voice_mode and voice_mode.lower() == "true"
         try:
@@ -2270,19 +1586,18 @@ async def chat_endpoint(
                         parsed = json.loads(chunk_data)
                         if "content" in parsed:
                             full_response += parsed["content"]
+                        elif parsed.get("media"):
+                            att = await asyncio.to_thread(_ingest_generated_media, parsed["media"], bool(voice_mode_bool))
+                            if att and not any((att.get("sha") and att.get("sha") == m.get("sha")) or
+                                               (att.get("path") and att.get("path") == m.get("path")) for m in media_atts):
+                                media_atts.append(att)
                     except json.JSONDecodeError:
                         pass
                 yield event_data
 
             # Store assistant response in session history (including any media markers)
-            if full_response.strip():
-                stored_response = full_response
-                # Check for media references in the tool results
-                for tool_result in messages:
-                    if tool_result.get("role") == "tool" and tool_result.get("content", "").startswith("MEDIA:"):
-                        media_path = tool_result["content"].split(" ", 1)[0].replace("MEDIA:", "")
-                        stored_response += f"\nMEDIA:{media_path}"
-                _append_message(session_id, "assistant", stored_response)
+            if full_response.strip() or media_atts:
+                _append_message(session_id, "assistant", full_response, media_atts)
                 # Append memory confirmation UI to the streamed response if a fact was detected
                 if memory_fact and session_id not in _agent_saved_turn:
                     confirmation = render_confirmation(memory_fact, session_id)
@@ -2300,7 +1615,7 @@ async def chat_endpoint(
             try:
                 partial = full_response.strip()
                 note = "[Response interrupted by the user.]"
-                _append_message(session_id, "assistant", f"{partial}\n\n{note}" if partial else note)
+                _append_message(session_id, "assistant", f"{partial}\n\n{note}" if partial else note, media_atts)
             except Exception as e:
                 logger.error(f"Failed to save interrupted reply: {e}")
             raise
@@ -2712,6 +2027,20 @@ async def serve_js():
     return HTMLResponse(content=js, media_type="application/javascript")
 
 
+@app.get("/assets/logo/{name}")
+async def serve_logo(name: str):
+    """Serve the Lucy logo for the chat UI from Lucy_Core/assets/logo/ (public, like chat.css / chat.js)."""
+    logo_dir = (_paths.ROOT / "assets" / "logo").resolve()
+    path = (logo_dir / name).resolve()
+    try:
+        path.relative_to(logo_dir)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path outside the logo folder")
+    if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".svg"} or not path.is_file():
+        raise HTTPException(status_code=404, detail="Logo not found")
+    return FileResponse(path)
+
+
 @app.get("/api/file/{path:path}")
 async def serve_file(path: str, _: bool = Depends(verify_api_key)):
     """Serve a file from the safe root for the frontend to download/view."""
@@ -2945,7 +2274,7 @@ async def model_metrics(_: bool = Depends(verify_api_key)):
 @app.get("/api/metrics/session")
 async def session_metrics(_: bool = Depends(verify_api_key)):
     """Returns session storage statistics for diagnostics."""
-    sessions = _list_sessions_db()
+    sessions = _list_sessions_db(include_messages=False)
     return {
         "active_sessions": len(sessions),
         "total_messages": sum(s["message_count"] for s in sessions.values()),
@@ -2954,9 +2283,11 @@ async def session_metrics(_: bool = Depends(verify_api_key)):
 
 
 @app.get("/api/sessions")
-async def list_sessions(_: bool = Depends(verify_api_key)):
-    """Returns all sessions with metadata for the sidebar."""
-    return {"sessions": _list_sessions_db()}
+async def list_sessions(messages: int = 0, _: bool = Depends(verify_api_key)):
+    """Returns the sessions for the sidebar (metadata only; ?messages=1 adds every message).
+
+    Sessions without any message are not listed: a "New Session" only exists once you write in it."""
+    return {"sessions": _list_sessions_db(include_messages=bool(messages), hide_empty=True)}
 
 
 @app.post("/api/sessions")
@@ -3268,11 +2599,23 @@ async def set_timezone_setting(request: Request, _ = Depends(verify_api_key)):
 
 
 @app.get("/api/sessions/{session_id}")
-async def get_session(session_id: str, _: bool = Depends(verify_api_key)):
-    """Returns full message history for a specific session."""
+async def get_session(session_id: str, request: Request, _: bool = Depends(verify_api_key)):
+    """Full message history (with attachments) of one session.
+
+    Sent with an ETag, so reopening a session you already loaded costs a tiny "304 Not Modified"."""
     if not _session_exists(session_id):
-        return {"session_id": session_id, "messages": []}
-    return {"session_id": session_id, "messages": _get_messages(session_id)}
+        return {"session_id": session_id, "title": "New Session", "messages": []}
+    with _db_lock:
+        meta = _conn.execute(
+            "SELECT s.title AS title, COUNT(m.rowid) AS n, COALESCE(MAX(m.rowid), 0) AS last "
+            "FROM sessions s LEFT JOIN messages m ON m.session_id = s.session_id WHERE s.session_id = ?",
+            (session_id,)).fetchone()
+    etag = 'W/"%d-%d-%d-%08x"' % (meta["n"], meta["last"], _library.rev, zlib.crc32((meta["title"] or "").encode("utf-8")))
+    headers = {"ETag": etag, "Cache-Control": "private, no-cache"}      # no-cache = always revalidate (cheap)
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    return JSONResponse({"session_id": session_id, "title": meta["title"], "messages": _get_messages_full(session_id)},
+                        headers=headers)
 
 
 @app.delete("/api/sessions/{session_id}")

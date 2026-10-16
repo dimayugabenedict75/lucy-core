@@ -265,3 +265,44 @@ def write_file(path: Path, content: str, project_root: Path) -> str:
         return f"Error: could not write {path.as_posix()}: {e}"
     return (f"Written {len(content)} characters to {path.as_posix()}."
             + (f" Previous version backed up ({bak.name})." if bak else ""))
+
+
+# ----------------------------------------------------------------------------------- "did you mean"
+_SKIP_DIRS = {".git", "node_modules", "__pycache__", "backups", "models", ".venv", "venv", "cache", "tmp"}
+
+
+def suggest_paths(file_path: str, project_root: Path, limit: int = 5, max_files: int = 8000) -> list[str]:
+    """Files in the project whose name is the same as / close to what the model typed.
+
+    A wrong path is the most common reason a read/edit/send fails; naming the real file lets the model fix it
+    in the next call instead of giving up."""
+    name = Path(str(file_path).replace("\\", "/")).name.lower()
+    if not name:
+        return []
+    scored, seen = [], 0
+    for root, dirs, files in os.walk(project_root):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
+        for f in files:
+            seen += 1
+            if seen > max_files:
+                break
+            low = f.lower()
+            score = 1.0 if low == name else difflib.SequenceMatcher(None, low, name).ratio()
+            if score >= 0.72:
+                try:
+                    rel = (Path(root) / f).relative_to(project_root).as_posix()
+                except ValueError:
+                    continue
+                scored.append((score, rel))
+        if seen > max_files:
+            break
+    scored.sort(key=lambda t: (-t[0], len(t[1])))
+    return [rel for _s, rel in scored[:limit]]
+
+
+def not_found_message(file_path: str, project_root: Path) -> str:
+    near = suggest_paths(file_path, project_root)
+    base = f"File not found: {file_path}"
+    if near:
+        return base + f". Did you mean: {', '.join(near)}?"
+    return base + ". Use find_file or list_local_files to locate it."
