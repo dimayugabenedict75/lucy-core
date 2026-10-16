@@ -53,6 +53,58 @@ PLAN_TOOL = {
     },
 }
 
+# Offered ONLY in rounds where the harness insists on a tool call (tool_choice "required"): the way out for a
+# model that really is finished, so that forcing a tool call never forces a pointless one.
+FINISH_TOOL_NAME = "finish_task"
+
+FINISH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": FINISH_TOOL_NAME,
+        "description": ("Call this ONLY when the user's whole request is completely done (or you are truly blocked "
+                        "after trying several different approaches). Put the final message for the user in `summary`."),
+        "parameters": {
+            "type": "object",
+            "properties": {"summary": {"type": "string", "description": "The final message to the user."}},
+            "required": ["summary"],
+        },
+    },
+}
+
+
+# ------------------------------------------------------------------------------------ what was asked for
+_NEG = re.compile(r"\b(?:don'?t|do\s+not|dont|no\s+need(?:\s+to)?|without|never|stop|instead\s+of)\b.{0,25}"
+                  r"\b(?:send|attach|edit|change|modify|update|patch|fix)", re.IGNORECASE)
+_QUESTION_START = re.compile(r"^\W*(?:how|what|why|where|when|which|who|is|are|was|were|does|do|did|should|"
+                             r"could\s+you\s+explain|explain)\b", re.IGNORECASE)
+_SEND_VERB = re.compile(r"\b(?:send|attach|deliver)\b", re.IGNORECASE)
+_SEND_OBJ = re.compile(r"\b(?:file|files|doc|docs|document|documents|pdf|docx|xlsx|csv|zip|image|images|picture|"
+                       r"photo|screenshot|attachment|it|them|this|that|report|paper|result|results)\b", re.IGNORECASE)
+_EDIT_VERB = re.compile(r"\b(?:edit|patch|modify|update|fix|rewrite|refactor|change|replace|implement|append|"
+                        r"insert|rename|correct|add)\b", re.IGNORECASE)
+_EDIT_OBJ = re.compile(r"(?:\bfiles?\b|\.\w{1,5}\b|\bcode\b|\bfunction\b|\bclass\b|\bmethod\b|\bscript\b|"
+                       r"\bmodule\b|\bconfig\w*\b|\bloop\b|\bendpoint\b|\bbug\b|\bpersona\b|\bprompt\b|"
+                       r"\breadme\b|\bparagraph\b|\bsection\b|\bdocument\b|\bagent\b|\bharness\b)", re.IGNORECASE)
+
+
+def expected_actions(user_text: str) -> list[tuple[str, frozenset]]:
+    """What the user's message explicitly asks the agent to DO with a tool -> [(label, tools that would do it)].
+
+    Deliberately narrow (file sending / file editing are what used to get dropped mid-task); a nudge built on
+    this is capped, so a wrong guess costs at most one extra round."""
+    t = (user_text or "").strip()
+    if not t or _NEG.search(t) or (_QUESTION_START.match(t) and "please" not in t.lower()):
+        return []
+    out = []
+    if "sticker" in t.lower() and _SEND_VERB.search(t):
+        out.append(("send a sticker", frozenset({"send_sticker"})))
+    elif _SEND_VERB.search(t) and _SEND_OBJ.search(t):
+        out.append(("send the file", frozenset({"send_file"})))
+    if _EDIT_VERB.search(t) and _EDIT_OBJ.search(t):
+        out.append(("change the file", frozenset({"edit_local_file", "write_local_file", "run_shell_command"})))
+    return out
+
+
 # ------------------------------------------------------------------------------------ text helpers
 # Emoji, pictographs, variation selectors, ZWJ, regional indicators, dingbats.
 _DECOR = re.compile(
@@ -85,6 +137,18 @@ _LEAD = (r"let me|let['’]s|i['’]ll|i will|i['’]m going to|i am going to|al
          r"i['’]m gonna|i shall|time to|now i|next,? i|first,? i|then i|i['’]ll now|i['’]m now|"
          r"i am currently|i['’]m currently|i['’]m in the process of")
 _PROMISE = re.compile(rf"\b(?:{_LEAD})\b[^.!?\n]{{0,80}}?\b(?:{_ACTION})\b", re.IGNORECASE)
+# In-progress narration is the same broken promise in a different tense: "I'm searching for X" / "I'm executing
+# find_file" / "Checking the directory now." - said, with no tool call behind it.
+_GERUND = (r"(?:search|look|check|read|open|runn|execut|list|writ|edit|updat|send|fetch|pull|find|scann|pars|patch|"
+           r"creat|generat|analyz|analys|review|grabb|download|install|fix|appl|call|invok|test|verif|locat|load|gather|"
+           r"retriev|sav|delet|renam|copy|mov|zipp|compil|build|navigat|inspect|dig|diggs)(?:ing|ying)")
+_PROGRESSIVE = re.compile(
+    rf"\b(?:i['’]m|i am)\s+(?:(?:now|just|currently|also|still|actually|first|next|then|already)\s+)*{_GERUND}\b"
+    rf"(?!\s+(?:forward|in\s+on|good|great))|"
+    rf"^\W*(?:(?:now|next|okay|ok|alright|so|then),?\s+)?{_GERUND}\s+(?!.{{0,40}}\b(?:is|are|was|were|can|will|may|should|could|would|has|have)\b)(?:[^.!?\n]|\.(?=\w)){{0,110}}[.!?…]*\s*$",
+    re.IGNORECASE)
+_TEXT_ACTION = re.compile(r"^\W*(?:\*\*)?action(?:\*\*)?\s*:", re.IGNORECASE)   # "Action: [Sticker: Focused]" - a call that never became one
+
 _OFFER = re.compile(r"\b(?:if you(?:['’]d)? (?:like|want)|would you like|want me to|shall i|should i|do you want|"
                     r"let me know|feel free)\b", re.IGNORECASE)
 _SEARCHY = re.compile(r"\b(?:search|look(?:\s+\w+){0,2}?\s+up|look\s+for|google|browse|find|query)\b", re.IGNORECASE)
@@ -123,7 +187,7 @@ def extract_queries(text: str, limit: int = 3) -> list[str]:
     return found[:limit]
 
 
-def find_promise(text: str, max_chars: int = 1600) -> Promise | None:
+def find_promise(text: str, max_chars: int = 1600, progressive: bool = True) -> Promise | None:
     """An announced-but-not-taken action at the END of a reply, else None.
 
     Only the last two sentences count, so a finished answer that merely mentions "I'll check" earlier
@@ -135,6 +199,12 @@ def find_promise(text: str, max_chars: int = 1600) -> Promise | None:
     for s in reversed(sents[-2:]):
         if s.endswith("?") or _OFFER.search(s):
             return None                       # ends by asking / offering: the user is meant to answer
+        if _TEXT_ACTION.match(s):
+            return Promise(s, "other", "action")
+        if progressive and len(text) <= 700 and s is sents[-1] and _PROGRESSIVE.search(s):
+            verb = (_PROGRESSIVE.search(s).group(0) or "").lower()
+            kind = "search" if _SEARCHY.search(s) else "other"
+            return Promise(s, kind, verb, extract_queries(s) if kind == "search" else [])
         m = _PROMISE.search(s)
         if m:
             verb = _VERB.search(s, m.start()).group(0).lower()

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import difflib
 import json
 import logging
 import re
@@ -49,8 +50,11 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 
-from lucy.server.multistep import PLAN_TOOL, PLAN_TOOL_NAME, Plan, Promise, find_promise
+from lucy.server.multistep import (FINISH_TOOL, FINISH_TOOL_NAME, PLAN_TOOL, PLAN_TOOL_NAME, Plan, Promise,
+                                   expected_actions, find_promise)
+from lucy.server.repeat_guard import RepeatGuard
 from lucy.server.text_tool_calls import TextToolCallFilter
+from lucy.tools.routing import TOOL_SEARCH_NAME, describe_tools
 
 logger = logging.getLogger("lucy.core.agent")
 
@@ -95,8 +99,15 @@ def unbacked_claim(text: str, ok_tools: set) -> tuple[str, set] | None:
     return None
 
 
+_LOCAL_HINT = re.compile(r"find_file|list_local_files|read_local_file|edit_local_file|write_local_file|"
+                         r"run_shell_command|\b(?:director(?:y|ies)|folders?|filesystem|file\s?names?|paths?)\b|"
+                         r"\b[\w\-]+\.(?:py|js|ts|md|txt|json|ya?ml|html|css|docx?|xlsx?|pdf|csv|zip|png|jpg)\b|"
+                         r"[A-Za-z]:[\\/]|/Users/|/home/", re.IGNORECASE)
+
 _FAIL_PREFIXES = ("error", "file not found", "directory not found", "image not found", "tool failed",
-                  "tool timed out", "unknown tool", "invalid arguments", "missing required")
+                  "tool timed out", "unknown tool", "invalid arguments", "missing required", "refused",
+                  "no change", "not a file", "[error", "permission denied", "access denied", "not allowed",
+                  "command failed", "traceback (most recent call last)")
 
 
 @dataclass
@@ -107,7 +118,8 @@ class Event:
 
 @dataclass
 class LoopConfig:
-    max_rounds: int = 8             # tool rounds per turn (a last tool-less round always follows)
+    max_rounds: int = 0             # SAFETY CEILING on tool rounds per turn; 0 = none. A task is never cut short by a
+                                    # round budget: it ends when it is done, when you stop it, or when it is stuck (max_stall)
     max_tokens: int = 4096          # per model call
     tool_timeout: float = 120.0     # seconds per tool call
     max_result_chars: int = 12000   # cap on one tool result fed back to the model
@@ -117,15 +129,20 @@ class LoopConfig:
     connect_timeout: float = 5.0
     ready_wait_s: float = 300.0     # how long to wait for a loading / crashed model
     http_retries: int = 2
-    max_empty_retries: int = 2
-    max_continuations: int = 2
-    max_repeat_calls: int = 3       # identical read-only repeats before forcing an answer
-    max_tool_errors: int = 8        # failed tool calls in one turn before forcing an answer
+    max_empty_retries: int = 4
+    max_continuations: int = 6
+    max_repeat_calls: int = 3       # identical read-only repeats before the "use what you have" push gets firm
+    max_tool_errors: int = 8        # (kept for compatibility; failures never end a turn - they trigger workarounds)
     narration_guard: bool = True
-    max_promise_nudges: int = 2     # broken promises in a row: nudge, then (2nd) run the search ourselves, then give up
+    max_promise_nudges: int = 1     # after this many nudges the harness makes the call itself (constrained JSON request)
     max_auto_acts: int = 2          # times per turn the harness may run an announced search itself
     plan_tool: bool = True          # offer the update_plan checklist tool
-    max_plan_nudges: int = 2        # "your plan still has pending steps" reminders per turn
+    max_plan_nudges: int = 2        # after this many reminders the next round REQUIRES a tool call
+    max_stall: int = 30             # consecutive rounds with no progress (only failures / repeats / nudges) -> honest report
+    max_repeat_trips: int = 4       # times the stream may be cut for repeating itself before the turn reports and ends
+    max_cover_nudges: int = 2       # "you were asked to send/edit a file but no tool did" reminders per turn
+    max_idle: int = 8               # consecutive rounds with NO tool call (nudges that were ignored, even when a tool
+                                    # call was required) before the turn reports honestly instead of nudging forever
 
 
 @dataclass
@@ -134,6 +151,9 @@ class RoundResult:
     tool_calls: list = field(default_factory=list)      # [{"id","name","arguments"(str)}]
     finish_reason: str | None = None
     emitted: bool = False
+    degenerate: bool = False        # the model started repeating itself and the stream was cut
+    raw: str = ""                   # what the model wrote, before repeated sentences were removed (for judging it)
+    held: str = ""                  # visible text withheld while the turn is in "push" mode (shown only if it is the answer)
 
 
 @dataclass
@@ -162,6 +182,21 @@ class TurnState:
     auto_acts: int = 0              # searches the harness ran on the model's behalf
     auto_calls: list = field(default_factory=list)
     plan: Plan = field(default_factory=Plan)
+    search_updates: int = 0         # tool_search calls this turn (bookkeeping, capped like plan updates)
+    # --- persistence: keep going until done, find a way round blockers ---
+    stall: int = 0                  # consecutive rounds with no real progress
+    idle: int = 0                   # consecutive rounds without any tool call (ignored nudges)
+    progress: bool = False          # set by a tool call that succeeded with something new this round
+    force_tool: bool = False        # next round is a harness-made tool call (grammar-constrained, see _forced_round)
+    forced_broken: bool = False     # the server can't do constrained output: fall back to tool_choice=required / nudges
+    release_held: bool = False      # the held text is real (e.g. a reply cut by the length limit): show it
+    required_broken: bool = False   # the server rejected tool_choice=required: use nudges only
+    anti_repeat: bool = False       # sampling penalties on (after the model repeated itself)
+    repeat_trips: int = 0
+    cover_nudges: int = 0
+    wanted: list = field(default_factory=list)  # [(label, tools)] the user explicitly asked for
+    sig_failed: dict = field(default_factory=dict)   # (tool, args) -> (times failed, epoch, message)
+    guard: RepeatGuard = field(default_factory=RepeatGuard)
 
 
 class _Retry(Exception):
@@ -245,11 +280,14 @@ class AgentLoop:
     def __init__(self, *, brain, tools: list[dict], execute: Callable[[str, dict], Awaitable[str]],
                  activity_for: Callable[[str, dict], str], count_tokens: Callable[[str], int],
                  temperature: float, cfg: LoopConfig | None = None,
-                 trace: Callable[[dict], None] | None = None, session_id: str | None = None):
+                 trace: Callable[[dict], None] | None = None, session_id: str | None = None,
+                 tool_catalog: Any = None, on_tools_added: Callable[[list], None] | None = None):
         self.cfg = cfg or LoopConfig()
+        self.tool_catalog = tool_catalog          # optional ToolCatalog: tool_search + auto-adding tools not shown this turn
+        self.on_tools_added = on_tools_added      # called with the new tool names (api.py remembers them for the next turns)
         if self.cfg.plan_tool and not any(t.get("function", {}).get("name") == PLAN_TOOL_NAME for t in tools):
             tools = list(tools) + [PLAN_TOOL]
-        self.brain, self.tools, self.execute = brain, tools, execute
+        self.brain, self.tools, self.execute = brain, list(tools), execute      # own copy: tools can be added mid-turn
         self.activity_for, self.count, self.temperature = activity_for, count_tokens, temperature
         self._trace_cb, self.session_id = trace, session_id
         self.schemas = {t["function"]["name"]: t["function"].get("parameters", {}) or {}
@@ -259,6 +297,29 @@ class AgentLoop:
         except Exception:
             self._tools_tokens = 4000
 
+    def _add_tools(self, specs) -> list[str]:
+        """Make more tools available from now on (tool_search / auto-add). Returns the names that were new."""
+        added = []
+        for t in specs:
+            fn = t.get("function") or {}
+            name = fn.get("name")
+            if not name or name in self.schemas:
+                continue
+            self.tools.append(t)
+            self.schemas[name] = fn.get("parameters", {}) or {}
+            added.append(name)
+        if added:
+            try:
+                self._tools_tokens = self.count(json.dumps(self.tools))
+            except Exception:
+                pass
+            if self.on_tools_added:
+                try:
+                    self.on_tools_added(list(added))
+                except Exception:
+                    pass
+        return added
+
     def _trace(self, **kw) -> None:
         if self._trace_cb:
             try:
@@ -267,88 +328,281 @@ class AgentLoop:
                 pass
 
     # =========================================================================== main loop
+    @staticmethod
+    def _last_user_text(messages: list[dict]) -> str:
+        """The user's latest real message (not a harness note)."""
+        for m in reversed(messages):
+            if m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, list):
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+            if isinstance(c, str) and c.strip() and not c.startswith(_NOTE):
+                return c
+        return ""
+
     async def run(self, messages: list[dict]) -> AsyncIterator[Event]:
+        """Work on the user's request until it is DONE.
+
+        The turn does not end because a step budget ran out or because a tool failed. It ends when the model
+        gives a real final answer (or calls finish_task), when the user stops it, or - as a last resort - when
+        `max_stall` rounds in a row made no progress at all (then it reports honestly what it tried)."""
         cfg, st = self.cfg, TurnState()
         t0 = time.monotonic()
         finish = "ok"
+        final_rounds = 0
+        st.wanted = expected_actions(self._last_user_text(messages))
         yield Event("activity", "think")
-        hard_cap = (cfg.max_rounds + 1 + cfg.max_empty_retries + cfg.max_continuations + cfg.http_retries + 4
-                    + cfg.max_promise_nudges + cfg.max_auto_acts + cfg.max_plan_nudges)
-        while st.rounds < hard_cap:
+        while True:
             st.rounds += 1
-            final_round = st.force_final or st.rounds > cfg.max_rounds
-            if final_round and not st.force_final:
+            ceiling = bool(cfg.max_rounds) and st.rounds > cfg.max_rounds
+            stalled = st.stall >= cfg.max_stall or st.idle >= cfg.max_idle
+            if (ceiling or stalled) and not st.force_final:
                 st.force_final = True
-                messages.append({"role": "user", "content": _NOTE + (
-                    "You have used all your tool calls for this turn and cannot call any more. Do not fill "
-                    "remaining gaps with assumptions or guesses. Report only what you actually confirmed via "
-                    "tools. For anything you did not confirm, say plainly that you don't know yet and ask "
-                    "the user, rather than presenting a guess as fact.")})
+                finish = "stalled" if stalled else "ceiling"
+                why = ("You have been going around in circles: several rounds in a row made no progress. "
+                       if stalled else f"This turn reached its safety limit of {cfg.max_rounds} tool rounds. ")
+                messages.append({"role": "user", "content": _NOTE + why + (
+                    "You cannot call any more tools this turn. Do not present guesses as facts. Tell the user "
+                    "plainly: what is DONE (confirmed by tool results), what is NOT done, what blocked you and "
+                    "what you already tried, and the one concrete thing that would unblock it. They can say "
+                    "'continue' and you will pick up from there.")})
+            final_round = st.force_final
+            if final_round:
+                final_rounds += 1
+                if final_rounds > 8:                       # the closing report itself kept failing
+                    break
             self._prune(messages)
             # Every model call is announced. Retries (nudges, auto-continue, empty-reply retries) used to run
             # silently, and the UI hides its indicator once text streams in - so those rounds looked frozen.
             yield Event("activity", "think")
 
+            if final_round:
+                round_tools = []
+            elif st.force_tool and st.forced_broken and not st.required_broken:
+                round_tools = list(self.tools) + [FINISH_TOOL]
+            else:
+                round_tools = self.tools
             res: RoundResult | None = None
-            async for ev in self._round(messages, [] if final_round else self.tools, st):
-                if ev.kind == "_round":
-                    res = ev.data
-                else:
-                    yield ev
+            if st.force_tool and not st.forced_broken and not final_round and self.tools:
+                # The model keeps announcing an action instead of calling the tool. Don't ask again: have the server
+                # produce the call itself (a grammar-constrained request that can only answer with a tool call).
+                res = await self._forced_round(messages, st)
+                if res is None:
+                    st.forced_broken = True
+                    self._trace(event="forced_unavailable", round=st.rounds)
+                    if not st.required_broken:             # next best: tool_choice=required, with finish_task as the exit
+                        round_tools = list(self.tools) + [FINISH_TOOL]
+            if res is None:
+                async for ev in self._round(messages, round_tools, st):
+                    if ev.kind == "_round":
+                        res = ev.data
+                    else:
+                        yield ev
+                st.glue = False
+                if res is None:                          # fatal error already reported
+                    finish = "error"
+                    break
             st.glue = False
-            if res is None:                              # fatal error already reported
-                finish = "error"
-                break
 
             calls = [] if final_round else self._normalize_calls(res, st)
+
+            # --- the model got stuck repeating itself: the stream was cut; restart it on a different footing ---
+            if res.degenerate and not (calls and all(parse_args(c["arguments"])[0] is not None for c in calls)):
+                st.repeat_trips += 1
+                st.anti_repeat = True
+                st.stall += 1
+                st.idle += 1
+                self._trace(event="repeat_cut", round=st.rounds, trips=st.repeat_trips, dropped=st.guard.dropped)
+                if st.repeat_trips > cfg.max_repeat_trips:
+                    msg = ("I kept getting stuck repeating myself, so I stopped that train of thought. "
+                           "Tell me to continue and I'll pick the task up from where it stands.")
+                    yield Event("content", self._sep(st, msg))
+                    st.emitted_any, st.last_char = True, msg[-1:]
+                    finish = "repeat"
+                    break
+                if res.content.strip():
+                    messages.append({"role": "assistant", "content": res.content})
+                messages.append({"role": "user", "content": _NOTE + (
+                    "Give the final answer now, in two or three sentences, without restating earlier points."
+                    if final_round else
+                    "Carry on with the next concrete step of the task by calling the right tool. Write nothing "
+                    "that was already said. If the whole task is finished, give a short final answer.")})
+                if st.repeat_trips >= 2:
+                    st.force_tool = True
+                continue
+
             if calls:
+                fin = [c for c in calls if c["name"] == FINISH_TOOL_NAME]
+                if fin:
+                    others = [c for c in calls if c["name"] != FINISH_TOOL_NAME]
+                    pending = st.plan.pending()
+                    if others:
+                        calls = others                   # real work first; finish_task is ignored this round
+                    elif pending:
+                        self._reject_finish(messages, res, fin, st)
+                        st.stall += 1
+                        continue
+                    else:
+                        args, _err = parse_args(fin[0]["arguments"])
+                        summary = str((args or {}).get("summary") or "").strip()
+                        if summary:
+                            yield Event("content", self._sep(st, summary))
+                            st.emitted_any, st.last_char = True, summary[-1:]
+                        elif not st.emitted_any:
+                            yield Event("content", "Done.")
+                        break
                 if res.finish_reason == "length" and any(parse_args(c["arguments"])[0] is None for c in calls):
                     st.truncated_calls += 1
+                    st.stall += 1
                     self._trace(event="truncated_tool_call", round=st.rounds)
                     if res.content.strip():
                         messages.append({"role": "assistant", "content": res.content})
                     messages.append({"role": "user", "content": _NOTE + (
                         "Your tool call was cut off by the output limit, so it was NOT run. Redo it with a much "
-                        "smaller payload (for a large file, create it small and add the rest in several "
-                        "edit_local_file steps).")})
-                    if st.truncated_calls > 2:
-                        st.force_final = True
+                        "smaller payload. For a big file: create it small with write_local_file, then add the rest "
+                        "in several edit_local_file steps (or append pieces with run_shell_command)."
+                        + (" Do not retry the same large call again." if st.truncated_calls > 1 else ""))})
                     continue
+                st.progress = False
+                st.idle = 0
+                if res.held.strip() and not find_promise(res.held):
+                    held_out = self._sep(st, res.held)
+                    st.emitted_any, st.last_char = True, held_out[-1:]
+                    yield Event("content", held_out)
                 async for ev in self._run_tools(res, calls, messages, st):
                     yield ev
                 st.promise_streak = 0                    # it acted: the last promise (if any) was kept
-                if all(c["name"] == PLAN_TOOL_NAME for c in calls) and st.plan.updates <= 4:
-                    st.rounds -= 1                       # bookkeeping isn't work: don't spend a tool round on it
+                bookkeeping = all(c["name"] in (PLAN_TOOL_NAME, TOOL_SEARCH_NAME) for c in calls)
+                if bookkeeping and st.plan.updates <= 4 and st.search_updates <= 4:
+                    st.rounds -= 1                       # bookkeeping isn't work: don't spend a round on it
+                elif st.progress:
+                    st.stall = 0
+                    st.force_tool = False
+                else:
+                    st.stall += 1                        # failures / repeats only: the workaround hints are in the results
                 yield Event("activity", None)
                 yield Event("activity", "think")
-                if st.repeats >= cfg.max_repeat_calls or st.tool_errors >= cfg.max_tool_errors:
-                    st.force_final = True
-                    finish = "forced"
                 continue
 
+            st.release_held = False
             verdict, extra = self._judge_final(res, messages, st, final_round)
             if verdict == "retry":
+                if st.release_held and res.held.strip():       # e.g. a real answer cut by the length limit
+                    held_out = self._sep(st, res.held)
+                    st.emitted_any, st.last_char = True, held_out[-1:]
+                    yield Event("content", held_out)
+                st.stall += 1
+                st.idle += 1
                 continue
             if verdict == "auto":                        # the model keeps announcing a search: run it for it
                 auto, st.auto_calls = st.auto_calls, []
                 st.auto_acts += 1
                 self._trace(event="auto_act", round=st.rounds, calls=[(c["name"], c["arguments"][:120]) for c in auto])
+                st.progress = False
                 async for ev in self._run_tools(res, auto, messages, st):
                     yield ev
+                st.stall = 0 if st.progress else st.stall + 1
                 yield Event("activity", None)
                 yield Event("activity", "think")
                 continue
+            if verdict == "done" and res.held.strip():         # it was held back, and it is the final answer
+                held_out = self._sep(st, res.held)
+                st.emitted_any, st.last_char = True, held_out[-1:]
+                yield Event("content", held_out)
             if verdict == "fallback":
                 yield Event("content", self._sep(st, extra))
                 st.emitted_any, st.last_char = True, extra[-1:]
             break
 
         self._trace(event="turn", rounds=st.rounds, tool_calls=st.tool_calls_total, tool_errors=st.tool_errors,
-                    nudges=st.nudges, auto_acts=st.auto_acts, plan_steps=len(st.plan.steps), empty_retries=st.empty_retries, continues=st.continues,
-                    retries=st.retries, repeats=st.repeats, finish=finish,
+                    nudges=st.nudges, auto_acts=st.auto_acts, plan_steps=len(st.plan.steps), empty_retries=st.empty_retries,
+                    continues=st.continues, retries=st.retries, repeats=st.repeats, stall=st.stall,
+                    repeat_cuts=st.repeat_trips, repeats_dropped=st.guard.dropped, finish=finish,
                     ms=int((time.monotonic() - t0) * 1000))
         yield Event("metrics", {"rounds": st.rounds, "tool_calls": st.tool_calls_total,
                                 "tool_errors": st.tool_errors, "retries": st.retries})
+
+    def _reject_finish(self, messages: list[dict], res: RoundResult, fin: list[dict], st: TurnState) -> None:
+        """finish_task while plan steps are still open: answer the call (keeps the history valid) and push on."""
+        messages.append({"role": "assistant", "content": res.content, "tool_calls": [
+            {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": "{}"}} for c in fin]})
+        for c in fin:
+            messages.append({"role": "tool", "tool_call_id": c["id"], "content": (
+                "Not finished: your plan still has open steps:\n" + st.plan.render() + "\n" + _NOTE +
+                f"Do the next one now: {st.plan.next_step()}. If a step is no longer needed, mark it skipped "
+                "with update_plan.")})
+
+    # =========================================================================== a harness-made tool call
+    @staticmethod
+    def _slim_schema(s):
+        """A JSON-schema fragment cut down to what llama.cpp's schema->grammar converter reliably supports."""
+        if not isinstance(s, dict):
+            return {}
+        out = {k: s[k] for k in ("type", "enum", "required") if k in s}
+        if "properties" in s and isinstance(s["properties"], dict):
+            out["properties"] = {k: AgentLoop._slim_schema(v) for k, v in s["properties"].items()}
+            out["additionalProperties"] = False
+        if "items" in s:
+            out["items"] = AgentLoop._slim_schema(s["items"])
+        if "type" not in out and "enum" not in out and "properties" not in out:
+            out["type"] = "string"
+        return out
+
+    async def _forced_round(self, messages: list[dict], st: TurnState) -> RoundResult | None:
+        """Get a tool call out of the model NOW, whatever its chat template or the server's tool_choice support.
+
+        A separate, non-streaming request whose output is constrained by a JSON schema to be exactly one call:
+        {"tool": <one of the tools>, "arguments": {...valid for that tool...}} (or finish_task). The model still
+        decides WHAT to call - it just can't answer with prose. Returns None when the server can't do this."""
+        cfg, brain = self.cfg, self.brain
+        alts = []
+        for t in list(self.tools) + [FINISH_TOOL]:
+            fn = t["function"]
+            params = self._slim_schema(fn.get("parameters") or {"type": "object", "properties": {}})
+            params.setdefault("type", "object")
+            alts.append({"type": "object", "additionalProperties": False, "required": ["tool", "arguments"],
+                         "properties": {"tool": {"enum": [fn["name"]]}, "arguments": params}})
+        schema = {"anyOf": alts}
+        ask = {"role": "user", "content": _NOTE + (
+            'Reply with ONLY a JSON object that is the single tool call to make right now: '
+            '{"tool": "<tool name>", "arguments": {...}}. Pick the tool that does the next step of what the user '
+            'asked (if a tool failed earlier, use a different approach). Use "finish_task" with a "summary" only '
+            "if the user's whole request is already completely done.")}
+        base = {"model": brain.model, "messages": list(messages) + [ask], "stream": False,
+                "temperature": 0.2, "max_tokens": min(cfg.max_tokens, 4096), **brain.extras()}
+        for k in ("repeat_penalty", "frequency_penalty", "presence_penalty", "dry_multiplier"):
+            base.pop(k, None)                       # sampling penalties would damage JSON
+        variants = [{"response_format": {"type": "json_schema", "json_schema": {"name": "tool_call", "schema": schema}}},
+                    {"json_schema": schema}]
+        try:
+            timeout = httpx.Timeout(cfg.http_timeout, connect=cfg.connect_timeout)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                for extra in variants:
+                    resp = await client.post(f"{brain.base_url}/chat/completions", json={**base, **extra})
+                    if resp.status_code != 200:
+                        continue
+                    text = ((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+                    try:
+                        obj = json.loads(text)
+                    except ValueError:
+                        continue
+                    name, args = obj.get("tool"), obj.get("arguments")
+                    if name not in {t["function"]["name"] for t in self.tools} | {FINISH_TOOL_NAME} \
+                            or not isinstance(args, dict):
+                        continue
+                    self._trace(event="forced_call", round=st.rounds, tool=name,
+                                args=json.dumps(args, ensure_ascii=False)[:200])
+                    res = RoundResult(finish_reason="tool_calls")
+                    res.tool_calls = [{"id": f"forced_{st.rounds}", "name": name,
+                                       "arguments": json.dumps(args, ensure_ascii=False)}]
+                    return res
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                                  # noqa: BLE001 - fall back to the normal path
+            logger.warning(f"forced tool call failed: {e}")
+        return None
 
     # =========================================================================== one model call
     def _sep(self, st: TurnState, text: str) -> str:
@@ -371,11 +625,25 @@ class AgentLoop:
             attempt += 1
             res, tcf = RoundResult(), TextToolCallFilter(tools)
             first_visible, announced_call = True, False
+            st.guard.begin_round()
+            dropped_before = st.guard.dropped
+            # While the harness is pushing the model to act (it announced something and stopped, left plan steps open,
+            # repeated itself...), its text is narration of the same intention. Hold it back: it is shown only if it
+            # turns out to be the actual answer. Otherwise the chat fills with "I'm going to..." paragraphs.
+            hold = bool(tools) and (st.promise_streak > 0 or st.force_tool or st.plan.nudges > 0 or st.cover_nudges > 0
+                                    or st.claim_nudges > 0 or st.repeat_trips > 0)
             payload = {"model": brain.model, "messages": messages, "temperature": self.temperature,
                        "max_tokens": cfg.max_tokens, "tools": tools, "stream": True,
                        "stream_options": {"include_usage": True}, **brain.extras()}
             if tools:
-                payload["tool_choice"] = "auto"
+                # After the model has twice announced an action without doing it, the round MUST contain a tool call
+                # (finish_task is the way out when it really is finished).
+                payload["tool_choice"] = "required" if (st.force_tool and not st.required_broken) else "auto"
+            if st.anti_repeat:                  # it repeated itself: discourage that (llama.cpp ignores unknown keys)
+                payload["repeat_penalty"] = max(float(payload.get("repeat_penalty", 1.0)), 1.1)
+                payload["frequency_penalty"] = max(float(payload.get("frequency_penalty", 0.0)), 0.2)
+                payload["dry_multiplier"] = max(float(payload.get("dry_multiplier", 0.0)), 0.5)
+                payload["dry_base"], payload["dry_allowed_length"] = 1.75, 4     # long runs only: JSON stays intact
             failure: _Retry | None = None
             try:
                 timeout = httpx.Timeout(cfg.http_timeout, connect=cfg.connect_timeout)
@@ -403,11 +671,19 @@ class AgentLoop:
                                 res.content += piece
                                 piece = tcf.feed(piece)
                                 if piece:
-                                    out = self._sep(st, piece) if first_visible else piece
-                                    first_visible = False
-                                    res.emitted = True
-                                    self._note_emitted(st, out)
-                                    yield Event("content", out)
+                                    piece = st.guard.feed(piece)      # drops sentences it already said
+                                    if piece and hold:
+                                        res.held += piece
+                                        res.emitted = True
+                                    elif piece:
+                                        out = self._sep(st, piece) if first_visible else piece
+                                        first_visible = False
+                                        res.emitted = True
+                                        self._note_emitted(st, out)
+                                        yield Event("content", out)
+                                    if st.guard.tripped:               # stuck in a loop: stop the generation now
+                                        res.degenerate, res.finish_reason = True, "repeat"
+                                        break
                             for tc in delta.get("tool_calls") or []:
                                 if not announced_call:      # the model is now writing a tool call (can take a while,
                                     announced_call = True   # and no text is streaming): keep the UI "busy"
@@ -445,7 +721,18 @@ class AgentLoop:
                     else:
                         logger.warning("Unparseable text tool call shown as text: " + tcf.held_text[:200])
                         rest = tcf.held_text
-                if rest:
+                if not res.degenerate:
+                    rest = (st.guard.feed(rest) if rest else "") + st.guard.flush()
+                else:
+                    rest = ""
+                res.raw = res.content
+                if st.guard.dropped > dropped_before:
+                    res.content = st.guard.round_text()               # what the user actually saw, for the history
+                    self._trace(event="repeat_dropped", round=st.rounds, n=st.guard.dropped - dropped_before)
+                if rest and hold:
+                    res.held += rest
+                    res.emitted = True
+                elif rest:
                     out = self._sep(st, rest) if first_visible else rest
                     res.emitted = True
                     self._note_emitted(st, out)
@@ -491,6 +778,10 @@ class AgentLoop:
             if failure.kind == "transient" and attempt <= cfg.http_retries:
                 st.retries += 1
                 await asyncio.sleep(1.5 * attempt)
+                continue
+            if failure.kind == "fatal" and payload.get("tool_choice") == "required" and not st.required_broken:
+                st.required_broken, st.force_tool = True, False       # this server can't force it: nudges only
+                self._trace(event="required_unsupported", status=failure.status)
                 continue
             msg = {"error": "Failed to connect to brain", "detail": failure.detail[:500]}
             if failure.status:
@@ -540,12 +831,13 @@ class AgentLoop:
 
         for c in prepared:
             name = c["name"]
-            yield Event("activity", "think" if name == PLAN_TOOL_NAME else self.activity_for(name, c["args"] or {}))
+            yield Event("activity", "think" if name in (PLAN_TOOL_NAME, TOOL_SEARCH_NAME) else self.activity_for(name, c["args"] or {}))
             t0 = time.monotonic()
             result, ok, flag = await self._execute_one(c, st)
             ms = int((time.monotonic() - t0) * 1000)
             self._trace(event="tool", round=st.rounds, tool=name, ok=ok, flag=flag, ms=ms,
-                        result_chars=len(result), args=json.dumps(c["args"] or {}, ensure_ascii=False)[:300])
+                        result_chars=len(result), args=json.dumps(c["args"] or {}, ensure_ascii=False)[:300],
+                        error=("" if ok else result[:240]))
             if ok:
                 st.ok_tools.add(name)
             model_view = result
@@ -559,6 +851,43 @@ class AgentLoop:
             if result.startswith("MEDIA:"):
                 yield Event("media", result.split(" ", 1)[0].replace("MEDIA:", ""))
 
+    # What to try when a tool is blocked. The loop never gives up on a task because a tool failed: it hands
+    # the model concrete ways round the problem, escalating the longer the blocker lasts.
+    _PLAYBOOK = {
+        "edit_local_file": "read_local_file the exact lines (use search / start_line) and retry with a smaller, exact "
+                           "old_string; or rewrite the whole file with write_local_file; or apply the change with "
+                           "run_shell_command (a short Python script or sed). Binary formats (.docx .xlsx .pdf) cannot "
+                           "be text-edited: generate the new file with a script instead.",
+        "write_local_file": "check the folder with list_local_files, try a path inside the Lucy Core folder, or write "
+                            "the file with run_shell_command (a short Python script).",
+        "read_local_file": "find the right path with find_file / list_local_files, read a slice with search or "
+                           "start_line/end_line, or use run_shell_command as a fallback.",
+        "send_file": "confirm the real path with find_file / list_local_files; a folder must be zipped first "
+                     "(run_shell_command) and the zip sent; a file outside the allowed folder must be copied into the "
+                     "Lucy Core folder first (run_shell_command) and the copy sent.",
+        "web_search": "rephrase with different keywords, search for a more specific part of the question, or open a "
+                      "known page with web_extract.",
+        "web_extract": "try another result from web_search, or search for a cached / alternative source of the page.",
+        "run_shell_command": "check the syntax for this operating system, split the command into smaller steps, or do "
+                             "it with a short Python script (run_shell_command python -c ...).",
+        "create_google_doc": "the Google connection may be unavailable: write the content to a local file with "
+                             "write_local_file and deliver it with send_file instead.",
+        "list_drive_files": "the Google connection may be unavailable: work with local files instead.",
+        "get_doc_content": "the Google connection may be unavailable: ask for the content or use a local copy.",
+    }
+
+    def _workaround(self, name: str, streak: int) -> str:
+        if streak < 2:
+            return ""
+        how = self._PLAYBOOK.get(name, "reach the same goal with a different tool or a different method")
+        text = (f"\n{_NOTE}Blocked: {name} has failed {streak} times in a row. Do NOT stop and do NOT repeat the "
+                f"same call. Work around it - {how}")
+        if streak >= 4:
+            text += (" Keep going until the task is done. Only after you have tried at least two genuinely "
+                     "different approaches may you tell the user what is blocking you - and even then finish every "
+                     "part of the task that you can.")
+        return text
+
     async def _execute_one(self, c: dict, st: TurnState) -> tuple[str, bool, str]:
         name, args = c["name"], c["args"]
         cfg = self.cfg
@@ -566,23 +895,38 @@ class AgentLoop:
         def fail(text: str, flag: str) -> tuple[str, bool, str]:
             st.tool_errors += 1
             st.fail_streak[name] = st.fail_streak.get(name, 0) + 1
-            if st.fail_streak[name] >= 2:
-                text += (f"\n{_NOTE}This is failure #{st.fail_streak[name]} in a row for {name}. Do not repeat the "
-                         "same call; change the arguments or approach, or tell the user what is blocking you.")
-            return text, False, flag
+            return text + self._workaround(name, st.fail_streak[name]), False, flag
 
         if c["parse_error"]:
             return fail(f"Invalid arguments for {name}: {c['parse_error']}. Nothing was run. "
                         "Call it again with a valid JSON object.", "bad_json")
+        if name not in self.schemas and self.tool_catalog is not None and name != TOOL_SEARCH_NAME:
+            spec = self.tool_catalog.get(name)                # a real tool that just wasn't shown this turn: add it, run it
+            if spec is not None and self._add_tools([spec]):
+                self._trace(event="tool_auto_added", round=st.rounds, tool=name)
         if name not in self.schemas:
-            return fail(f"Unknown tool '{name}'. Nothing was run. Available tools: "
-                        f"{', '.join(sorted(self.schemas))}.", "unknown_tool")
+            close = difflib.get_close_matches(name, list(self.schemas), n=3, cutoff=0.5)
+            return fail(f"Unknown tool '{name}'. Nothing was run. "
+                        + (f"Did you mean: {', '.join(close)}? " if close else "")
+                        + f"Available tools: {', '.join(sorted(self.schemas))}.", "unknown_tool")
         args = coerce_args(args, self.schemas[name])
         c["args"] = args
         missing = [k for k in (self.schemas[name].get("required") or []) if args.get(k) is None]
         if missing:
             return fail(f"Missing required argument(s) for {name}: {', '.join(missing)}. Nothing was run. "
                         "Call it again with all required arguments.", "missing_args")
+
+        if name == TOOL_SEARCH_NAME:
+            st.search_updates += 1
+            query = str(args.get("query") or "")
+            found = self.tool_catalog.search(query) if self.tool_catalog is not None else []
+            added = self._add_tools(found)
+            self._trace(event="tool_search", round=st.rounds, query=query[:80], found=[t["function"]["name"] for t in found], added=added)
+            if found:
+                return (f"Now available (call them directly):\n{describe_tools(found)}\n"
+                        f"{_NOTE}Use the right one for the user's request now."), True, ""
+            have = ", ".join(sorted(n for n in self.schemas if n != TOOL_SEARCH_NAME))
+            return f"No tool matches '{query}'. Tools you already have: {have}.", True, ""
 
         if name == PLAN_TOOL_NAME:
             err = st.plan.set(args.get("steps"))
@@ -593,22 +937,34 @@ class AgentLoop:
                     else "All steps are finished. Give the user your final answer.")
             return f"Plan saved:\n{st.plan.render()}\n{_NOTE}{tail}", True, ""
 
-        key = (name, json.dumps(args, sort_keys=True, default=str))
+        sig = (name, json.dumps(args, sort_keys=True, default=str))
+        key = sig
         if name in READ_ONLY_TOOLS and key in st.cache and st.cache[key][1] == st.epoch:
             st.repeats += 1
-            return (f"{_NOTE}You already ran this exact call this turn; reusing its result. Don't repeat it - "
-                    f"answer with it or try something different.\n{st.cache[key][0]}"), True, "repeat"
+            push = ("You keep re-reading the same thing: you already HAVE this information. Use it to do the next "
+                    "step of the task now (edit, write, send...) instead of reading again."
+                    if st.repeats >= cfg.max_repeat_calls else
+                    "Don't repeat it - use the result to continue with the task, or try something different.")
+            return (f"{_NOTE}You already ran this exact call this turn; reusing its result. {push}\n"
+                    f"{st.cache[key][0]}"), True, "repeat"
+        prev = st.sig_failed.get(sig)
+        if prev and prev[0] >= 2 and prev[1] == st.epoch:
+            return fail(f"This exact call already failed {prev[0]} times with: {prev[2]}\n{_NOTE}It was not run "
+                        "again, because nothing has changed since. Change the arguments or the approach.", "repeat_fail")
 
         try:
             raw = await asyncio.wait_for(self.execute(name, args), timeout=cfg.tool_timeout)
         except asyncio.TimeoutError:
+            st.sig_failed[sig] = ((prev[0] if prev else 0) + 1, st.epoch, "timed out")
             return fail(f"Tool timed out after {int(cfg.tool_timeout)}s: {name}. "
                         "Try a smaller or different request.", "timeout")
         except asyncio.CancelledError:
             raise
         except Exception as e:                              # noqa: BLE001 - a tool must never kill the turn
             logger.exception(f"Tool {name} raised")
-            return fail(f"Tool failed: {name} raised {type(e).__name__}: {e}", "exception")
+            msg = f"Tool failed: {name} raised {type(e).__name__}: {e}"
+            st.sig_failed[sig] = ((prev[0] if prev else 0) + 1, st.epoch, msg[:300])
+            return fail(msg, "exception")
 
         result = "(no output)" if raw is None else raw if isinstance(raw, str) else json.dumps(raw, default=str)
         result = self._cap(result)
@@ -616,8 +972,10 @@ class AgentLoop:
             if name == "edit_local_file" and "not found in file" in result:
                 result += (f"\n{_NOTE}Re-read the file with read_local_file and copy old_string exactly, "
                            "including whitespace and line breaks.")
+            st.sig_failed[sig] = ((prev[0] if prev else 0) + 1, st.epoch, result[:300])
             return fail(result, "tool_error")
         st.fail_streak[name] = 0
+        st.progress = True
         if name in READ_ONLY_TOOLS:
             st.cache[key] = (result, st.epoch)
         else:
@@ -636,12 +994,18 @@ class AgentLoop:
     # =========================================================================== replies
     def _judge_final(self, res: RoundResult, messages: list[dict], st: TurnState,
                      final_round: bool) -> tuple[str, str]:
-        """No tool calls this round. Decide: done / retry (messages were extended) / fallback text."""
-        cfg, text = self.cfg, res.content
+        """No tool calls this round. Decide: done / retry (messages were extended) / fallback text.
+
+        A plain reply only ends the turn when nothing is left undone. Every "not yet" below pushes the model on
+        (and from the 3rd push the next round MUST call a tool) instead of giving up."""
+        cfg = self.cfg
+        text = res.raw or res.content          # judge what the model meant, even if repeated sentences were hidden
+        hist = res.content if res.content.strip() else text      # what goes into the conversation history
         if res.finish_reason == "length" and text.strip() and st.continues < cfg.max_continuations:
             st.continues += 1
             st.glue = True
-            messages.append({"role": "assistant", "content": text})
+            st.release_held = True
+            messages.append({"role": "assistant", "content": hist})
             messages.append({"role": "user", "content": _NOTE + "Your reply was cut off by the output limit. "
                              "Continue exactly where you stopped, without repeating anything."})
             self._trace(event="continue", n=st.continues)
@@ -650,7 +1014,8 @@ class AgentLoop:
             if st.empty_retries < cfg.max_empty_retries:
                 st.empty_retries += 1
                 messages.append({"role": "user", "content": _NOTE + "Your last reply was empty. " + (
-                    "Use the tool results above to answer the user now, in plain text." if st.tool_calls_total
+                    "Use the tool results above to continue the task: call the next tool, or if everything is "
+                    "done, answer the user in plain text." if st.tool_calls_total
                     else "Answer the user's last message in plain text.")})
                 self._trace(event="empty_reply_retry", n=st.empty_retries)
                 return "retry", ""
@@ -660,14 +1025,14 @@ class AgentLoop:
                 return "fallback", ("I ran the tools but couldn't put a proper reply together. The last result was:\n\n"
                                     + st.last_result[:800])
             return "fallback", "I didn't get a reply from the model. Please try again."
-        if cfg.narration_guard and st.claim_nudges < 1 and self.tools:
+        if cfg.narration_guard and st.claim_nudges < 2 and self.tools:
             claim = unbacked_claim(text, st.ok_tools)
             if claim:
                 sentence, tools = claim
                 st.claim_nudges += 1
                 names = "/".join(sorted(tools))
                 can = "Make the tool call now, or " if not final_round else "You cannot call tools any more this turn, so "
-                messages.append({"role": "assistant", "content": text})
+                messages.append({"role": "assistant", "content": hist})
                 messages.append({"role": "user", "content": _NOTE + (
                     f"You said: \"{sentence[:140]}\" - but no {names} call succeeded this turn, so that did not "
                     f"happen. {can}correct your statement honestly. (If it really was done in an earlier turn, say "
@@ -680,32 +1045,56 @@ class AgentLoop:
         if promise and ({"set_reminder", "schedule_task"} & st.ok_tools) and re.search(r"remind|schedul|follow", text, re.IGNORECASE):
             promise = None                                     # "I'll remind you" after set_reminder() already ran
         if promise:
-            return self._broken_promise(promise, text, messages, st)
+            return self._broken_promise(promise, hist, messages, st)
         pending = st.plan.pending()
-        if pending and not final_round and st.plan.nudges < cfg.max_plan_nudges and self.tools:
+        if pending and not final_round and self.tools:
             st.plan.nudges += 1
-            messages.append({"role": "assistant", "content": text})
+            st.nudges += 1
+            messages.append({"role": "assistant", "content": hist})
             messages.append({"role": "user", "content": _NOTE + (
                 "Your plan still has unfinished steps:\n" + st.plan.render() + "\n"
                 f"Do the next one now: {pending[0]['text']}. Call its tool; don't just describe it. If a step is no "
                 "longer needed, mark it skipped with update_plan. Only answer once every step is done or skipped.")})
-            self._trace(event="plan_nudge", pending=len(pending))
+            if st.plan.nudges > cfg.max_plan_nudges:
+                st.force_tool = True
+            self._trace(event="plan_nudge", pending=len(pending), forced=st.force_tool)
             return "retry", ""
+        # The user explicitly asked for something a tool must do (send a file, edit a file) and none did.
+        if st.wanted and not final_round and self.tools and st.cover_nudges < cfg.max_cover_nudges \
+                and not text.rstrip().endswith("?"):
+            todo = [(label, tools) for label, tools in st.wanted
+                    if not (tools & st.ok_tools) and any(t in self.schemas for t in tools)]
+            if todo:
+                st.cover_nudges += 1
+                st.nudges += 1
+                label, tools = todo[0]
+                names = " / ".join(sorted(t for t in tools if t in self.schemas))
+                messages.append({"role": "assistant", "content": hist})
+                messages.append({"role": "user", "content": _NOTE + (
+                    f"The user asked you to {label}, but no {names} call has succeeded this turn, so that is not "
+                    "done yet. Do it now with the tool. If something blocks you, work around it (another path, "
+                    "another method) instead of stopping; if the request was truly already satisfied, say so "
+                    "in one sentence.")})
+                self._trace(event="cover_nudge", wanted=label)
+                return "retry", ""
         return "done", ""
 
     def _broken_promise(self, promise: Promise, text: str, messages: list[dict], st: TurnState) -> tuple[str, str]:
-        """The reply ended with "I'll do X" and no tool call. Escalate instead of letting the turn die:
+        """The reply ended with "I'll do X" and no tool call. Never let the turn die on that:
 
           1st time  nudge            - tell the model to call the tool now
-          2nd time  auto-act         - if it announced a web search, the harness runs it (queries from the
-                                       text, else the user's last message); otherwise a firmer nudge
-          3rd time  auto-act / give up honestly (never leave the user with a silent, unfulfilled promise)
+          2nd time  auto-act         - if it announced a web search, the harness runs it (queries from the text,
+                                       else the user's last message); otherwise a firmer nudge
+          3rd+ time REQUIRED         - the next round must contain a tool call (tool_choice=required); finish_task
+                                       is offered as the exit for a model that really is done
         """
         cfg = self.cfg
         st.promise_streak += 1
         n = st.promise_streak
         self._trace(event="broken_promise", n=n, kind=promise.kind, sentence=promise.sentence[:140])
-        can_auto = promise.kind == "search" and "web_search" in self.schemas and st.auto_acts < cfg.max_auto_acts
+        local = bool(_LOCAL_HINT.search(text))        # "search for repeat_guard.py in the folder" is NOT a web search
+        can_auto = (promise.kind == "search" and "web_search" in self.schemas and st.auto_acts < cfg.max_auto_acts
+                    and not local)
         if n >= 2 and can_auto:
             queries = promise.queries or [self._fallback_query(messages)]
             st.auto_calls = [{"id": f"auto_{st.rounds}_{i}", "name": "web_search", "parse_error": None,
@@ -713,17 +1102,17 @@ class AgentLoop:
                              for i, q in enumerate([q for q in queries if q][:3])]
             if st.auto_calls:
                 return "auto", ""
-        if n <= cfg.max_promise_nudges:
-            st.nudges += 1
-            firm = "" if n == 1 else (" This is the second time you announced an action and then stopped. "
-                                      "Your NEXT message must be the tool call itself, with no text before it.")
-            messages.append({"role": "assistant", "content": text})
-            messages.append({"role": "user", "content": _NOTE + (
-                "You said you would take an action but did not call a tool. Call the tool now - don't "
-                "describe it. If no tool is needed, just answer." + firm)})
-            return "retry", ""
-        return "fallback", (f"I said I'd do that ({promise.verb}) but never actually ran it, so nothing happened yet. "
-                            "Tell me to go ahead and I'll do it properly.")
+        st.nudges += 1
+        firm = "" if n == 1 else (f" This is the {'second' if n == 2 else str(n) + 'th'} time you announced an action "
+                                  "and then stopped. Your NEXT message must be the tool call itself, with no text "
+                                  "before it.")
+        messages.append({"role": "assistant", "content": text})
+        messages.append({"role": "user", "content": _NOTE + (
+            "You said you would take an action but did not call a tool. Call the tool now - don't "
+            "describe it. If no tool is needed because the task is finished, just give the final answer." + firm)})
+        if n > cfg.max_promise_nudges:
+            st.force_tool = True
+        return "retry", ""
 
     @staticmethod
     def _fallback_query(messages: list[dict]) -> str:

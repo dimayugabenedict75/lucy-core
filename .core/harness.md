@@ -8,7 +8,8 @@ Lucy Core root = the folder containing `src/`, `ui/`, `runtime/`, `assets/`, `.c
 
 | Path | What it is |
 |---|---|
-| `src/lucy/server/api.py` | FastAPI app on **port 8090**: chat endpoints, session storage, **every tool's implementation** (`execute_tool_call`), tool definitions (`TOOLS`), prompt building (`_build_messages`), voice/TTS streaming |
+| `src/lucy/server/api.py` | FastAPI app on **port 8090**: chat endpoints, session storage, `execute_tool_call` (looks tools up in the registry), tool definitions (`TOOLS`), prompt building (`_build_messages`), voice/TTS streaming |
+| `src/lucy/tools/` | One file per tool (schema + handler + tier + label), the registry that discovers them, and `routing.py` (which tools to show per turn, `tool_search`) |
 | `src/lucy/server/agent_loop.py` | The tool-calling loop: calls the model, validates and runs tools, retries, nudges, context budget |
 | `src/lucy/server/llm_manager.py` | Starts/stops the llama-servers. **Lucy 12B on 8080, Lucy 4B on 8081**, one at a time. Settings tab > Model drives it |
 | `src/lucy/server/tts_filter.py` | Removes tool calls, `Action:` lines, `MEDIA:` markers, file paths, URLs, markdown from what is spoken |
@@ -30,22 +31,37 @@ Lucy Core root = the folder containing `src/`, `ui/`, `runtime/`, `assets/`, `.c
 2. `_build_messages` assembles the prompt: persona -> `[USER FACTS]` (pinned preferences + relevant memories) ->
    memory rules -> harness map -> skills -> tool rules -> recent history.
 3. `AgentLoop.run` calls llama-server. If the model asks for tools they are validated, executed by
-   `execute_tool_call`, and the results go back to the model until it answers (max 8 tool rounds).
+   `execute_tool_call`, and the results go back to the model until it answers. There is no round cap: a turn ends only when the task is done, the user presses Stop, or 30 rounds in a row make no progress (then it reports honestly what it tried). Failures trigger workarounds, not give-up.
 4. Text streams to the UI as SSE. In voice mode finished sentences also go through `tts_filter` to Lucy Audio.
 
 ## Multi-step turns (`src/lucy/server/multistep.py` + `agent_loop.py`)
-- `update_plan(steps=[{text,status}])` is a loop-level checklist tool (not in `TOOLS`; handled inside `AgentLoop`). While steps are `pending`/`in_progress` the loop won't let the turn end on a plain reply (max 2 reminders).
+- `update_plan(steps=[{text,status}])` is a loop-level checklist tool (not in `TOOLS`; handled inside `AgentLoop`). While steps are `pending`/`in_progress` the loop won't let the turn end on a plain reply (after 2 reminders the next round REQUIRES a tool call).
 - Broken-promise ladder: a reply that ends with "I'll search/read/edit..." and no tool call is (1) nudged, (2) if it was a web search the harness runs `web_search` itself (queries quoted in the text, else the user's message), (3) otherwise reported honestly. Emoji after the promise are ignored.
 - `agent_trace.jsonl` events: `broken_promise`, `auto_act`, `plan_nudge`.
 
-## Tools (implemented in `execute_tool_call` in api.py)
+## Tools (one file each in `src/lucy/tools/`)
 Files: `read_local_file`, `edit_local_file`, `write_local_file`, `list_local_files`, `find_file`, `send_file`.
-Web: `web_search`, `web_extract`. Vision: `analyze_image`. Shell: `run_shell_command`.
+Web: `web_search`, `web_extract`. Vision: `analyze_image`. Shell: `run_shell_command` (PowerShell by default; `action`: run / start / poll / kill / list;
+`timeout` default 60 s; `start` runs it in the background and `poll` returns only the NEW output; env `LUCY_SHELL` changes the default shell).
 Voice/media: `send_tts`, `send_sticker`. Memory: `remember`, `recall_memory`, `forget`, `search_conversations`.
 Others: Google Drive/Docs, computer-use (`cua_*`). The live list is in the prompt.
 
-To ADD a tool: (1) add a definition to `TOOLS` in api.py, (2) add an `if tool_name == "...":` branch in
-`execute_tool_call`, (3) optionally a label in `_tool_to_activity`. Restart Lucy Core.
+Only a few tools are shown each turn (`src/lucy/tools/routing.py`): files, memory and the sticker always, plus the families the
+user's words point at (web, reminders, shell, drive, images, desktop control...). If you need a tool you don't see, call
+`tool_search(query)` - the tools it finds work right after - or just call the tool by its name: the harness adds it.
+Set `LUCY_TOOL_ROUTING=0` to show every tool every turn.
+
+To ADD a tool: drop ONE file in `src/lucy/tools/` that exports `SCHEMA` (OpenAI function definition), `handler(args, ctx)`,
+`TIER` ("read"/"write"/"exec"/"system"/"network") and `LABEL` (an activity word the UI knows); or `TOOLS = [{schema, handler,
+tier, label}, ...]` for a small family. It is discovered at startup (`registry.py`). Then add its keywords to `FAMILIES` in
+`routing.py` so it is shown when relevant. Restart Lucy Core.
+
+## Prompt order and speed (KV cache)
+llama-server only re-reads the part of the prompt that changed, counted from the start (`cache_prompt` is on). So the prompt is
+built stable-first: persona, memory rules, this harness digest, tool rules - then the per-message recalled facts and matching
+skills - then the chat history - then the user's message. The tool list is part of the prompt too, so it keeps a fixed order and
+tools used in the last 3 turns stay in it. Knobs: `LUCY_PROMPT_ORDER` = `static_first` (default) | `late` (facts ride on the last
+user message, history stays cached) | `legacy` (old order). Measure with `python tools/measure_ttft.py --label NAME`.
 
 ## Stickers
 `send_sticker(emotion, theme="Dark", caption?)`. The file name IS the emotion: `assets/stickers/Dark/Happy.png`,

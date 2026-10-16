@@ -18,6 +18,11 @@ class Fake(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         srv = self.server; srv.requests.append(body)
+        if body.get("stream") is False:                 # the harness's grammar-constrained "make the tool call" request
+            if srv.script and "forced" in srv.script[0]:
+                out = json.dumps({"choices": [{"message": {"content": json.dumps(srv.script.pop(0)["forced"])}}]}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(out); return
+            self.send_response(400); self.end_headers(); self.wfile.write(b"constrained output not scripted"); return   # -> harness falls back
         step = srv.script.pop(0) if srv.script else {"content": ["(script exhausted)"], "finish": "stop"}
         if "status" in step:
             self.send_response(step["status"]); self.end_headers(); self.wfile.write(step.get("body", "").encode()); return
@@ -119,11 +124,13 @@ def test_truncated_tool_call_not_executed():
     assert "cut off by the output limit" in r.requests[1]["messages"][-1]["content"]
 
 # ---- loops, failures, budgets -------------------------------------------------------------------
-def test_duplicate_readonly_call_cached_then_forced_final():
+def test_duplicate_readonly_call_is_cached_and_the_model_is_pushed_to_use_it():
     r = run([CALL(), CALL(), CALL(), CALL(), ANS("Done.")])
     assert len(r.calls) == 1 and r.metrics["tool_calls"] == 4
-    assert r.requests[-1]["tools"] == [] and "tool_choice" not in r.requests[-1] and r.text == "Done."
+    # no forced answer any more: the turn goes on until the model itself is done
+    assert r.requests[-1]["tool_choice"] == "auto" and r.requests[-1]["tools"] and r.text == "Done."
     assert "already ran this exact call" in tool_msgs(r, 2)[-1]["content"]
+    assert "already HAVE" in tool_msgs(r)[-1]["content"]
 
 def test_mutation_invalidates_cache():
     r = run([CALL(), CALL("edit_local_file", {"file_path": "a", "old_string": "b", "new_string": "c"}), CALL(), ANS()])
@@ -132,7 +139,7 @@ def test_mutation_invalidates_cache():
 def test_failure_streak_hint():
     async def bad(n, a): return "Error: boom"
     r = run([CALL(a={"query": "a"}), CALL(a={"query": "b"}), ANS()], execute=bad)
-    assert "failure #2" in tool_msgs(r)[-1]["content"] and r.metrics["tool_errors"] == 2
+    assert "Blocked: web_search has failed 2 times" in tool_msgs(r)[-1]["content"] and r.metrics["tool_errors"] == 2
 
 def test_edit_not_found_hint():
     async def bad(n, a): return "Error: 'old_string' not found in file: a.py"
@@ -151,7 +158,7 @@ def test_big_result_capped():
 
 def test_max_rounds_forces_tool_free_final_round():
     r = run([CALL(a={"query": "1"}), CALL(a={"query": "2"}), ANS("Here is what I confirmed.")], cfg=LoopConfig(max_rounds=2))
-    assert r.requests[2]["tools"] == [] and "used all your tool calls" in r.requests[2]["messages"][-1]["content"]
+    assert r.requests[2]["tools"] == [] and "safety limit of 2" in r.requests[2]["messages"][-1]["content"]
     assert r.text == "Here is what I confirmed."
 
 # ---- replies -----------------------------------------------------------------------------------------
@@ -160,7 +167,7 @@ def test_empty_reply_after_tools_is_nudged():
     assert r.text == "Now I answer." and "Use the tool results" in r.requests[2]["messages"][-1]["content"]
 
 def test_empty_forever_falls_back_with_last_result():
-    r = run([CALL(), {"content": [], "finish": "stop"}, {"content": [], "finish": "stop"}, {"content": [], "finish": "stop"}])
+    r = run([CALL()] + [{"content": [], "finish": "stop"}] * 6)
     assert "result of web_search" in r.text and "couldn't put a proper reply" in r.text
 
 def test_length_cutoff_is_continued_without_breaking_words():

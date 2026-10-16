@@ -50,55 +50,63 @@ def test_first_broken_promise_is_just_a_nudge_and_a_real_call_clears_it():
     assert r.calls == [("web_search", {"query": "ingco soldering station"})]
     assert "did not call" in r.requests[1]["messages"][-1]["content"]
 
-def test_second_nudge_is_firmer_for_non_search_promises():
+def test_second_unkept_promise_makes_the_harness_produce_the_call_itself():
+    """The model said "I'll read the file" twice and stopped: it is not asked a third time. A grammar-constrained
+    request (JSON schema = exactly one valid tool call) gets the call out of it, whatever the chat template does."""
     r = run([STOP("I'll read the file now."), STOP("I'll read the file now."),
-             CALL("read_local_file", {"file_path": "a.md"}), ANS("It says hi.")])
-    assert r.calls == [("read_local_file", {"file_path": "a.md"})]
-    assert "NEXT message must be the tool call" in r.requests[2]["messages"][-1]["content"]
+             {"forced": {"tool": "read_local_file", "arguments": {"file_path": "a.md"}}}, ANS("It says hi.")])
+    assert r.calls == [("read_local_file", {"file_path": "a.md"})] and r.text.endswith("It says hi.") and r.errors == []
+    forced = r.requests[2]
+    assert forced["stream"] is False and "tools" not in forced
+    schema = forced["response_format"]["json_schema"]["schema"]["anyOf"]
+    assert {a["properties"]["tool"]["enum"][0] for a in schema} >= {"read_local_file", "web_search", "finish_task"}
+    assert r.text.count("I'll read the file now.") == 1                                   # narration is shown once, not per round
 
-def test_promise_that_is_never_kept_ends_honestly_not_silently():
-    r = run([STOP("I'll read the file now.")] * 4)
-    assert not r.calls and "never actually ran it" in r.text and r.errors == []
+def test_narration_from_rejected_rounds_is_not_shown():
+    r = run([STOP("I'll read the file now."), STOP("Now I am going to read that file for you."),
+             {"forced": {"tool": "read_local_file", "arguments": {"file_path": "a.md"}}}, ANS("It says hi.")])
+    assert "going to read that file" not in r.text and r.text.endswith("It says hi.")
 
-def test_streak_resets_after_a_kept_promise():
-    r = run([STOP("Let me search for ingco."), CALL(), STOP("Now I'll read the first result."),
-             CALL("read_local_file", {"file_path": "x"}), ANS("Done.")])
-    assert [c[0] for c in r.calls] == ["web_search", "read_local_file"] and r.text.endswith("Done.")
+def test_promise_about_a_local_file_is_not_turned_into_a_web_search():
+    r = run([STOP("I'll search for `repeat_guard.py` across the entire user directory."),
+             STOP("I'm searching for repeat_guard.py in the project folder."),
+             {"forced": {"tool": "read_local_file", "arguments": {"file_path": "repeat_guard.py"}}}, ANS("Found it.")])
+    assert [c[0] for c in r.calls] == ["read_local_file"]                                 # no junk web_search
 
-def test_auto_act_is_capped_per_turn():
-    r = run([STOP("Let me search for a.")] * 2 + [STOP("Now I'll search for b.")] * 2 + [STOP("Let me search for c.")] * 4)
-    assert len([c for c in r.calls if c[0] == "web_search"]) <= 2
+def test_unkept_promise_falls_back_to_required_tool_choice_when_constrained_output_is_unavailable():
+    r = run([STOP("I'll read the file now.")] * 2 + [CALL("read_local_file", {"file_path": "a.md"}), ANS("It says hi.")])
+    assert [c[0] for c in r.calls] == ["read_local_file"] and r.errors == []
+    assert r.requests[2]["stream"] is False and r.requests[3]["stream"] is False    # constrained call, both formats (fake answers 400)
+    assert r.requests[4]["tool_choice"] == "required"
+    assert "finish_task" in [t["function"]["name"] for t in r.requests[4]["tools"]]
 
-# ---- plan ----------------------------------------------------------------------------------------
-def test_plan_flow_runs_every_step_and_the_tool_is_handled_by_the_loop():
-    r = run([PLAN(("search A", "in_progress"), ("search B", "pending")),
-             CALL("web_search", {"query": "A"}),
-             PLAN(("search A", "done"), ("search B", "in_progress")),
-             CALL("web_search", {"query": "B"}),
-             PLAN(("search A", "done"), ("search B", "done")),
-             ANS("Compared A and B.")])
-    assert [c[0] for c in r.calls] == ["web_search", "web_search"]          # update_plan never reaches execute()
-    assert r.text.endswith("Compared A and B.") and r.metrics["tool_calls"] == 5
-    first = tool_msgs(r, 1)[0]["content"]
-    assert "1. [>] search A" in first and "2. [ ] search B" in first and "Next: search A" in first
+def test_finish_task_is_the_way_out_when_a_tool_call_is_required():
+    r = run([STOP("I'll read the file now.")] * 2 + [{"forced": {"tool": "finish_task", "arguments": {"summary": "Nothing left to do - all done."}}}])
+    assert not r.calls and r.text.endswith("Nothing left to do - all done.")
 
-def test_plan_bookkeeping_does_not_eat_the_tool_round_budget():
-    from lucy.server.agent_loop import LoopConfig
-    steps = [("one", "pending"), ("two", "pending")]
-    r = run([PLAN(*steps), CALL("web_search", {"query": "1"}), PLAN(("one", "done"), ("two", "pending")),
-             CALL("web_search", {"query": "2"}), PLAN(("one", "done"), ("two", "done")), ANS("ok")],
-            cfg=LoopConfig(max_rounds=2))
-    assert len(r.calls) == 2 and r.text.endswith("ok")                       # 2 real rounds fit in max_rounds=2
+def test_finish_task_is_refused_while_plan_steps_are_open():
+    r = run([PLAN(("a", "pending")), ANS("x1"), ANS("x2"), ANS("x3"),
+             {"forced": {"tool": "finish_task", "arguments": {"summary": "done!"}}},
+             {"forced": {"tool": "web_search", "arguments": {"query": "q"}}}, PLAN(("a", "done")), ANS("Really finished.")])
+    assert r.text.endswith("Really finished.") and "done!" not in r.text and [c[0] for c in r.calls] == ["web_search"]
 
-def test_cannot_finish_with_pending_steps():
-    r = run([PLAN(("look", "pending"), ("summarise", "pending")), ANS("All done!"),
-             CALL("web_search", {"query": "x"}), PLAN(("look", "done"), ("summarise", "skipped")), ANS("Really done.")])
-    assert "unfinished steps" in r.requests[2]["messages"][-1]["content"] and r.text.endswith("Really done.")
-    assert len(r.calls) == 1
+def test_required_tool_choice_unsupported_by_the_server_falls_back_to_nudges():
+    r = run([STOP("I'll read the file now.")] * 2 + [{"status": 400, "body": "tool_choice required is not supported"},
+                                                      CALL("read_local_file", {"file_path": "a.md"}), ANS("ok then.")])
+    assert r.errors == [] and [c[0] for c in r.calls] == ["read_local_file"] and r.text.endswith("ok then.")
+    assert r.requests[2]["stream"] is False and r.requests[4]["tool_choice"] == "required" and r.requests[5]["tool_choice"] == "auto"
 
-def test_plan_nudges_are_capped_so_a_stubborn_model_still_finishes():
-    r = run([PLAN(("a", "pending")), ANS("one"), ANS("two"), ANS("three")])
-    assert r.text.endswith("three") and r.errors == []
+def test_pending_plan_is_pushed_until_done_and_then_a_tool_call_is_required():
+    r = run([PLAN(("a", "pending")), ANS("one"), ANS("two"), ANS("three"),
+             {"forced": {"tool": "web_search", "arguments": {"query": "q"}}}, PLAN(("a", "done")), ANS("Finished.")])
+    assert r.text.endswith("Finished.") and r.errors == [] and [c[0] for c in r.calls] == ["web_search"]
+    assert r.requests[4]["stream"] is False
+
+def test_a_model_that_ignores_every_push_ends_with_an_honest_report_not_an_endless_loop():
+    r = run([PLAN(("a", "pending"))] + [ANS(f"Reply number {i} that never acts.") for i in range(14)])
+    last = r.requests[-1]
+    assert last["tools"] == [] and "going around in circles" in last["messages"][-1]["content"]
+    assert r.metrics["rounds"] <= 14 and r.errors == []
 
 def test_bad_plan_is_rejected_with_a_message():
     r = run([CALL("update_plan", {"steps": []}), ANS("fine")])
