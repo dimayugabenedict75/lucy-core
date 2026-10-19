@@ -17,3 +17,4 @@ venv/
 lucy_audio/build/
 lucy_audio/*.log
 lucy_audio/*.wav
+.core/constitution.lock

@@ -939,6 +939,12 @@ filesToSend.forEach(f => formData.append('files', f));
                             } else {
                                 scrollToBottom();
                             }
+                        } else if (data.approval_request) {
+                            // Safety layer: the agent is waiting for your OK (Approve / Deny / Always allow).
+                            getFileGroup(streamingBubble).appendChild(renderApprovalCard(data.approval_request, sendSid));
+                            scrollToBottom();
+                        } else if (data.approval_resolved) {
+                            markApprovalResolved(data.approval_resolved.id, data.approval_resolved.decision);
                         } else if (data.error) {
                             streamingBubble.textContent = `Error: ${data.error}`;
                         } else if (data.media) {
@@ -1038,6 +1044,7 @@ filesToSend.forEach(f => formData.append('files', f));
                                         'recall': 'Recalling...',
                                         'forget': 'Forgetting...',
                                         'history': 'Searching past chats...',
+                                        'approval': 'Waiting for your OK...',
                                     };
                                     if (activity.includes(':')) {
                                         const splitIdx = activity.indexOf(':');
@@ -1292,6 +1299,8 @@ function openSettings() {
     loadLlmStatus();
     loadSkills();
     loadConnectors();
+    loadMcp();
+    loadSafety();
 }
 
 function closeSettings() {
@@ -3070,3 +3079,207 @@ window.addEventListener('lucy:proactive-open', async (e) => {
     await loadSessions();
     switchSession(sid, true);
 });
+
+// ---- Safety layer (P1): approval cards + Settings > Safety ----
+const APPROVAL_DONE = {approve: 'Approved', always: 'Approved (always this chat)', deny: 'Denied', timeout: 'Timed out (denied)'};
+
+function renderApprovalCard(req, sid) {
+    const card = document.createElement('div');
+    card.className = 'approval-card';
+    card.dataset.approvalId = req.id;
+    const title = document.createElement('div');
+    title.className = 'approval-title';
+    title.textContent = 'Lucy wants to: ' + (req.summary || req.tool);
+    card.appendChild(title);
+    if (req.reason) {
+        const why = document.createElement('div');
+        why.className = 'approval-reason';
+        why.textContent = 'Why it asks: ' + req.reason;
+        card.appendChild(why);
+    }
+    if (req.details) {
+        const pre = document.createElement('pre');
+        pre.className = 'approval-details' + (req.details_kind === 'diff' ? ' diff' : '');
+        if (req.details_kind === 'diff') {
+            req.details.split('\n').forEach(line => {
+                const span = document.createElement('span');
+                span.textContent = line + '\n';
+                if (line.startsWith('+') && !line.startsWith('+++')) span.className = 'add';
+                else if (line.startsWith('-') && !line.startsWith('---')) span.className = 'del';
+                pre.appendChild(span);
+            });
+        } else {
+            pre.textContent = req.details;
+        }
+        card.appendChild(pre);
+    }
+    const row = document.createElement('div');
+    row.className = 'approval-actions';
+    const btn = (label, decision, cls) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'approval-btn ' + cls;
+        b.textContent = label;
+        b.onclick = () => answerApproval(req.id, decision, sid, card);
+        row.appendChild(b);
+    };
+    btn('Approve', 'approve', 'ok');
+    btn('Deny', 'deny', 'no');
+    if (req.can_always) btn('Always allow in this chat', 'always', 'always');
+    card.appendChild(row);
+    return card;
+}
+
+async function answerApproval(id, decision, sid, card) {
+    card.querySelectorAll('button').forEach(b => b.disabled = true);
+    try {
+        const resp = await fetch(`/api/safety/approvals/${encodeURIComponent(id)}?api_key=${API_KEY}`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({decision, session_id: sid})
+        });
+        if (!resp.ok) throw new Error(await resp.text());
+        markApprovalResolved(id, decision);
+    } catch (e) {
+        markApprovalResolved(id, 'gone');
+    }
+}
+
+function markApprovalResolved(id, decision) {
+    document.querySelectorAll(`.approval-card[data-approval-id="${CSS.escape(id)}"]`).forEach(card => {
+        card.querySelectorAll('button').forEach(b => b.disabled = true);
+        const row = card.querySelector('.approval-actions');
+        if (row) row.textContent = APPROVAL_DONE[decision] || 'No longer pending';
+        card.classList.add('resolved', decision === 'approve' || decision === 'always' ? 'yes' : 'no');
+    });
+}
+
+async function loadSafety() {
+    const sel = document.getElementById('safetyModeSelect');
+    if (!sel) return;
+    try {
+        const resp = await fetch(`/api/safety/status?api_key=${API_KEY}`);
+        const st = await resp.json();
+        sel.innerHTML = st.modes.map(m => `<option value="${m.id}">${escapeHtml(m.label)}</option>`).join('');
+        sel.value = st.mode;
+        document.getElementById('safetyPauseToggle').checked = !!st.paused;
+        const info = document.getElementById('safetyStatus');
+        const bits = [];
+        if (st.halted) bits.push('⚠ ' + st.halted);
+        if (st.paused) bits.push('Agent is PAUSED: no tool runs anywhere.');
+        (st.config_problems || []).forEach(p => bits.push('Config: ' + p));
+        bits.push('Writes without asking in: ' + (st.write_folders || []).join(', '));
+        info.textContent = bits.join('\n');
+        loadSafetyBackups();
+    } catch (e) {
+        console.error('Failed to load safety status:', e);
+    }
+}
+
+async function setSafetyMode(mode) {
+    const resp = await fetch(`/api/safety/mode?api_key=${API_KEY}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode})
+    });
+    if (!resp.ok) alert('Could not change the mode: ' + await resp.text());
+    else flashSaved();
+    loadSafety();
+}
+
+async function setSafetyPaused(paused) {
+    await fetch(`/api/safety/pause?api_key=${API_KEY}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({paused, kill_jobs: true})
+    });
+    flashSaved();
+    loadSafety();
+}
+
+// ---- MCP servers (P4): the list under Settings > Connectors ----
+async function loadMcp() {
+    const body = document.getElementById('mcpServersBody');
+    if (!body) return;
+    try {
+        const resp = await fetch(`/api/mcp/status?api_key=${API_KEY}`);
+        const st = await resp.json();
+        document.getElementById('mcpStatus').textContent = (st.problems || []).map(p => 'Config: ' + p).join('\n');
+        const servers = st.servers || [];
+        if (!servers.length) {
+            body.innerHTML = '<tr><td colspan="3" class="settings-table-empty">No MCP servers in .core/mcp.json</td></tr>';
+            return;
+        }
+        body.innerHTML = '';
+        servers.forEach(s => {
+            const tr = document.createElement('tr');
+            const name = document.createElement('td');
+            name.textContent = s.tools ? `${s.name} (${s.tools} tools)` : s.name;
+            name.title = `${s.transport}, tools ask as: ${s.tier}`;
+            const state = document.createElement('td');
+            if (s.error) { state.textContent = '\u26A0 ' + s.error.slice(0, 80); state.title = s.error; }
+            else if (!s.enabled) state.textContent = 'off';
+            else if (s.running) state.textContent = 'running';
+            else state.textContent = s.tools ? 'ready (starts when used)' : 'not listed yet';
+            const act = document.createElement('td');
+            act.className = 'settings-row-actions';
+            const toggle = document.createElement('button');
+            toggle.className = 'settings-row-btn';
+            toggle.textContent = s.enabled ? 'Turn off' : 'Turn on';
+            toggle.onclick = async () => { await mcpPost(s.key, 'enabled', {enabled: !s.enabled}); flashSaved(); setTimeout(loadMcp, 1500); };
+            act.appendChild(toggle);
+            if (s.enabled) {
+                const refresh = document.createElement('button');
+                refresh.className = 'settings-row-btn';
+                refresh.textContent = 'Refresh';
+                refresh.onclick = async () => { refresh.textContent = '...'; await mcpPost(s.key, 'refresh', {}); loadMcp(); };
+                act.appendChild(refresh);
+            }
+            tr.append(name, state, act);
+            body.appendChild(tr);
+        });
+    } catch (e) {
+        console.error('Failed to load MCP servers:', e);
+    }
+}
+
+async function mcpPost(key, action, payload) {
+    const resp = await fetch(`/api/mcp/${encodeURIComponent(key)}/${action}?api_key=${API_KEY}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+    });
+    if (!resp.ok) {
+        let msg = await resp.text();
+        try { msg = JSON.parse(msg).detail || msg; } catch (e) {}
+        alert(`MCP ${key}: ${msg}`);
+    }
+}
+
+async function loadSafetyBackups() {
+    const body = document.getElementById('safetyBackupsBody');
+    if (!body) return;
+    const resp = await fetch(`/api/safety/backups?limit=30&api_key=${API_KEY}`);
+    const data = await resp.json();
+    const items = data.backups || [];
+    if (!items.length) {
+        body.innerHTML = '<tr><td colspan="3" class="settings-table-empty">No file changes yet</td></tr>';
+        return;
+    }
+    body.innerHTML = '';
+    items.forEach(b => {
+        const tr = document.createElement('tr');
+        const what = document.createElement('td');
+        what.textContent = `${b.ts}  ${b.kind === 'created' ? 'created' : 'changed'}  ${b.path}`;
+        what.title = `${b.tool} (${b.id})`;
+        const tool = document.createElement('td');
+        tool.textContent = b.tool;
+        const act = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.className = 'settings-action-btn';
+        btn.textContent = 'Restore';
+        btn.onclick = async () => {
+            if (!confirm(`Put ${b.path} back the way it was before this change?`)) return;
+            const r = await fetch(`/api/safety/backups/${encodeURIComponent(b.id)}/restore?api_key=${API_KEY}`, {method: 'POST'});
+            const res = await r.json();
+            alert(res.message || (res.ok ? 'Restored' : 'Failed'));
+            loadSafetyBackups();
+        };
+        act.appendChild(btn);
+        tr.append(what, tool, act);
+        body.appendChild(tr);
+    });
+}

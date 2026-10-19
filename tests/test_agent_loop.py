@@ -257,10 +257,10 @@ def test_backed_claim_is_not_challenged():
 
 def test_file_claim_needs_a_successful_edit_not_just_any_tool():
     r = run([CALL(), ANS("I updated api.py with the new tool.")])               # only web_search ran
-    assert r.metrics["rounds"] == 3 and "edit_local_file/write_local_file" in r.requests[2]["messages"][-1]["content"]
+    assert r.metrics["rounds"] == 3 and all(n in r.requests[2]["messages"][-1]["content"] for n in ("apply_patch", "edit_local_file", "write_local_file"))
     async def failing(n, a): return "Error: 'old_string' not found in file"
     r = run([CALL("edit_local_file", {"file_path": "a", "old_string": "x", "new_string": "y"}), ANS("I edited the file for you.")], execute=failing)
-    assert "no edit_local_file/write_local_file call succeeded" in r.requests[-1]["messages"][-1]["content"]
+    assert "call succeeded" in r.requests[-1]["messages"][-1]["content"] and "edit_local_file" in r.requests[-1]["messages"][-1]["content"]
 
 def test_questions_future_and_earlier_turn_statements_are_not_claims():
     for t in ["Did you want me to save that to memory?", "I saved it earlier in a previous chat.", "If I update the file you need to restart."]:

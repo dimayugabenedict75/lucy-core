@@ -8,17 +8,19 @@ import time
 from pathlib import Path
 
 from lucy import paths as _paths
+from lucy.tools import _common
 from lucy.server import file_guard
 from ._common import outside_root, resolve_path
 
 logger = logging.getLogger("lucy.core.api")      # same logger name as before: log lines look the same
 _HOME = _paths.SAFE_ROOT.as_posix()              # shown to the model in tool descriptions
+_REACH = _common.allowed_roots_text()            # every allowed drive/folder (permissions.yaml folders.read)
 
 _SCHEMA_READ_LOCAL_FILE = {
     "type": "function",
     "function": {
         "name": "read_local_file",
-        "description": (f"Read a file from the local filesystem (paths under {_HOME}; relative paths resolve from the "
+        "description": (f"Read a file from the local filesystem (paths anywhere under {_REACH}; relative paths resolve from the "
                         "Lucy Core folder). Small files are returned whole. For a LARGE file (like api.py) use "
                         "search='text' to find the lines you need, then start_line/end_line to read just that part."),
         "parameters": {
@@ -140,7 +142,7 @@ _SCHEMA_WRITE_LOCAL_FILE = {
     "type": "function",
     "function": {
         "name": "write_local_file",
-        "description": f"Write content to a file on the local filesystem. Overwrites if the file exists. Only safe paths under {_HOME} are allowed. Parent directories are created automatically. Use this to write/create a brand new file. For editing an existing file, prefer edit_local_file to avoid accidental data loss.",
+        "description": f"Write content to a file on the local filesystem. Overwrites if the file exists. Works anywhere under {_REACH} (some places ask first). Parent directories are created automatically. Use this to write/create a brand new file. For editing an existing file, prefer edit_local_file to avoid accidental data loss.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -176,7 +178,7 @@ _SCHEMA_LIST_LOCAL_FILES = {
     "type": "function",
     "function": {
         "name": "list_local_files",
-        "description": f"List files in a local directory. Only safe paths under {_HOME} are allowed.",
+        "description": f"List files in a local directory anywhere under {_REACH}.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -218,7 +220,7 @@ _SCHEMA_FIND_FILE = {
     "type": "function",
     "function": {
         "name": "find_file",
-        "description": f"Find a file by name within a specific directory and subdirectories. Only safe paths under {_HOME} are allowed.",
+        "description": f"Find a file by name within a directory and its subdirectories, anywhere under {_REACH}.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -285,7 +287,7 @@ _SCHEMA_SEND_FILE = {
     "type": "function",
     "function": {
         "name": "send_file",
-        "description": f"Signal to the client that a file is ready for the user to view or download. The file must already exist on disk under {_HOME}.",
+        "description": f"Signal to the client that a file is ready for the user to view or download. The file must already exist on disk under {_REACH}.",
         "parameters": {
             "type": "object",
             "properties": {

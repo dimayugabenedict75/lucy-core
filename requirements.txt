@@ -13,3 +13,9 @@ tiktoken
 tzdata      # Windows needs this for zoneinfo (e.g. "Asia/Manila")
 google-api-python-client
 google-auth-oauthlib
+python-docx   # P3: Word files
+openpyxl      # P3: Excel files
+python-pptx   # P3: PowerPoint files
+reportlab     # P3: PDF creation
+pypdf         # P3: PDF reading
+pypdfium2     # P3: PDF page -> PNG (office_render), pure pip wheel, no system tools

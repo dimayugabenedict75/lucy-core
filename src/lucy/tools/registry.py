@@ -9,6 +9,7 @@ import asyncio
 import importlib
 import inspect
 import pkgutil
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -37,12 +38,29 @@ class ToolSpec:
     module: str = ""
 
     async def run(self, args: dict, ctx: ToolContext) -> str:
-        """Run the handler; sync handlers go to a worker thread so they can never block the event loop."""
-        if inspect.iscoroutinefunction(self.handler):
-            out = await self.handler(args, ctx)
-        else:
-            out = await asyncio.to_thread(self.handler, args, ctx)
-        return out if isinstance(out, str) else str(out)
+        """Run the handler; sync handlers go to a worker thread so they can never block the event loop.
+
+        EVERY tool execution passes the safety layer here (constitution: this file is hash-locked):
+        before() applies the hard rules and snapshots files about to change; after() wraps untrusted content and
+        writes the audit log. Asking the user happens earlier, in the agent loop (safety.SafetyLayer.gate)."""
+        from lucy import safety                         # lazy: the safety layer resolves paths through lucy.tools
+        layer = safety.get()
+        refusal = layer.before(self.name, self.tier, args, ctx.session_id)
+        if refusal is not None:
+            return refusal
+        t0 = time.monotonic()
+        try:
+            if inspect.iscoroutinefunction(self.handler):
+                out = await self.handler(args, ctx)
+            else:
+                out = await asyncio.to_thread(self.handler, args, ctx)
+        except BaseException as e:
+            if not isinstance(e, asyncio.CancelledError):
+                layer.after(self.name, self.tier, args, ctx.session_id, "", int((time.monotonic() - t0) * 1000),
+                            error=f"{type(e).__name__}: {e}")
+            raise
+        out = out if isinstance(out, str) else str(out)
+        return layer.after(self.name, self.tier, args, ctx.session_id, out, int((time.monotonic() - t0) * 1000))
 
 
 def _make_spec(schema: Any, handler: Any, tier: Any, label: Any, module: str) -> ToolSpec:

@@ -101,7 +101,9 @@ def expected_actions(user_text: str) -> list[tuple[str, frozenset]]:
     elif _SEND_VERB.search(t) and _SEND_OBJ.search(t):
         out.append(("send the file", frozenset({"send_file"})))
     if _EDIT_VERB.search(t) and _EDIT_OBJ.search(t):
-        out.append(("change the file", frozenset({"edit_local_file", "write_local_file", "run_shell_command"})))
+        out.append(("change the file", frozenset({"edit_local_file", "write_local_file", "apply_patch", "run_shell_command",
+                                                  "docx_create", "docx_edit", "xlsx_create", "xlsx_edit", "pptx_create", "pptx_edit",
+                                                  "pdf_create"})))
     return out
 
 
