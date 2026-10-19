@@ -26,6 +26,7 @@ class ProactiveHost:
     recent_messages: Callable[[str, int], list] = lambda sid, n: []  # [{"role","content"}], oldest first
     # --- state of the rest of the system ------------------------------------------------------------
     is_busy: Callable[[], bool] = lambda: False                      # a chat reply is being generated right now
+    paused: Callable[[], bool] = lambda: False                       # the user pressed "Pause agent" (safety layer)
     health: Callable[[], dict] = lambda: {}                          # {"llm_phase","llm_error","llm_label"}
     app_timezone: Callable[[], str] = lambda: "system"               # Settings > Timezone value
     # --- model -----------------------------------------------------------------------------------------

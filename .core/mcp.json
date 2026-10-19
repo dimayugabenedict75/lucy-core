@@ -1,0 +1,75 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "enabled": false,
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--isolated",
+        "--headless"
+      ],
+      "hint": "browser, web pages",
+      "idle_minutes": 15,
+      "timeout": 90,
+      "tier": "network",
+      "core": [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type"
+      ],
+      "tool_tiers": {
+        "browser_snapshot": "read",
+        "browser_take_screenshot": "read",
+        "browser_console_messages": "read",
+        "browser_network_requests": "read",
+        "browser_wait_for": "read",
+        "browser_type": "exec",
+        "browser_press_key": "exec",
+        "browser_fill_form": "exec",
+        "browser_evaluate": "system",
+        "browser_run_code": "system",
+        "browser_file_upload": "system",
+        "browser_install": "system"
+      }
+    },
+    "github": {
+      "enabled": false,
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      },
+      "hint": "github issues, pull requests, repos",
+      "tier": "network",
+      "read_only_hint": true
+    },
+    "filesystem": {
+      "enabled": false,
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "D:/Projects"
+      ],
+      "hint": "files in D:/Projects",
+      "tier": "write",
+      "read_only_hint": true,
+      "trusted": true
+    },
+    "google-workspace": {
+      "enabled": false,
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-google-workspace"
+      ],
+      "env": {
+        "GOOGLE_CLIENT_ID": "167639071295-fag98421qac0fs3npoflrep1rt66pj82.apps.googleusercontent.com"
+      },
+      "hint": "google drive, docs, gmail, calendar",
+      "idle_minutes": 15,
+      "timeout": 90
+    }
+  }
+}

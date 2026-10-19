@@ -1,0 +1,112 @@
+# Lucy's permissions (P1 safety layer). Lucy can READ this file but can never change it.
+# After YOU edit it by hand: open a terminal in the Lucy Core folder and run   python -m lucy.safety seal
+# (the agent refuses to run tools while this file differs from its sealed hash). The mode below can also be switched
+# from Settings > Safety, which re-seals automatically.
+#
+# Placeholders: {LUCY_ROOT} = this Lucy Core folder, {HOME} = your user folder (C:/Users/<you>),
+#               {SAFE_ROOT} = the file-tool root (LUCY_SAFE_ROOT, default {HOME}), {RUNTIME} = {LUCY_ROOT}/runtime
+# Lists here REPLACE the built-in list of the same name. The hard protections (Lucy's own safety files, wipe-the-disk
+# commands, risky commands always asking) are built in and cannot be switched off from here.
+
+# ask_every_time  - every change, command, PC control and internet use asks first (reading allowed folders does not)
+# ask_for_risky   - (default) file changes inside folders.write and web reading run; commands / PC control ask
+# auto_in_allowed - like ask_for_risky, plus commands run without asking when they stay inside folders.write
+# full_auto       - nothing asks except the built-in risky list, Lucy's own files (ask_paths) and injection suspects
+mode: auto_in_allowed
+
+approval_timeout_s: 300        # an unanswered approval card counts as "Deny" after this many seconds
+
+folders:
+  read:                        # the file tools can reach these, and reading never asks (except denied_paths)
+    - "C:/"
+    - "D:/"
+    - "E:/"
+    - "{SAFE_ROOT}"
+  write:                       # creating/editing files here runs without asking (except readonly/ask paths below)
+    - "C:/"
+    - "D:/"
+    # E: (backup HDD) is in ask_paths instead: Lucy may write there, but always asks first
+
+ask_paths:                     # changes here ALWAYS ask
+  - "E:/"                      # your backups: the last line of defence, never changed without your OK
+  - "{LUCY_ROOT}/src"          # Lucy editing her own code / UI / persona
+  - "{LUCY_ROOT}/ui"
+  - "{LUCY_ROOT}/.core"
+  - "{HOME}/AppData"           # app settings and the per-user Startup folder (auto-run at login)
+
+denied_paths:                  # never read, never written: secrets, login tokens, browser data
+  - "{LUCY_ROOT}/google_client_secret.json"
+  - "{LUCY_ROOT}/.env"
+  - "{HOME}/.ssh"
+  - "{HOME}/.aws"
+  - "{HOME}/.azure"
+  - "{HOME}/.kube"
+  - "{HOME}/.docker"
+  - "{HOME}/.gnupg"
+  - "{HOME}/.git-credentials"
+  - "{HOME}/.config/gcloud"
+  - "{HOME}/NTUSER.DAT"
+  - "{HOME}/AppData/Roaming/Microsoft/Credentials"    # Windows saved passwords
+  - "{HOME}/AppData/Local/Microsoft/Credentials"
+  - "{HOME}/AppData/Roaming/Microsoft/Protect"        # keys that unlock all of the above
+  - "{HOME}/AppData/Local/Microsoft/Vault"
+  - "{HOME}/AppData/Roaming/Microsoft/Vault"
+  - "{HOME}/AppData/Local/Google/Chrome/User Data"    # browser passwords, cookies, history
+  - "{HOME}/AppData/Local/Microsoft/Edge/User Data"
+  - "{HOME}/AppData/Local/BraveSoftware/Brave-Browser/User Data"
+  - "{HOME}/AppData/Local/Vivaldi/User Data"
+  - "{HOME}/AppData/Roaming/Opera Software"
+  - "{HOME}/AppData/Roaming/Mozilla/Firefox/Profiles"
+  - "{HOME}/AppData/Roaming/discord"                  # Discord login token
+  - "{HOME}/AppData/Roaming/Telegram Desktop/tdata"
+  - "{HOME}/AppData/Roaming/Bitwarden"
+  - "{HOME}/AppData/Local/1Password"
+  - "{HOME}/AppData/Roaming/Exodus"                   # crypto wallets
+  - "{HOME}/AppData/Roaming/Electrum"
+  - "{HOME}/AppData/Roaming/Ethereum"
+  - "C:/Program Files (x86)/Steam/config"             # Steam login tokens
+  - "C:/Windows/System32/config"                      # registry hives incl. password hashes (SAM)
+  - "C:/System Volume Information"
+
+readonly_paths:                # can be read, never written by Lucy's file tools
+                               # (no junctions like "C:/Documents and Settings": they resolve to C:/Users itself)
+  - "C:/Windows"
+  - "C:/Program Files"
+  - "C:/Program Files (x86)"
+  - "C:/ProgramData"                                  # installers, Defender, the all-users Startup folder
+  - "C:/Recovery"
+  - "C:/Boot"
+  - "C:/$Recycle.Bin"
+  - "C:/$WinREAgent"
+  - "C:/PerfLogs"
+  - "C:/Users/Default"
+  - "C:/pagefile.sys"
+  - "C:/hiberfil.sys"
+  - "C:/swapfile.sys"
+  - "C:/bootmgr"
+  - "C:/BOOTNXT"
+  - "D:/System Volume Information"
+  - "E:/System Volume Information"
+  - "D:/$Recycle.Bin"
+  - "E:/$Recycle.Bin"
+
+commands:                      # extra regexes (case-insensitive) on top of the built-in lists in src/lucy/safety/policy.py
+  deny: []                     # e.g. - '\bRemove-Item\b.*D:\\Photos'
+  ask: []                      # e.g. - '\bnpm\s+publish\b'
+
+network:
+  allow_hosts: ["*"]           # web_search / web_extract may reach these without asking ("*" = anywhere)
+  deny_hosts: ["localhost", "*.localhost", "127.*", "0.0.0.0", "::1", "[::1]", "169.254.*", "metadata.google.internal"]
+
+tools:                         # per-tool override: auto | ask | deny  (cannot weaken the hard protections)
+  send_tts: auto
+  send_sticker: auto
+  # cua_mouse: deny
+
+untrusted:                     # results of these tools / files in these folders are treated as DATA, never instructions
+  tools: [web_search, web_extract, get_doc_content, list_drive_files]
+  paths: ["{HOME}/Downloads"]
+
+backups:                       # undo snapshots taken before every file change (runtime/backups/undo)
+  max_file_mb: 50              # bigger files are not snapshotted (the change is still logged)
+  max_total_mb: 2048           # oldest snapshots are removed past this size

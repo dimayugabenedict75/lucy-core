@@ -290,6 +290,7 @@
                 <button class="settings-tab-btn" data-tab="skills" onclick="switchSettingsTab('skills')">Skills</button>
                 <button class="settings-tab-btn" data-tab="connectors"
                     onclick="switchSettingsTab('connectors')">Connectors</button>
+                <button class="settings-tab-btn" data-tab="safety" onclick="switchSettingsTab('safety')">Safety</button>
             </div>
 
             <div class="settings-panels">
@@ -406,6 +407,37 @@
                     </div>
                 </div>
 
+                <!-- SAFETY -->
+                <div class="settings-panel" id="panel-safety">
+                    <div class="setting-group">
+                        <label for="safetyModeSelect">Permission mode</label>
+                        <select id="safetyModeSelect" onchange="setSafetyMode(this.value)"></select>
+                        <div class="llm-status">Risky commands, Lucy's own files and anything copied from web pages always ask. Edit .core/permissions.yaml for folders.</div>
+                    </div>
+                    <div class="setting-group">
+                        <label for="safetyPauseToggle">Pause agent</label>
+                        <input type="checkbox" id="safetyPauseToggle" onchange="setSafetyPaused(this.checked)">
+                        <div class="llm-status">Stops every tool (chat, background tasks, reminders) and kills running background commands.</div>
+                    </div>
+                    <div class="llm-status safety-status" id="safetyStatus"></div>
+                    <div class="settings-table-wrap">
+                        <table class="settings-table" id="safetyBackupsTable">
+                            <thead>
+                                <tr>
+                                    <th>Recent file changes (undo)</th>
+                                    <th>Tool</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="safetyBackupsBody">
+                                <tr>
+                                    <td colspan="3" class="settings-table-empty">No file changes yet</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- CONNECTORS -->
                 <div class="settings-panel" id="panel-connectors">
                     <div class="settings-toolbar">
@@ -425,6 +457,24 @@
                             <tbody id="connectorsTableBody">
                                 <tr>
                                     <td colspan="2" class="settings-table-empty">No connectors configured yet</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="llm-status" style="margin-top:18px">MCP servers (tools for the browser, GitHub, ...). Lucy finds their tools with tool_search. Servers are listed in .core/mcp.json (edit it yourself, then run seal.bat).</div>
+                    <div class="llm-status safety-status" id="mcpStatus"></div>
+                    <div class="settings-table-wrap">
+                        <table class="settings-table" id="mcpTable">
+                            <thead>
+                                <tr>
+                                    <th>MCP server</th>
+                                    <th>Status</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="mcpServersBody">
+                                <tr>
+                                    <td colspan="3" class="settings-table-empty">No MCP servers yet</td>
                                 </tr>
                             </tbody>
                         </table>

@@ -147,6 +147,11 @@ class ProactiveEngine:
         cfg = self.cfg
         if not cfg.get("enabled", True):
             return
+        try:
+            if self.host.paused():                  # "Pause agent": nothing proactive runs until the user resumes
+                return
+        except Exception:                           # noqa: BLE001
+            pass
         now = self.clock()
         await self._process_due(now)
         if now - self._last_watch >= float(cfg["watch_interval_seconds"]):

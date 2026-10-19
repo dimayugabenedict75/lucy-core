@@ -31,6 +31,22 @@ KEY_FILES = [
 ]
 
 
+def _reach(safe_root: Path) -> str:
+    try:
+        from lucy.tools import _common
+        return _common.allowed_roots_text()
+    except Exception:                                    # noqa: BLE001
+        return safe_root.as_posix()
+
+
+def _hint() -> str:
+    try:
+        from lucy.tools import _common
+        return _common.safety_hint()
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
 def build_harness_digest(tools: list[dict], project_root: Path, safe_root: Path) -> str:
     root = project_root.as_posix()
     files = []
@@ -45,8 +61,8 @@ def build_harness_digest(tools: list[dict], project_root: Path, safe_root: Path)
         stickers = ""
     lines = [
         "YOUR HARNESS (Lucy Core) - this is accurate and current; use it instead of guessing or asking the user:",
-        f"- You run inside Lucy Core, located at {root}. Your file tools work anywhere under {safe_root.as_posix()}; "
-        f"relative paths (e.g. src/lucy/server/api.py) resolve from the Lucy Core folder.",
+        f"- You run inside Lucy Core, located at {root}. Your file tools work anywhere under {_reach(safe_root)}; "
+        f"relative paths (e.g. src/lucy/server/api.py) resolve from the Lucy Core folder. {_hint()}",
         "- Layout:",
         *files,
         f"- Your tools: {tool_names}.",

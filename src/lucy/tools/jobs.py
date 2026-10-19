@@ -20,6 +20,7 @@ MAX_BUFFER = 2_000_000          # characters of output kept per job (the newest 
 KEEP_FINISHED = 30              # finished jobs remembered for poll/list
 FINISHED_TTL = 3600.0           # ...for at most this long (seconds)
 _WIN = os.name == "nt"
+_HIDDEN_ENV = {"DEV_API_KEY", "LUCY_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_CLIENT_SECRET"}
 
 
 class JobError(RuntimeError):
@@ -56,7 +57,9 @@ class Job:
         self._cursor = 0                                 # absolute offset already handed out by read_new()
         self._lock = threading.Lock()
         self._done = threading.Event()
-        full_env = dict(os.environ)
+        # Lucy's own secrets never reach a command the model wrote (it could use them to call Lucy's API and,
+        # say, switch the permission mode). The user's explicit `env` still wins.
+        full_env = {k: v for k, v in os.environ.items() if k.upper() not in _HIDDEN_ENV}
         full_env.update({str(k): str(v) for k, v in (env or {}).items()})
         kwargs: dict = {}
         if _WIN:

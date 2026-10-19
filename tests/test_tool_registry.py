@@ -4,6 +4,7 @@ import asyncio, pathlib, sys, tempfile, textwrap, threading, types, uuid
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 import pytest  # noqa: E402
 from lucy.tools import registry as R  # noqa: E402
+from lucy.safety.taint import unwrap  # noqa: E402
 
 
 def _schema(name="demo_tool", desc="Does a demo thing."):
@@ -127,10 +128,10 @@ def test_google_tools_are_registered_and_call_toolset():
     T.create_google_doc = lambda self, title: f"created:{title}"
     T.get_doc_content = lambda self, title: f"content:{title}"
     try:
-        assert asyncio.run(reg.run("list_drive_files", {})) == "files!"
+        assert unwrap(asyncio.run(reg.run("list_drive_files", {}))) == "files!"      # P1: web/drive results are framed as untrusted data
         assert asyncio.run(reg.run("create_google_doc", {"title": "Plan"})) == "created:Plan"
-        assert asyncio.run(reg.run("get_doc_content", {"title": "Plan"})) == "content:Plan"
-        assert asyncio.run(reg.run("get_doc_content", {})) == "content:"      # missing arg behaves like before
+        assert unwrap(asyncio.run(reg.run("get_doc_content", {"title": "Plan"}))) == "content:Plan"
+        assert unwrap(asyncio.run(reg.run("get_doc_content", {}))) == "content:"      # missing arg behaves like before
     finally:
         T.list_drive_files, T.create_google_doc, T.get_doc_content = saved
 
@@ -180,9 +181,9 @@ def test_web_tools_call_their_helpers():
     web._web_search, web._web_extract = fake_search, fake_extract
     try:
         run = lambda n, a: asyncio.run(reg.run(n, a))
-        assert run("web_search", {"query": "cats"}) == "S:cats:5"
-        assert run("web_search", {"query": "cats", "limit": 3}) == "S:cats:3"
-        assert run("web_extract", {"urls": ["u"]}) == "E:['u']:15000"
+        assert unwrap(run("web_search", {"query": "cats"})) == "S:cats:5"      # P1: framed as untrusted data
+        assert unwrap(run("web_search", {"query": "cats", "limit": 3})) == "S:cats:3"
+        assert unwrap(run("web_extract", {"urls": ["u"]})) == "E:['u']:15000"
     finally:
         web._web_search, web._web_extract = saved
 

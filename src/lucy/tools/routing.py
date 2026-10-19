@@ -25,10 +25,38 @@ TOOL_SEARCH = {
     },
 }
 
+def tool_search_schema(extra: str = "") -> dict:
+    """TOOL_SEARCH, with the names of connected MCP servers added to its description (stable text = stable prompt cache)."""
+    if not extra:
+        return TOOL_SEARCH
+    import copy
+    t = copy.deepcopy(TOOL_SEARCH)
+    t["function"]["description"] += f" Also connected: {extra}."
+    return t
+
+
 # Always in the prompt: read/write/edit files, memory, and the sticker (the persona uses it all the time).
 ALWAYS = ("read_local_file", "write_local_file", "edit_local_file", "remember", "recall_memory", "send_sticker")
 
 _F = re.IGNORECASE
+# Office wording. A family fires on the noun alone (read) or on noun + intent verb (create / edit): the model then sees 2-4
+# Office tools instead of all nine.
+_WORD = (r"\b(?:word|docx|document|report|memo|letter|resum[e\u00e9]|cv|essay|proposal|minutes|newsletter|handout|brochure|flyer|"
+         r"contract|agreement|invoice|cover letter)\b")
+_EXCEL = r"\b(?:excel|xlsx|xlsm|spreadsheet|workbook|worksheet|sheet|budget|tracker|ledger|formulas?|pivot|csv)\b"
+_PPT = r"\b(?:powerpoint|pptx|slides?|slide deck|deck|presentation|pitch|keynote)\b"
+_PDF = r"\bpdf\b"
+_MAKE = (r"\b(?:make|create|write|draft|generate|build|prepare|compose|produce|put together|design|export|convert|turn|new|"
+         r"save (?:it )?as)\b")
+_CHANGE = (r"\b(?:edit|change|update|fix|replace|add|insert|delete|remove|modify|rename|correct|rewrite|revise|append|reorder|move|"
+           r"swap|translate|shorten|expand)\b")
+
+
+def _intent(noun: str, verb: str):
+    """Pattern that needs BOTH an Office noun and an intent verb somewhere in the text (any order)."""
+    return re.compile(r"^(?=.*" + noun + r")(?=.*" + verb + r")", re.IGNORECASE | re.DOTALL)
+
+
 # (family, pattern on the user's words, tools it brings in)
 FAMILIES: List[tuple] = [
     ("web", re.compile(r"\b(search|google|look\s?up|latest|news|weather|price|prices|online|internet|website|web\s?page|"
@@ -51,6 +79,30 @@ FAMILIES: List[tuple] = [
     ("drive", re.compile(r"\b(google|drive|gdrive|g-drive|docs?)\b", _F), ("list_drive_files", "create_google_doc", "get_doc_content")),
     ("shell", re.compile(r"\b(run|execute|command|terminal|powershell|cmd|bash|shell|install|pip|npm|git|build|compile|"
                          r"pytest|test|script|process|kill|restart|service)\b", _F), ("run_shell_command",)),
+    ("code_explore", re.compile(r"\b(code|codebase|source|repo|repository|project|function|class|method|symbol|grep|refactor|where is .{1,40} (?:defined|used)|"
+                                r"find (?:the )?(?:usages?|references?|definition)|who calls|implement(?:ation)?|bug|traceback|stack ?trace|exception)\b", _F),
+     ("code_search", "project_map")),
+    ("code_patch", re.compile(r"\b(patch|diff|refactor|rename|fix\b.{0,25}\b(?:bug|error|test|code|failure|crash)|implement|add (?:a )?(?:function|method|class|feature)|"
+                              r"change the code|several (?:edits|changes))\b", _F), ("apply_patch", "code_search")),
+    ("code_files", re.compile(r"\b[\w\-]+\.(?:py|js|jsx|ts|tsx|cs|java|go|rs|cpp|c|h|kt|rb|php|sh|ps1)\b", _F), ("apply_patch", "code_search")),
+    ("code_tests", re.compile(r"\b(tests?|pytest|unittest|jest|vitest|dotnet test|npm test|failing|ci|build breaks?|passes|passing)\b", _F), ("run_tests",)),
+    ("code_git", re.compile(r"\b(git|commit|branch|stash|checkout|staged|unstaged|uncommitted|what changed|changes since|diff)\b", _F), ("git",)),
+    ("code_python", re.compile(r"\b(python repl|in python|run python|calculate|compute|evaluate|crunch|quick script|pandas|numpy|statistics|average of)\b", _F), ("python",)),
+    ("code_lint", re.compile(r"\b(lint|linter|format(?:ting)? (?:the )?(?:code|file)|ruff|black|eslint|prettier|code style|pep ?8)\b", _F), ("format_and_lint",)),
+    # --- Office: the noun alone brings office_read; noun + a create verb brings the create tool; noun + an edit verb the edit tool ---
+    ("word_read", re.compile(_WORD, _F), ("office_read",)),
+    ("word_new", _intent(_WORD, _MAKE), ("docx_create", "office_render")),
+    ("word_edit", _intent(_WORD, _CHANGE), ("docx_edit", "office_render")),
+    ("excel_read", re.compile(_EXCEL, _F), ("office_read",)),
+    ("excel_new", _intent(_EXCEL, _MAKE), ("xlsx_create",)),
+    ("excel_edit", _intent(_EXCEL, _CHANGE), ("xlsx_edit",)),
+    ("ppt_read", re.compile(_PPT, _F), ("office_read",)),
+    ("ppt_new", _intent(_PPT, _MAKE), ("pptx_create", "office_render")),
+    ("ppt_edit", _intent(_PPT, _CHANGE), ("pptx_edit", "office_render")),
+    ("pdf_read", re.compile(_PDF, _F), ("office_read",)),
+    ("pdf_new", _intent(_PDF, _MAKE), ("pdf_create", "office_render")),
+    ("undo", re.compile(r"\b(undo|revert|restore|roll\s?back|put (?:it|that) back|backups?|previous version)\b", _F),
+     ("restore_from_backup",)),
     ("desktop", re.compile(r"\b(click|double[- ]?click|mouse|cursor|keyboard|type\s+(?:in|into)|press|hotkey|minimi[sz]e|"
                            r"window|desktop|screen)\b", _F), ("cua_cursor", "cua_mouse", "cua_keyboard")),
 ]
@@ -91,20 +143,36 @@ def select_tools(user_text: str, history: Optional[Iterable[dict]] = None,
 
 
 class ToolCatalog:
-    """Every tool the model could use, searchable by keyword. Lives next to the loop so tool_search can add schemas."""
+    """Every tool the model could use, searchable by keyword. Lives next to the loop so tool_search can add schemas.
 
-    def __init__(self, tools: Iterable[dict]):
+    MCP tools (P4) ride along: `keywords` maps a tool name to extra words that should find it (its server's hint),
+    `core` is the set of main tools of each server (they win ties), `more` returns a line about sibling tools."""
+
+    def __init__(self, tools: Iterable[dict], keywords: Optional[Dict[str, str]] = None,
+                 core: Optional[Iterable[str]] = None, more: Any = None):
         self._by_name: Dict[str, dict] = {}
         for t in tools:
             name = (t.get("function") or {}).get("name")
             if name and name != TOOL_SEARCH_NAME:
                 self._by_name[name] = t
+        self._keywords = dict(keywords or {})
+        self._core = set(core or ())
+        self._more = more
 
     def names(self) -> List[str]:
         return list(self._by_name)
 
     def get(self, name: str) -> Optional[dict]:
         return self._by_name.get(name)
+
+    def more_hint(self, found: Iterable[dict]) -> str:
+        """Extra line for the tool_search answer (e.g. the other tools of an MCP server). Empty when there is none."""
+        if self._more is None:
+            return ""
+        try:
+            return str(self._more([t["function"]["name"] for t in found]) or "")
+        except Exception:                                # noqa: BLE001 - a hint must never break a search
+            return ""
 
     def search(self, query: str, limit: int = 4) -> List[dict]:
         q = str(query or "").lower()
@@ -118,11 +186,16 @@ class ToolCatalog:
             fn = spec["function"]
             name_words = set(re.findall(r"[a-z0-9]+", name.lower()))
             desc = str(fn.get("description", "")).lower()
+            extra = set(re.findall(r"[a-z0-9]+", self._keywords.get(name, "").lower()))
             for w in words:
                 if w in name_words or w in name.lower():
                     scores[name] = scores.get(name, 0) + 3
+                elif w in extra:
+                    scores[name] = scores.get(name, 0) + 3
                 elif w in desc:
                     scores[name] = scores.get(name, 0) + 1
+            if name in self._core and name in scores:
+                scores[name] += 2                        # a server's main tools beat its niche ones on a tie
         ranked = sorted((n for n in scores if n in self._by_name), key=lambda n: (-scores[n], n))
         return [self._by_name[n] for n in ranked[:limit]]
 
@@ -135,3 +208,52 @@ def describe_tools(specs: Iterable[dict]) -> str:
         first = re.split(r"(?<=[.!?])\s", str(fn.get("description", "")).strip(), maxsplit=1)[0]
         lines.append(f"- {fn['name']}: {first[:140]}")
     return "\n".join(lines)
+
+
+# --- coding mode: the harness adds a short work-method note to the prompt while any of these tools is in play ---
+CODING_TOOLS = frozenset({"code_search", "project_map", "apply_patch", "run_tests", "git", "format_and_lint"})
+
+CODING_ADDENDUM = (
+    "CODING MODE: work like this. (1) Look first: project_map for an unfamiliar project, code_search to find the exact place, "
+    "read_local_file for just those lines. (2) Say your plan in update_plan if there are several steps. (3) Change code with "
+    "apply_patch (several edits to one file at once) or edit_local_file; copy old text exactly. (4) The harness checks syntax after "
+    "every code edit and adds the result to the tool answer: if it reports a problem, fix it before anything else. (5) Run run_tests "
+    "after changing behaviour and fix what fails; do not claim it works until the tests pass. (6) Finish with a short report: what "
+    "changed (file + what), test result, anything left. Never say you edited or tested something unless the tool answer confirms it."
+)
+
+
+def coding_mode(tool_names: Iterable[str]) -> bool:
+    return bool(CODING_TOOLS & set(tool_names))
+
+
+# --- Office mode: the harness adds the office guidance (.core/skills/definitions/office/SKILL.md) while a create / edit / render tool is in play ---
+OFFICE_TOOLS = frozenset({"docx_create", "docx_edit", "xlsx_create", "xlsx_edit", "pptx_create", "pptx_edit", "pdf_create", "office_render"})
+
+_OFFICE_DEFAULT = (
+    "OFFICE FILES: never write library code; the tools build the file and send it to the chat. New file: docx_create / xlsx_create / "
+    "pptx_create / pdf_create (easiest input: markdown; slides separated by a --- line). Change a file: office_read it first, then "
+    "docx_edit / xlsx_edit / pptx_edit with exact text. Spreadsheets: headers in 'columns', calculations as formulas ('=B2*C2'). "
+    "Slides: one idea each, at most 6 short bullets. If the answer says 'NOT sent to the chat yet', fix the problem and call the same tool "
+    "again. Check the look with office_render + analyze_image. Do not write the file path or a MEDIA: line yourself.")
+_guide_cache: Dict[str, Any] = {"mtime": None, "text": _OFFICE_DEFAULT}
+
+
+def office_mode(tool_names: Iterable[str]) -> bool:
+    return bool(OFFICE_TOOLS & set(tool_names))
+
+
+def office_guidance(max_chars: int = 2600) -> str:
+    """The text of .core/skills/definitions/office/SKILL.md (or .core/skills/office/SKILL.md) without its front matter (re-read when the file changes), else the built-in default."""
+    try:
+        from lucy import paths as _paths
+        base = _paths.ROOT / ".core" / "skills"
+        f = next(c for c in (base / "definitions" / "office" / "SKILL.md", base / "office" / "SKILL.md") if c.is_file())
+        mtime = f.stat().st_mtime
+        if _guide_cache["mtime"] != mtime:
+            txt = f.read_text(encoding="utf-8")
+            txt = re.sub(r"\A---\s*\n.*?\n---\s*\n", "", txt, count=1, flags=re.DOTALL).strip()
+            _guide_cache.update(mtime=mtime, text=txt[:max_chars] if txt else _OFFICE_DEFAULT)
+        return _guide_cache["text"]
+    except Exception:                                    # noqa: BLE001 - missing / unreadable file: built-in text
+        return _OFFICE_DEFAULT

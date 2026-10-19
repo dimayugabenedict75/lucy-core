@@ -34,6 +34,30 @@ def client():
     return TestClient(api.app)
 
 
+def _purge(*sids):
+    with api._db_lock:
+        for sid in sids:
+            for table in ("messages", "summaries", "sessions"):
+                try:
+                    api._conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (sid,))
+                except Exception:                                # noqa: BLE001 - a table this version does not have
+                    pass
+        api._conn.commit()
+
+
+class _session:
+    """A session id nobody used before, deleted afterwards. When the whole suite runs, `lucy.paths` is already imported with the REAL
+    project root before this file sets LUCY_ROOT, so these tests write into the real runtime/sessions.sqlite: a fixed id piled up
+    4 messages per run (the alternation test then failed) and left test sessions in the chat sidebar."""
+    def __init__(self, prefix):
+        import uuid
+        self.sid = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    def __enter__(self):
+        return self.sid
+    def __exit__(self, *a):
+        _purge(self.sid)
+
+
 def test_tools_registered_everywhere():
     names = [t["function"]["name"] for t in api.TOOLS]
     for n in proactive.TOOL_NAMES:
@@ -68,12 +92,12 @@ def test_tool_roundtrip_through_execute_tool_call():
 
 
 def test_test_endpoint_stores_message_in_active_session_and_streams():
-    with client() as c:
-        api._append_message("s-active", "user", "hello")
-        api._append_message("s-active", "assistant", "hi")
+    with client() as c, _session("s-active") as sid:
+        api._append_message(sid, "user", "hello")
+        api._append_message(sid, "assistant", "hi")
         res = c.post("/api/proactive/test", headers=H, json={"text": "ping from test"}).json()
         assert res["ok"]
-        msgs = api._get_messages("s-active")
+        msgs = api._get_messages(sid)
         assert msgs[-1]["role"] == "assistant" and "ping from test" in msgs[-1]["content"]
         # no window was open -> replayed to the next connection (poll variant of the same data)
         ev = c.get("/api/proactive/pending?since=0", headers=H).json()["events"]
@@ -87,14 +111,13 @@ def test_test_endpoint_stores_message_in_active_session_and_streams():
 
 
 def test_cli_sessions_never_receive_proactive_messages():
-    with client():
-        api._append_message("cli-dev", "user", "x")
+    with client(), _session("cli-dev") as sid:
+        api._append_message(sid, "user", "x")
         assert not api._proactive_pick_session().startswith("cli-")
 
 
 def test_build_messages_alternates_and_carries_clock():
-    with client():
-        sid = "s-alt"
+    with client(), _session("s-alt") as sid:
         api._append_message(sid, "assistant", "unprompted hello")                 # Lucy spoke first
         api._append_message(sid, "user", "hey")
         api._append_message(sid, "assistant", "reply")
@@ -151,8 +174,7 @@ def test_promise_detector_catches_announce_then_stop():
 
 
 def test_clock_note_only_when_about_time():
-    with client():
-        sid = "s-clock"
+    with client(), _session("s-clock") as sid:
         api._append_message(sid, "user", "hi"); api._append_message(sid, "assistant", "hey")
         assert "Current local time" not in api._build_messages(sid, "read agent_loop.py")[-1]["content"]
         assert "Current local time" in api._build_messages(sid, "remind me tomorrow at 9")[-1]["content"]

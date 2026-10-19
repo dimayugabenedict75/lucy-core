@@ -23,6 +23,7 @@ if "lucy.cua.lucy_cua" not in sys.modules:
 
 from lucy.server import api  # noqa: E402
 from lucy.tools import registry as R  # noqa: E402
+from lucy.safety.taint import unwrap  # noqa: E402
 
 
 def _dummy():
@@ -53,7 +54,7 @@ def test_google_tools_work_through_execute_tool_call():
     saved = T.get_doc_content
     T.get_doc_content = lambda self, title: f"content:{title}"
     try:
-        assert asyncio.run(api.execute_tool_call("get_doc_content", {"title": "Plan"})) == "content:Plan"
+        assert unwrap(asyncio.run(api.execute_tool_call("get_doc_content", {"title": "Plan"}))) == "content:Plan"   # P1: untrusted frame
         assert api._tool_to_activity("get_doc_content", {}) == "docs"
         assert api._tool_to_activity("list_drive_files", {}) == "drive"
     finally:
@@ -86,7 +87,7 @@ def test_web_and_media_tools_work_through_execute_tool_call():
     web._web_search = fake_search
     media.clean_for_speech = lambda text, names: (seen.setdefault("names", names), "")[1]
     try:
-        assert asyncio.run(api.execute_tool_call("web_search", {"query": "cats"})) == "S:cats:5"
+        assert unwrap(asyncio.run(api.execute_tool_call("web_search", {"query": "cats"}))) == "S:cats:5"
         out = asyncio.run(api.execute_tool_call("send_tts", {"text": "hello"}))
         assert out.startswith("send_tts: nothing speakable")
         assert "send_tts" in seen["names"] and "web_search" in seen["names"]       # api passes the real tool-name list

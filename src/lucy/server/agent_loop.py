@@ -43,6 +43,7 @@ import asyncio
 import difflib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -57,12 +58,21 @@ from lucy.server.text_tool_calls import TextToolCallFilter
 from lucy.tools.routing import TOOL_SEARCH_NAME, describe_tools
 
 logger = logging.getLogger("lucy.core.agent")
+VERIFY_NAMES = frozenset({"edit_local_file", "write_local_file", "apply_patch"})
 
 # Tools that only read: an identical repeat within the same state of the world is wasted work.
 READ_ONLY_TOOLS = frozenset({
     "web_search", "web_extract", "read_local_file", "list_local_files", "find_file", "recall_memory",
-    "search_conversations", "get_doc_content", "list_drive_files", "analyze_image",
+    "search_conversations", "get_doc_content", "list_drive_files", "analyze_image", "code_search", "project_map", "office_read",
 })
+
+# Independent reads that can safely run side by side in one round (no shared client/state, no GPU slot, no approval of
+# their own). Google tools share one non-thread-safe client and analyze_image needs the single llama slot: not listed.
+PARALLEL_TOOLS = frozenset({"read_local_file", "list_local_files", "find_file", "code_search", "project_map",
+                            "web_search", "web_extract", "recall_memory", "search_conversations", "office_read"})
+
+# Tools that put the file they made into the chat themselves (MEDIA: result): that counts as "sent the file".
+DELIVERS_FILES = frozenset({"docx_create", "docx_edit", "xlsx_create", "xlsx_edit", "pptx_create", "pptx_edit", "pdf_create"})
 
 _NOTE = "[Harness note - internal, do not mention or quote it] "
 
@@ -72,7 +82,11 @@ _CLAIM_FAMILIES = [
     ("saved something to memory", r"saved|stored|added|noted|recorded|committed|written|logged|remembered",
      r"memory|persistent|long[- ]term|remember", {"remember"}),
     ("changed a file", r"updated|edited|patched|modified|changed|rewrote|written|wrote|created|saved|fixed|appended|added",
-     r"file|\.py\b|\.md\b|\.json\b|api\.py|lucy\.md|\bcode\b|persona|harness|script", {"edit_local_file", "write_local_file"}),
+     r"file|\.py\b|\.md\b|\.json\b|api\.py|lucy\.md|\bcode\b|persona|harness|script",
+     {"edit_local_file", "write_local_file", "apply_patch", "format_and_lint", "docx_create", "docx_edit", "xlsx_create", "xlsx_edit",
+      "pptx_create", "pptx_edit", "pdf_create"}),
+    ("ran the tests", r"ran|run|tested|verified|executed|checked", r"\btests?\b|test suite|pytest|unit tests",
+     {"run_tests", "run_shell_command", "python"}),
     ("sent something to the chat", r"sent|attached|shared|dropped|posted|delivered",
      r"sticker|image|picture|file|screenshot", {"send_sticker", "send_file"}),
     ("searched the web", r"searched|looked\s+up|googled|browsed",
@@ -275,14 +289,29 @@ class AgentLoop:
     activity_for   (name, args) -> activity label for the UI
     count_tokens   (text) -> int
     trace          optional callable(dict) for per-call / per-turn logging
+    gate           optional async (name, args, emit) -> None | refusal text (the P1 permission layer)
     """
 
     def __init__(self, *, brain, tools: list[dict], execute: Callable[[str, dict], Awaitable[str]],
                  activity_for: Callable[[str, dict], str], count_tokens: Callable[[str], int],
                  temperature: float, cfg: LoopConfig | None = None,
                  trace: Callable[[dict], None] | None = None, session_id: str | None = None,
-                 tool_catalog: Any = None, on_tools_added: Callable[[list], None] | None = None):
+                 tool_catalog: Any = None, on_tools_added: Callable[[list], None] | None = None,
+                 gate: Callable[[str, dict, Callable[[str, Any], None] | None], Awaitable[str | None]] | None = None,
+                 verify: Any = "default"):
         self.cfg = cfg or LoopConfig()
+        # VERIFY step (lucy.tools._verify): after a successful file write/edit the harness checks syntax (and, if the user
+        # enabled LUCY_VERIFY=tests, runs the tests) and appends the outcome to the tool result. None = off.
+        if verify == "default":
+            from lucy.tools import _verify
+            verify = _verify.verify_after
+        self.verify = verify
+        self._gate_lock = asyncio.Lock()                    # approval cards appear one at a time, even for parallel calls
+        # Permission gate (lucy.safety): awaited right before a tool runs. None = run it; a string = not allowed (it
+        # becomes the tool result). It may pause the turn to ask the user: it reports that through `emit`
+        # (approval_request / approval_resolved / activity events), which the loop streams out while it waits.
+        self.gate = gate
+        self._emit: Callable[[str, Any], None] | None = None
         self.tool_catalog = tool_catalog          # optional ToolCatalog: tool_search + auto-adding tools not shown this turn
         self.on_tools_added = on_tools_added      # called with the new tool names (api.py remembers them for the next turns)
         if self.cfg.plan_tool and not any(t.get("function", {}).get("name") == PLAN_TOOL_NAME for t in tools):
@@ -829,35 +858,117 @@ class AgentLoop:
             for c in prepared]})
         st.tool_calls_total += len(prepared)
 
-        for c in prepared:
+        i = 0
+        while i < len(prepared):
+            group = self._parallel_group(prepared, i)
+            if len(group) > 1:
+                first = group[0]
+                yield Event("activity", self.activity_for(first["name"], first["args"] or {}))
+
+                async def timed(c):
+                    t0 = time.monotonic()
+                    out = await self._execute_one(c, st)
+                    return out, int((time.monotonic() - t0) * 1000)
+
+                async def run_all():
+                    return await asyncio.gather(*[timed(c) for c in group])
+
+                outcomes: list = []
+                async for item in self._with_side_events(run_all()):
+                    if isinstance(item, Event):
+                        yield item
+                    else:
+                        outcomes = item
+                self._trace(event="parallel_reads", round=st.rounds, tools=[c["name"] for c in group])
+                for c, ((result, ok, flag), ms) in zip(group, outcomes):      # results go back in the order they were asked
+                    async for ev in self._record(c, result, ok, flag, ms, messages, st):
+                        yield ev
+                i += len(group)
+                continue
+            c = prepared[i]
             name = c["name"]
             yield Event("activity", "think" if name in (PLAN_TOOL_NAME, TOOL_SEARCH_NAME) else self.activity_for(name, c["args"] or {}))
             t0 = time.monotonic()
-            result, ok, flag = await self._execute_one(c, st)
+            result, ok, flag = "", False, ""
+            async for item in self._with_side_events(self._execute_one(c, st)):
+                if isinstance(item, Event):
+                    yield item                       # e.g. an approval card while the call waits for the user
+                else:
+                    result, ok, flag = item
             ms = int((time.monotonic() - t0) * 1000)
-            self._trace(event="tool", round=st.rounds, tool=name, ok=ok, flag=flag, ms=ms,
-                        result_chars=len(result), args=json.dumps(c["args"] or {}, ensure_ascii=False)[:300],
-                        error=("" if ok else result[:240]))
-            if ok:
-                st.ok_tools.add(name)
-            model_view = result
-            if result.startswith("MEDIA:"):
-                # The UI shows the file; the model only needs to know it was delivered (and must not echo the path)
-                short = json.dumps(c["args"] or {}, ensure_ascii=False)[:120]
-                model_view = (f"Delivered to the user's chat via {name} {short}. It is displayed automatically - do "
-                              "not write the file path or a MEDIA: line in your reply.")
-            messages.append({"role": "tool", "tool_call_id": c["id"], "content": model_view})
-            st.last_result = model_view
-            if result.startswith("MEDIA:"):
-                yield Event("media", result.split(" ", 1)[0].replace("MEDIA:", ""))
+            async for ev in self._record(c, result, ok, flag, ms, messages, st):
+                yield ev
+            i += 1
+
+    def _parallel_group(self, prepared: list, start: int) -> list:
+        """Consecutive independent read-only calls starting at `start` that may run at the same time (LUCY_PARALLEL=0 = never)."""
+        if os.environ.get("LUCY_PARALLEL", "1").strip().lower() in ("0", "false", "off", "no"):
+            return []
+        group, seen = [], set()
+        for c in prepared[start:]:
+            sig = (c["name"], json.dumps(c["args"], sort_keys=True, default=str))
+            if c["name"] not in PARALLEL_TOOLS or c["name"] not in self.schemas or c["parse_error"] or sig in seen:
+                break
+            seen.add(sig)
+            group.append(c)
+        return group
+
+    async def _record(self, c: dict, result: str, ok: bool, flag: str, ms: int, messages: list, st: TurnState) -> AsyncIterator[Event]:
+        name = c["name"]
+        self._trace(event="tool", round=st.rounds, tool=name, ok=ok, flag=flag, ms=ms,
+                    result_chars=len(result), args=json.dumps(c["args"] or {}, ensure_ascii=False)[:300],
+                    error=("" if ok else result[:240]))
+        if ok:
+            st.ok_tools.add(name)
+            if name in DELIVERS_FILES and result.startswith("MEDIA:"):
+                st.ok_tools.add("send_file")
+        model_view = result
+        if result.startswith("MEDIA:"):
+            # The UI shows the file; the model only needs to know it was delivered (and must not echo the path)
+            short = json.dumps(c["args"] or {}, ensure_ascii=False)[:120]
+            model_view = (f"Delivered to the user's chat via {name} {short}. It is displayed automatically - do "
+                          "not write the file path or a MEDIA: line in your reply.")
+        messages.append({"role": "tool", "tool_call_id": c["id"], "content": model_view})
+        st.last_result = model_view
+        if result.startswith("MEDIA:"):
+            yield Event("media", result.split(" ", 1)[0].replace("MEDIA:", ""))
+
+    async def _with_side_events(self, coro):
+        """Run `coro` and stream out the events it emits while it runs (the gate's approval cards), then its result.
+        If the consumer stops (Stop button) the call is cancelled, which also withdraws a pending approval."""
+        q: asyncio.Queue = asyncio.Queue()
+        self._emit = lambda kind, data=None: q.put_nowait(Event(kind, data))
+        task = asyncio.ensure_future(coro)
+        getter = None
+        try:
+            while True:
+                getter = asyncio.ensure_future(q.get())
+                done, _ = await asyncio.wait({task, getter}, return_when=asyncio.FIRST_COMPLETED)
+                if getter in done:
+                    yield getter.result()
+                else:
+                    getter.cancel()
+                getter = None
+                if task.done():
+                    while not q.empty():
+                        yield q.get_nowait()
+                    yield task.result()
+                    return
+        finally:
+            self._emit = None
+            if getter is not None:
+                getter.cancel()
+            if not task.done():
+                task.cancel()
 
     # What to try when a tool is blocked. The loop never gives up on a task because a tool failed: it hands
     # the model concrete ways round the problem, escalating the longer the blocker lasts.
     _PLAYBOOK = {
         "edit_local_file": "read_local_file the exact lines (use search / start_line) and retry with a smaller, exact "
                            "old_string; or rewrite the whole file with write_local_file; or apply the change with "
-                           "run_shell_command (a short Python script or sed). Binary formats (.docx .xlsx .pdf) cannot "
-                           "be text-edited: generate the new file with a script instead.",
+                           "run_shell_command (a short Python script or sed). Binary formats (.docx .xlsx .pptx .pdf) cannot "
+                           "be text-edited: use docx_edit / xlsx_edit / pptx_edit (office_read the file first) or docx_create / "
+                           "xlsx_create / pptx_create / pdf_create for a new one.",
         "write_local_file": "check the folder with list_local_files, try a path inside the Lucy Core folder, or write "
                             "the file with run_shell_command (a short Python script).",
         "read_local_file": "find the right path with find_file / list_local_files, read a slice with search or "
@@ -865,6 +976,25 @@ class AgentLoop:
         "send_file": "confirm the real path with find_file / list_local_files; a folder must be zipped first "
                      "(run_shell_command) and the zip sent; a file outside the allowed folder must be copied into the "
                      "Lucy Core folder first (run_shell_command) and the copy sent.",
+        "apply_patch": "read_local_file the exact lines and retry with smaller edits whose old text is copied exactly; or use "
+                       "edit_local_file for one change at a time; or rewrite the whole file with write_local_file.",
+        "run_tests": "read the failure lines it gave you, open the failing code with read_local_file, fix it, and run it again; "
+                     "if no framework was found, pass cwd (the folder with the tests) or use run_shell_command.",
+        "docx_create": "read the error: it names the block that is wrong. Retry with 'markdown' (headings, - bullets, | tables |) instead of 'blocks'.",
+        "docx_edit": "office_read the file and copy the exact words into find / match (a shorter piece is safer); tables are edited with set_cell / add_row.",
+        "xlsx_create": "read the error, then retry with 'columns' (header texts) and 'rows' (lists of cells); formulas are texts starting with '='.",
+        "xlsx_edit": "office_read the file to see the sheet names and cells, then retry; use sheet 1, 2, 3 if a name does not match.",
+        "pptx_create": "retry with 'markdown': '# Title' and '- bullets' for each slide, slides separated by a line '---'.",
+        "pptx_edit": "office_read the deck to see the slide numbers (from 1), then retry with a smaller list of ops.",
+        "pdf_create": "retry with 'markdown'; if characters are missing, make the document with docx_create instead.",
+        "office_read": "check the path with find_file; for a scanned PDF use office_render and analyze_image; for an old .doc / .xls LibreOffice must be installed.",
+        "office_render": "LibreOffice is needed for Word / Excel / PowerPoint (PDFs work without): tell the user, and check the content with office_read instead.",
+        "git": "run git action 'status' to see the real state first; if it is not a repository use action 'init'; "
+               "anything else (push, pull, reset) goes through run_shell_command and may ask the user.",
+        "code_search": "try a shorter or different query, regex=true, or a wider folder; or find the file with find_file.",
+        "project_map": "pass a different path, or use list_local_files and read_local_file instead.",
+        "python": "send smaller code; for files or programs use the file tools or run_shell_command (the python tool cannot).",
+        "format_and_lint": "no linter may be installed: skip it and tell the user, or check the syntax by running the code.",
         "web_search": "rephrase with different keywords, search for a more specific part of the question, or open a "
                       "known page with web_extract.",
         "web_extract": "try another result from web_search, or search for a cached / alternative source of the page.",
@@ -923,8 +1053,11 @@ class AgentLoop:
             added = self._add_tools(found)
             self._trace(event="tool_search", round=st.rounds, query=query[:80], found=[t["function"]["name"] for t in found], added=added)
             if found:
+                more = getattr(self.tool_catalog, "more_hint", None)
+                more = more(found) if callable(more) else ""
                 return (f"Now available (call them directly):\n{describe_tools(found)}\n"
-                        f"{_NOTE}Use the right one for the user's request now."), True, ""
+                        + (more + "\n" if more else "")
+                        + f"{_NOTE}Use the right one for the user's request now."), True, ""
             have = ", ".join(sorted(n for n in self.schemas if n != TOOL_SEARCH_NAME))
             return f"No tool matches '{query}'. Tools you already have: {have}.", True, ""
 
@@ -952,6 +1085,14 @@ class AgentLoop:
             return fail(f"This exact call already failed {prev[0]} times with: {prev[2]}\n{_NOTE}It was not run "
                         "again, because nothing has changed since. Change the arguments or the approach.", "repeat_fail")
 
+        if self.gate is not None:
+            async with self._gate_lock:                 # parallel calls: ask about one at a time
+                verdict = await self.gate(name, args, self._emit)
+            if verdict is not None:                     # denied / refused / nobody to approve: never a dead end
+                st.tool_errors += 1                     # ...but no workaround playbook: getting the same effect through
+                st.sig_failed[sig] = (2, st.epoch, verdict[:300])   # another tool would defeat the user's decision
+                self._trace(event="tool_denied", round=st.rounds, tool=name, reason=verdict[:200])
+                return verdict, False, "denied"
         try:
             raw = await asyncio.wait_for(self.execute(name, args), timeout=cfg.tool_timeout)
         except asyncio.TimeoutError:
@@ -976,6 +1117,17 @@ class AgentLoop:
             return fail(result, "tool_error")
         st.fail_streak[name] = 0
         st.progress = True
+        if self.verify is not None and name in VERIFY_NAMES:      # harness-side check of the changed file (no approval, can't be skipped)
+            try:
+                extra = await self.verify(name, args, result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:                              # noqa: BLE001 - a check must never break the turn
+                logger.warning(f"verify after {name} failed: {e}")
+                extra = ""
+            if extra:
+                result += "\n" + extra
+                self._trace(event="verify", round=st.rounds, tool=name, note=extra[:160])
         if name in READ_ONLY_TOOLS:
             st.cache[key] = (result, st.epoch)
         else:

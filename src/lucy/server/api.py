@@ -37,6 +37,8 @@ from lucy.server.stickers_tool import StickerLibrary, send_sticker as _send_stic
 from lucy.server import library as _library_mod            # persistent file/image cache + Library view
 from lucy.server.harness_info import build_harness_digest   # accurate map of Lucy Core for the agent
 from lucy import proactive as _proactive                    # reminders, follow-ups, greetings (Lucy can speak first)
+from lucy import safety as _safety                          # P1: permissions, approvals, audit, undo, constitution lock
+from lucy import mcp as _mcp                                # P4: MCP servers (tools found with tool_search, never all in the prompt)
 import base64
 
 # Persona is loaded from file
@@ -1160,6 +1162,10 @@ def _truncate(s: str, limit: int = _ACTIVITY_DETAIL_MAX) -> str:
     return s if len(s) <= limit else s[:limit - 1] + "\u2026"
 
 
+_OFFICE_ACTIVITY = {"docx_create": "write", "xlsx_create": "write", "pptx_create": "write", "pdf_create": "write",
+                    "docx_edit": "edit", "xlsx_edit": "edit", "pptx_edit": "edit", "office_read": "read", "office_render": "analyze"}
+
+
 def _tool_to_activity(tool_name: str, args: dict) -> str:
     """Map a tool name + its args to a 'prefix:detail' activity label for the
     frontend (e.g. 'write:reset.py', 'search:latest iPhone'). The frontend
@@ -1180,6 +1186,8 @@ def _tool_to_activity(tool_name: str, args: dict) -> str:
         return f"run:{_truncate(args['command'])}"
     if tool_name == "send_file" and args.get("file_path"):
         return f"send:{args['file_path']}"
+    if tool_name in _OFFICE_ACTIVITY and args.get("path"):
+        return f"{_OFFICE_ACTIVITY[tool_name]}:{args['path']}"
     if tool_name == "web_search" and args.get("query"):
         return f"search:{_truncate(args['query'])}"
     if tool_name == "web_extract" and args.get("urls"):
@@ -1326,6 +1334,18 @@ def _note_added_tools(session_id: str | None, names: list) -> None:
     hist[-1] = sorted(set(hist[-1]) | set(names))
 
 
+def _mcp_for_turn():
+    """(schemas of the enabled MCP tools, search keywords, core names, more-hint fn, hint text). They only reach the
+    catalog (tool_search / auto-add); a tool enters the prompt when the model asked for it. Never breaks a chat."""
+    try:
+        m = _mcp.get()
+        tools = m.catalog_schemas()
+        return tools, m.keywords(), m.core_names(), m.more_hint, m.hint()
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning(f"MCP tools unavailable this turn: {e}")
+        return [], {}, set(), None, ""
+
+
 def _tools_for_turn(messages: List[Dict[str, Any]], skill_list: list[dict] | None = None, session_id: str | None = None):
     """(tools shown to the model this turn, catalog of every tool for tool_search / auto-add).
 
@@ -1340,8 +1360,11 @@ def _tools_for_turn(messages: List[Dict[str, Any]], skill_list: list[dict] | Non
     if skill_list:                                           # skills can still pull their tools in
         names += [t["function"]["name"] for t in _resolve_skills_to_tools(skill_list) if t["function"]["name"] not in names]
     keep = _sticky_tool_names(session_id, names)
-    shown = [t for t in TOOLS if t["function"]["name"] in keep] + [_routing.TOOL_SEARCH]      # TOOLS order = stable prompt
-    return shown, _routing.ToolCatalog(TOOLS)
+    mcp_tools, mcp_kw, mcp_core, mcp_more, mcp_hint = _mcp_for_turn()
+    shown = ([t for t in TOOLS if t["function"]["name"] in keep]                 # TOOLS order = stable prompt
+             + [t for t in mcp_tools if t["function"]["name"] in keep]           # MCP tools the model pulled in recently
+             + [_routing.tool_search_schema(mcp_hint)])
+    return shown, _routing.ToolCatalog(TOOLS + mcp_tools, keywords=mcp_kw, core=mcp_core, more=mcp_more)
 
 
 async def _stream_response(messages: List[Dict[str, Any]], temperature: float | None = None, skill_list: list[dict] = None, voice_mode: bool = False, session_id: str | None = None):
@@ -1364,7 +1387,19 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
     _refresh_sticker_tool()                   # new sticker files are picked up without a restart
     if temperature is None:
         temperature = llm.temperature          # Settings > Model value (preset per model)
+    _halt = _safety.get().halt_reason()       # constitution files changed without the user sealing them
+    if _halt:
+        yield f"data: {json.dumps({'error': _halt})}\n\n"
+        return
     available_tools, _catalog = _tools_for_turn(messages, skill_list, session_id)
+    if _catalog is not None and _routing.coding_mode(t["function"]["name"] for t in available_tools):
+        messages = list(messages)             # coding turn: add the short work-method note after the stable system blocks
+        _at = next((i for i, m in enumerate(messages) if m.get("role") != "system"), len(messages))
+        messages.insert(_at, {"role": "system", "content": _routing.CODING_ADDENDUM})
+    if _catalog is not None and _routing.office_mode(t["function"]["name"] for t in available_tools):
+        messages = list(messages)             # Word / Excel / PowerPoint / PDF turn: add the office guidance (.core/skills/definitions/office/SKILL.md)
+        _at = next((i for i, m in enumerate(messages) if m.get("role") != "system"), len(messages))
+        messages.insert(_at, {"role": "system", "content": _routing.office_guidance()})
     _tts_filter = TTSStreamFilter(_tool_names())    # strips tool calls, paths, MEDIA: ... (all tools, not just the ones shown)
     agent = AgentLoop(
         brain=_BRAIN, tools=available_tools,
@@ -1373,7 +1408,8 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
         cfg=LoopConfig(max_rounds=MAX_TOOL_ROUNDS, max_tokens=LUCY_MAX_TOKENS, tool_timeout=LUCY_TOOL_TIMEOUT,
                        ctx_tokens=int(llm.cfg.get("context_length", 100000)), http_timeout=LUCY_TIMEOUT),
         trace=_agent_trace, session_id=session_id, tool_catalog=_catalog,
-        on_tools_added=lambda names: _note_added_tools(session_id, names))
+        on_tools_added=lambda names: _note_added_tools(session_id, names),
+        gate=_safety.get().gate_for(session_id))    # may pause the turn to show an approval card
 
     async def _speak(text: str):
         """Yield SSE lines that speak `text` through Lucy Audio (voice mode)."""
@@ -1408,6 +1444,8 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
             yield f"data: {json.dumps({'activity': ev.data})}\n\n"
         elif ev.kind == "media":
             yield f"data: {json.dumps({'media': ev.data})}\n\n"
+        elif ev.kind in ("approval_request", "approval_resolved"):
+            yield f"data: {json.dumps({ev.kind: ev.data})}\n\n"
         elif ev.kind == "error":
             yield f"data: {json.dumps(ev.data)}\n\n"
             return
@@ -2044,11 +2082,13 @@ async def serve_logo(name: str):
 @app.get("/api/file/{path:path}")
 async def serve_file(path: str, _: bool = Depends(verify_api_key)):
     """Serve a file from the safe root for the frontend to download/view."""
-    file_path = (SAFE_ROOT / path).resolve()
+    file_path = (SAFE_ROOT / path).resolve()          # an absolute path (D:/...) replaces SAFE_ROOT here
     try:
         file_path.relative_to(SAFE_ROOT)
     except ValueError:
-        raise HTTPException(status_code=403, detail="Path outside allowed root")
+        # Outside SAFE_ROOT: allowed if the safety layer lets Lucy read it (folders.read, not a denied path)
+        if _safety.get().decide("read_local_file", "read", {"file_path": file_path.as_posix()}, None).level != _safety.AUTO:
+            raise HTTPException(status_code=403, detail="Path outside allowed root")
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(file_path)
@@ -2731,7 +2771,8 @@ async def _proactive_run_agent(messages: list, allowed: list, timeout: float, ma
         cfg=LoopConfig(max_rounds=max_rounds, max_tokens=LUCY_MAX_TOKENS, tool_timeout=LUCY_TOOL_TIMEOUT,
                        ctx_tokens=int(llm.cfg.get("context_length", 100000)), http_timeout=LUCY_TIMEOUT,
                        plan_tool=False),
-        trace=_agent_trace, session_id="proactive-task")
+        trace=_agent_trace, session_id="proactive-task",
+        gate=lambda name, args, _emit: _safety.get().gate(name, args, None, None))   # no approver in the background
     text = ""
 
     async def consume():
@@ -2785,7 +2826,7 @@ async def _proactive_start():
             is_busy=_proactive_is_busy, health=_proactive_health, app_timezone=_proactive_app_timezone,
             persona=lambda: _persona_prompt, llm_ready=_proactive_llm_ready, llm_complete=_proactive_llm_complete,
             run_agent=_proactive_run_agent, memory_context=_memory_manager.get_contextual_memory,
-            sticker=_proactive_sticker, speak=_proactive_speak))
+            sticker=_proactive_sticker, speak=_proactive_speak, paused=lambda: _safety.get().paused))
         await _proactive.start()
     except Exception as e:                                # noqa: BLE001 - Lucy must start even if this cannot
         logger.error(f"Proactive system failed to start: {e}", exc_info=True)
@@ -2794,6 +2835,136 @@ async def _proactive_start():
 @app.on_event("shutdown")
 async def _proactive_stop():
     await _proactive.stop()
+
+
+# === Safety layer (P1): permissions, approvals, audit, undo. These routes are for the USER (the UI); the agent has no
+# tool that calls them, its shell gets no API key, and any shell command mentioning them always asks first.
+@app.on_event("startup")
+async def _safety_start():
+    layer = _safety.install()
+    if layer.constitution.note:
+        logger.info(f"Safety: {layer.constitution.note}")
+    if layer.constitution.problems:
+        logger.error(f"Safety: constitution files changed without being sealed: {layer.constitution.problems}. "
+                     "The agent will not run tools until you run: python -m lucy.safety seal")
+    for p in layer.cfg.problems:
+        logger.warning(f"Safety config: {p}")
+
+
+@app.get("/api/safety/status")
+async def safety_status(session_id: Optional[str] = None, _ = Depends(verify_api_key)):
+    """Mode, pause flag, halted reason, pending approvals (for this chat), config problems."""
+    return _safety.get().status(session_id)
+
+
+@app.post("/api/safety/approvals/{approval_id}")
+async def safety_approve(approval_id: str, request: Request, _ = Depends(verify_api_key)):
+    """{decision: approve | deny | always}. Resumes the waiting agent turn."""
+    body = await request.json()
+    try:
+        ok = _safety.get().broker.resolve(approval_id, str(body.get("decision", "")), body.get("session_id"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=404, detail="no such pending approval (already answered, timed out or stopped)")
+    return {"ok": True}
+
+
+@app.post("/api/safety/mode")
+async def safety_mode(request: Request, _ = Depends(verify_api_key)):
+    body = await request.json()
+    try:
+        _safety.get().set_mode(str(body.get("mode", "")), by="user (settings)")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return _safety.get().status(body.get("session_id"))
+
+
+@app.post("/api/safety/pause")
+async def safety_pause(request: Request, _ = Depends(verify_api_key)):
+    """{paused: bool, kill_jobs: bool=true}. Paused = no tool runs anywhere (chat, background tasks, proactive)."""
+    body = await request.json()
+    paused = bool(body.get("paused", True))
+    _safety.get().set_paused(paused, by="user (settings)")
+    killed = 0
+    if paused and body.get("kill_jobs", True):
+        from lucy.tools import jobs as _jobs
+        for j in _jobs.default.all():
+            if j.running:
+                j.kill()
+                killed += 1
+    return {**_safety.get().status(body.get("session_id")), "killed_jobs": killed}
+
+
+@app.get("/api/safety/backups")
+async def safety_backups(limit: int = 30, _ = Depends(verify_api_key)):
+    return {"backups": _safety.get().backups.list(limit=max(1, min(limit, 200)))}
+
+
+@app.post("/api/safety/backups/{backup_id}/restore")
+async def safety_restore(backup_id: str, _ = Depends(verify_api_key)):
+    msg = await asyncio.to_thread(_safety.get().backups.restore, backup_id, session=None, by="user (settings)")
+    _safety.get().audit.write(event="restore", by="user (settings)", backup_id=backup_id, result=msg[:200])
+    return {"ok": not msg.startswith(("Error", "Refused")), "message": msg}
+
+
+@app.get("/api/safety/audit")
+async def safety_audit(n: int = 50, _ = Depends(verify_api_key)):
+    return {"entries": _safety.get().audit.tail(max(1, min(n, 500)))}
+
+
+# === MCP (P4). Servers come from .core/mcp.json (a constitution file: only the user edits it, then reseals). These routes
+# only switch a server the user already declared on/off, re-read its tool list or stop it. For the USER (the UI).
+@app.on_event("startup")
+async def _mcp_start():
+    await asyncio.to_thread(_mcp.get().start)        # reads the config + cached tool lists; slow work runs in a thread
+    for p in _mcp.get().problems:
+        logger.warning(f"MCP config: {p}")
+
+
+@app.on_event("shutdown")
+async def _mcp_stop():
+    await asyncio.to_thread(_mcp.get().shutdown)
+
+
+@app.get("/api/mcp/status")
+async def mcp_status(_ = Depends(verify_api_key)):
+    return _mcp.get().status()
+
+
+@app.post("/api/mcp/{key}/enabled")
+async def mcp_enabled(key: str, request: Request, _ = Depends(verify_api_key)):
+    """{enabled: bool}. Switching on reads the tool list in the background when it is not cached yet."""
+    body = await request.json()
+    m, on = _mcp.get(), bool(body.get("enabled", True))
+    try:
+        m.set_enabled(key, on)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"no MCP server called {key}")
+    if on and key not in m._raw_tools:
+        asyncio.get_running_loop().run_in_executor(None, m._safe_refresh, key)
+    return m.status()
+
+
+@app.post("/api/mcp/{key}/refresh")
+async def mcp_refresh(key: str, _ = Depends(verify_api_key)):
+    """Start the server (if needed) and re-read its tool list now."""
+    m = _mcp.get()
+    if key not in m.servers:
+        raise HTTPException(status_code=404, detail=f"no MCP server called {key}")
+    try:
+        await asyncio.to_thread(m.refresh, key)
+    except _mcp.McpError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return m.status()
+
+
+@app.post("/api/mcp/{key}/stop")
+async def mcp_stop(key: str, _ = Depends(verify_api_key)):
+    await asyncio.to_thread(_mcp.get().stop, key)
+    return _mcp.get().status()
 
 
 app.include_router(_proactive.router, dependencies=[Depends(verify_api_key)])
