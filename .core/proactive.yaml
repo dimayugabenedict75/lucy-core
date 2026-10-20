@@ -5,12 +5,10 @@
 enabled: true
 user_name: Benny
 
-# "app" follows Settings > Timezone. Your Settings value was UTC; if you live elsewhere set it here,
-# otherwise quiet hours are off by your UTC offset. Examples: "Asia/Manila" (needs 'pip install tzdata'
-# on Windows), "+08:00" (always works), "utc", "system".
-# NOTE: "app" resolves to UTC right now, so quiet hours (23:00-07:00) are applied in UTC. For Manila use
-# timezone: "Asia/Manila" (tzdata is in requirements.txt) or timezone: "+08:00" - then restart Lucy Core.
-timezone: app
+# Your timezone. Quiet hours, rest days, repeat rules and tasks all follow it.
+#   "Asia/Manila" (needs tzdata, which is in requirements.txt), "+08:00" (always works), "app" (= Settings > Timezone,
+#   which was UTC for you), "utc", "system".
+timezone: "Asia/Manila"
 
 startup_delay_seconds: 5
 tick_seconds: 10              # how often due reminders are checked
@@ -79,3 +77,22 @@ llm:
   max_tokens: 200
   temperature: 0.7
   idle_before_llm_seconds: 20  # never borrow the model while you are chatting
+
+jobs:                        # P8 task queue: long, repeating and idle-time work (tool `task`, Settings > Tasks)
+  enabled: true
+  read_tools: [web_search, web_extract, read_local_file, list_local_files, find_file, recall_memory, search_conversations]
+  blocked_tools: [task, core_change, user_tool, proactive_control]   # never available inside a job
+  default_budget: {seconds: 1200, tool_calls: 60, tokens: 80000}    # per task; "Continue" adds another round
+  max_budget: {seconds: 14400, tool_calls: 600, tokens: 800000}     # the most a task can ask for
+  max_runs_per_day: 8          # started runs per day (Run now / Continue ignore the daily caps)
+  max_tool_calls_per_day: 400
+  max_seconds_per_day: 10800
+  max_active: 30
+  max_attempts: 3              # a run that errors is retried from its checkpoint
+  retry_minutes: 10
+  park_timeout_hours: 48       # an approval nobody answers counts as a denial after this long
+  auto_start_model_full: false # false: a task the MODEL created with full tools waits for your OK in Settings > Tasks
+  idle_start_minutes: 10       # "idle" tasks start after this much quiet
+  report_max_chars: 1200
+  keep_days: 60
+  system_jobs: true            # reflection + weekly trace review run on the queue (false = their own loops, like before)

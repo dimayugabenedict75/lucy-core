@@ -11,10 +11,12 @@ from lucy.server import file_guard
 
 
 def extra_roots() -> list:
-    """The `folders.read` entries of permissions.yaml as Paths ("c:" -> "c:/", a drive root)."""
+    """The `folders.read` entries of permissions.yaml plus the reachable `drives` (a new drive shows up while running),
+    as Paths ("c:" -> "c:/", a drive root)."""
     try:
         from lucy import safety                      # lazy: the safety layer imports this module too
-        folders = list(safety.get().cfg.read_folders)
+        cfg = safety.get().cfg
+        folders = list(cfg.read_folders) + [d for d in cfg.drive_roots() if d not in cfg.read_folders]
     except Exception:                                # noqa: BLE001 - no safety layer -> SAFE_ROOT only
         return []
     return [Path(f + "/") if re.fullmatch(r"[A-Za-z]:", f) else Path(f) for f in folders]

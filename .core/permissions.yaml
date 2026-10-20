@@ -12,23 +12,25 @@
 # ask_for_risky   - (default) file changes inside folders.write and web reading run; commands / PC control ask
 # auto_in_allowed - like ask_for_risky, plus commands run without asking when they stay inside folders.write
 # full_auto       - nothing asks except the built-in risky list, Lucy's own files (ask_paths) and injection suspects
-mode: auto_in_allowed
+mode: ask_for_risky
 
 approval_timeout_s: 300        # an unanswered approval card counts as "Deny" after this many seconds
 
+drives:                        # whole drives. A drive NOT listed (a new F:, a USB stick) gets `other`.
+  C: ask                       # read freely; every change asks (Windows, programs, your user folder live here)
+  D: full                      # code + games: read, change and delete without asking
+  E: storage                   # backup drive: read + write freely (backups go here); deleting / moving OUT always asks
+  other: storage               # any drive added later: like E: until you list it here
+# profiles: off (not reachable) | ask | storage (deleting asks) | full
+# Shell commands still ask in ask_for_risky; in auto_in_allowed they run alone when they stay on a `full` drive.
+
 folders:
-  read:                        # the file tools can reach these, and reading never asks (except denied_paths)
-    - "C:/"
-    - "D:/"
-    - "E:/"
+  read:                        # extra folders the file tools can reach (reading never asks, except denied_paths)
     - "{SAFE_ROOT}"
-  write:                       # creating/editing files here runs without asking (except readonly/ask paths below)
-    - "C:/"
-    - "D:/"
-    # E: (backup HDD) is in ask_paths instead: Lucy may write there, but always asks first
+  write: []                    # extra folders where changes run WITHOUT asking even on an `ask` drive,
+                               # e.g. - "{HOME}/Documents"
 
 ask_paths:                     # changes here ALWAYS ask
-  - "E:/"                      # your backups: the last line of defence, never changed without your OK
   - "{LUCY_ROOT}/src"          # Lucy editing her own code / UI / persona
   - "{LUCY_ROOT}/ui"
   - "{LUCY_ROOT}/.core"

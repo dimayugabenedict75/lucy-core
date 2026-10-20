@@ -38,3 +38,4 @@ class ProactiveHost:
     # --- extras ----------------------------------------------------------------------------------------
     sticker: Callable[[str], str | None] = lambda emotion: None      # -> relative media path or None
     speak: Callable[[str], Awaitable[None]] | None = None            # speak through Lucy Audio on this PC
+    job_hooks: object | None = None                                  # lucy.autonomy.JobHostHooks (P8 task queue); None = tasks cannot run agents

@@ -5,8 +5,14 @@ THE LIST (this file is on it, so the list protects itself):
   * src/lucy/tools/registry.py              the one place every tool call passes the safety checks
   * src/lucy/tools/_common.py               path resolution used by every file tool
   * src/lucy/server/file_guard.py           path rules, edit validation
+  * src/lucy/broker/*.py                    the admin helper (P5): it runs ELEVATED, so its code must never be agent-written
+  * src/lucy/selfdev/*.py                   P7 self-evolution: the sandbox for Lucy's own tools, the Lane B gate (copy ->
+                                            tests -> canary -> the user's approval -> swap / rollback)
   * .core/permissions.yaml                  the user's rules
   * .core/mcp.json                          the MCP servers Lucy may launch (a server entry is a program that runs on this PC)
+  * .core/personas/lucy.md                  CORE persona (P6): identity, voice and safety rules, human-owned. Lucy's own
+                                            writable persona is the SEPARATE file lucy_self.md (not locked, but capped,
+                                            guarded and logged by lucy.persona)
   * .core/constitution.lock                 the hashes (written only by `python -m lucy.safety seal` or the Settings UI)
 
 At startup the hashes are compared with the lock. A mismatch means something changed these files without the user
@@ -31,12 +37,17 @@ CODE_FILES = [_LUCY / "tools" / "registry.py", _LUCY / "tools" / "_common.py", _
 LOCK_NAME = "constitution.lock"
 
 
+BROKER_DIR = _LUCY / "broker"
+SELFDEV_DIR = _LUCY / "selfdev"
+
+
 def code_files() -> List[Path]:
-    return sorted(_PKG.glob("*.py")) + CODE_FILES
+    return sorted(_PKG.glob("*.py")) + CODE_FILES + sorted(BROKER_DIR.glob("*.py")) + sorted(SELFDEV_DIR.glob("*.py"))
 
 
 def config_files(root: Path) -> List[Path]:
-    return [Path(root) / ".core" / "permissions.yaml", Path(root) / ".core" / "mcp.json"]
+    return [Path(root) / ".core" / "permissions.yaml", Path(root) / ".core" / "mcp.json",
+            Path(root) / ".core" / "personas" / "lucy.md"]
 
 
 def lock_path(root: Path) -> Path:
@@ -65,7 +76,7 @@ class Constitution:
         self.lock = lock_path(self.root)
         # Folders/files the agent may never write (besides the files above): the safety package folder (no new
         # modules sneaking in) and Lucy's safety state (audit log, undo backups, pause flag).
-        self._protected = [norm_path(p) for p in self.files + [self.lock, _PKG] + list(extra_protected)]
+        self._protected = [norm_path(p) for p in self.files + [self.lock, _PKG, BROKER_DIR, SELFDEV_DIR] + list(extra_protected)]
         self._stat: Dict[str, Tuple[int, int]] = {}
         self.problems: List[str] = []
         self.note = ""

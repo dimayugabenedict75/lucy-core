@@ -60,7 +60,7 @@ def test_default_order_keeps_everything_that_never_changes_in_front_of_the_facts
         a, b = build("hello there"), build("something else entirely")
     n = common_prefix(a, b)
     assert api._prompt_order() == "static_first"
-    assert n >= 3 and a[0]["content"] == api._persona_prompt            # persona + memory rules + tool rules (+ digest) are identical
+    assert n >= 3 and a[0]["content"] == api._persona_text()            # persona + memory rules + tool rules (+ digest) are identical
     assert "FACT-ABOUT" in a[n]["content"] and "FACT-ABOUT" in b[n]["content"]      # the first difference IS the recalled facts
     assert all("FACT-ABOUT" not in m["content"] and "SKILL<" not in m["content"] for m in a[:n])
     assert [m["role"] for m in a[:n + 2]] == ["system"] * (n + 2)       # facts + skills are still system messages (no template risk)

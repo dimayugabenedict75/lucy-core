@@ -239,7 +239,7 @@ def edit_file(path: Path, old: str, new: str, replace_all: bool, project_root: P
         if rel.startswith("src/") and path.suffix == ".py":
             extra += " This is Lucy Core code: the change takes effect after Lucy Core restarts."
         elif rel.startswith(".core/personas/"):
-            extra += " Persona changes take effect after Lucy Core restarts."
+            extra += " Persona changes apply from the next message."
     except ValueError:
         pass
     return f"{msg} in {path.as_posix()}.{extra}"

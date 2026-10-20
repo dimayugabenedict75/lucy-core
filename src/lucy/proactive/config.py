@@ -27,7 +27,7 @@ DEFAULTS: dict[str, Any] = {
     "user_name": "Benny",
     # "app"  -> follow Settings > Timezone.  Otherwise "Asia/Manila", "+08:00", "utc" or "system".
     # NOTE: if Settings says UTC but you live elsewhere, set this - quiet hours depend on it.
-    "timezone": "app",
+    "timezone": "Asia/Manila",
     "startup_delay_seconds": 5,
     "tick_seconds": 10,
     "watch_interval_seconds": 60,
@@ -89,6 +89,27 @@ DEFAULTS: dict[str, Any] = {
         "max_attempts": 3,
         "max_runs_per_day": 6,
     },
+    "jobs": {                              # P8 task queue (lucy.autonomy): long / repeating / idle-time work through the agent loop
+        "enabled": True,
+        "read_tools": ["web_search", "web_extract", "read_local_file", "list_local_files", "find_file", "recall_memory",
+                       "search_conversations"],      # what an `access: read` job may use
+        "blocked_tools": ["task", "core_change", "user_tool", "proactive_control"],   # no job spawns jobs or edits Lucy itself
+        "default_budget": {"seconds": 1200, "tool_calls": 60, "tokens": 80000},
+        "max_budget": {"seconds": 14400, "tool_calls": 600, "tokens": 800000},
+        "max_runs_per_day": 8,             # started goal-runs per day (the user's "Run now" / Continue ignore the caps)
+        "max_tool_calls_per_day": 400,
+        "max_seconds_per_day": 10800,
+        "max_active": 30,
+        "max_attempts": 3,                 # a run that errors is retried (from its checkpoint) this many times
+        "retry_minutes": 10,
+        "park_timeout_hours": 48,          # an unanswered approval counts as a denial after this long
+        "auto_start_model_full": False,    # False: a task the MODEL made with full tools waits for the user's OK
+        "idle_start_minutes": 10,          # "idle" tasks start after this much quiet
+        "poll_seconds": 1.0,
+        "report_max_chars": 1200,
+        "keep_days": 60,
+        "system_jobs": True,               # reflection + weekly trace review run on the queue (false = their own loops)
+    },
     "llm": {"timeout_seconds": 45, "max_tokens": 200, "temperature": 0.7, "idle_before_llm_seconds": 20},
 }
 
@@ -116,7 +137,7 @@ def _choice(*opts: str) -> Callable[[Any], str]:
 
 SETTABLE: dict[str, Callable[[Any], Any]] = {
     "quiet_hours.enabled": _bool, "quiet_hours.start": _hhmm, "quiet_hours.end": _hhmm,
-    "greeting.enabled": _bool, "checkin.enabled": _bool, "alerts.enabled": _bool, "tasks.enabled": _bool,
+    "greeting.enabled": _bool, "checkin.enabled": _bool, "alerts.enabled": _bool, "tasks.enabled": _bool, "jobs.enabled": _bool,
     "delivery.voice": _choice("off", "reminders", "all"), "delivery.sticker": _bool,
 }
 

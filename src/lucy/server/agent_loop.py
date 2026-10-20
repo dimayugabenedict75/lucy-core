@@ -72,7 +72,7 @@ PARALLEL_TOOLS = frozenset({"read_local_file", "list_local_files", "find_file", 
                             "web_search", "web_extract", "recall_memory", "search_conversations", "office_read"})
 
 # Tools that put the file they made into the chat themselves (MEDIA: result): that counts as "sent the file".
-DELIVERS_FILES = frozenset({"docx_create", "docx_edit", "xlsx_create", "xlsx_edit", "pptx_create", "pptx_edit", "pdf_create"})
+DELIVERS_FILES = frozenset({"docx_create", "docx_edit", "xlsx_create", "xlsx_edit", "pptx_create", "pptx_edit", "pdf_create", "screenshot"})
 
 _NOTE = "[Harness note - internal, do not mention or quote it] "
 
