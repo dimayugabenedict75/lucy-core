@@ -10,7 +10,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 try:
     import yaml
@@ -25,6 +25,13 @@ MODE_LABELS = {
     "full_auto": "Full auto",
 }
 DEFAULT_MODE = "ask_for_risky"
+
+# Whole-drive rules (P5). A drive letter not listed gets `other` (a new F:, a USB stick). Profiles:
+#   off      not part of Lucy's reach (reading asks, changes ask)
+#   ask      read freely; every change asks
+#   storage  read and change freely; DELETING (or moving something out) always asks
+#   full     read, change and delete freely; in "auto_in_allowed" mode commands that stay on the drive run too
+DRIVE_PROFILES = ("off", "ask", "storage", "full")
 
 # Built-in defaults. permissions.yaml overrides keys it sets; lists REPLACE the default list (so the user can remove an
 # entry), except the hard-wired protections in policy.py / constitution.py, which no config can remove.
@@ -54,6 +61,7 @@ DEFAULTS: Dict[str, Any] = {
         "paths": ["{HOME}/Downloads"],
     },
     "backups": {"max_file_mb": 50, "max_total_mb": 2048},
+    "drives": {},                                  # e.g. {"C": "ask", "D": "full", "other": "storage"}
 }
 
 
@@ -75,7 +83,23 @@ class Config:
     untrusted_paths: List[str] = field(default_factory=list)
     max_file_bytes: int = 50 * 1024 * 1024
     max_total_bytes: int = 2048 * 1024 * 1024
+    drives: Dict[str, str] = field(default_factory=dict)   # "c" -> profile (lower-case letter)
+    other_drive: str = "off"                                # profile of drives not listed
     problems: List[str] = field(default_factory=list)      # config mistakes (shown in the UI, never fatal)
+
+    def drive_profile(self, normed: str) -> Optional[str]:
+        """Profile of the drive a normalised path is on ("c:/x" -> drives["c"]); None for non-drive paths."""
+        letter = drive_letter(normed)
+        if letter is None:
+            return None
+        return self.drives.get(letter, self.other_drive)
+
+    def drive_roots(self) -> List[str]:
+        """Drive roots Lucy can reach right now ("c:" style): listed drives + present unlisted ones if `other` allows."""
+        out = [f"{k}:" for k, v in sorted(self.drives.items()) if v != "off"]
+        if self.other_drive != "off":
+            out += [f"{k}:" for k in present_drives() if k not in self.drives]
+        return out
 
 
 def norm_path(p: str | os.PathLike) -> str:
@@ -88,6 +112,29 @@ def norm_path(p: str | os.PathLike) -> str:
 def is_inside(path: str, folder: str) -> bool:
     """Both already normalised with norm_path."""
     return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
+_DRIVE = re.compile(r"^([a-z]):(/|$)")
+
+
+def drive_letter(normed: str) -> Optional[str]:
+    m = _DRIVE.match(normed or "")
+    return m.group(1) if m else None
+
+
+_present_cache: Dict[str, Any] = {"t": 0.0, "v": []}
+
+
+def present_drives() -> List[str]:
+    """Drive letters that exist right now (Windows only; cached 20 s so a plugged-in drive shows up quickly)."""
+    import time
+    if os.name != "nt":
+        return []
+    now = time.monotonic()
+    if now - _present_cache["t"] > 20:
+        _present_cache["v"] = [c.lower() for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{c}:\\")]
+        _present_cache["t"] = now
+    return list(_present_cache["v"])
 
 
 def _expand(s: str, ctx: Dict[str, str]) -> str:
@@ -165,7 +212,22 @@ def load(path: Path | None, *, root: Path, safe_root: Path, runtime: Path, home:
             for r in lst:
                 if is_inside(w, r):
                     problems.append(f"{kind} entry {r} covers the whole write folder {w} (check for junctions/typos)")
+    drives: Dict[str, str] = {}
+    other = "off"
+    for k, v in (d.get("drives") or {}).items():
+        prof = "off" if v is False or v is None else str(v).strip().lower()      # YAML reads a bare `off` as False
+        if prof not in DRIVE_PROFILES:
+            problems.append(f"drives.{k}: must be one of {', '.join(DRIVE_PROFILES)} (got {v!r}); using 'ask'")
+            prof = "ask"
+        key = str(k).strip().lower().rstrip("/\\").rstrip(":")
+        if key == "other":
+            other = prof
+        elif re.fullmatch(r"[a-z]", key):
+            drives[key] = prof
+        else:
+            problems.append(f"drives: {k!r} is not a drive letter (use C, D, ... or other)")
     return Config(
+        drives=drives, other_drive=other,
         mode=mode, approval_timeout_s=timeout,
         read_folders=paths(folders.get("read")), write_folders=write_folders,
         ask_paths=paths(d.get("ask_paths")), denied_paths=denied, readonly_paths=readonly,

@@ -47,7 +47,8 @@ class SafetyLayer:
         self.state_path = self.runtime / "safety_state.json"
         self.enforce = enforce_constitution
         state_files = [self.runtime / "logs" / "audit.jsonl", self.runtime / "backups", self.state_path,
-                       self.runtime / "trash"]
+                       self.runtime / "trash", self.runtime / "broker",      # broker: admin helper secret + port
+                       self.runtime / "selfdev"]      # P7: user-tool tiers, Lane B proposals + releases (user decides)
         self.constitution = Constitution(self.root, extra_protected=state_files)
         self.audit = AuditLog(self.runtime / "logs" / "audit.jsonl")
         self.broker = ApprovalBroker()
@@ -156,6 +157,7 @@ class SafetyLayer:
                 "paused": self.paused, "halted": self.halt_reason(), "note": self.constitution.note,
                 "config_problems": self.cfg.problems, "write_folders": self.cfg.write_folders,
                 "read_folders": self.cfg.read_folders,
+                "drives": {**{k.upper() + ":": v for k, v in self.cfg.drives.items()}, "other": self.cfg.other_drive},
                 "pending": self.broker.pending(session), "session_allowed": sorted(self.session_allow.get(session or "_", ()))}
 
     # ============================================================================== decisions
@@ -317,6 +319,9 @@ class SafetyLayer:
                 details = str(a.get("content") or "")[:600]
             elif name == "restore_from_backup":
                 summary = f"Undo change {a.get('backup_id')}"
+            elif self._tool_summary(name, a):
+                summary = self._tool_summary(name, a)
+                details = json.dumps(a, ensure_ascii=False, indent=1, default=str)[:2000]
             else:
                 summary = f"{name}"
                 details = json.dumps(a, ensure_ascii=False, indent=1, default=str)[:2000]
@@ -324,6 +329,22 @@ class SafetyLayer:
             details = f"(could not prepare a preview: {e})\n" + json.dumps(a, ensure_ascii=False, default=str)[:1500]
         return {"tool": name, "tier": d.tier, "summary": summary, "reason": d.reason, "details": details[:8000],
                 "details_kind": kind, "can_always": d.can_always_allow}
+
+    @staticmethod
+    def _tool_summary(name: str, args: dict) -> str:
+        """One plain-language line from a BUILT-IN tool module's `describe_call(name, args)` (P5 PC tools).
+        The full arguments are still shown under it, so a wrong summary cannot hide what will run."""
+        try:
+            from lucy.tools import registry
+            spec = registry.default.get(name)
+            mod = spec.module if spec is not None else ""
+            if not mod.startswith("lucy.tools.") or mod.startswith("lucy.tools_user"):
+                return ""
+            import importlib
+            fn = getattr(importlib.import_module(mod), "describe_call", None)
+            return str(fn(name, args or {}))[:300] if callable(fn) else ""
+        except Exception:                                            # noqa: BLE001
+            return ""
 
     @staticmethod
     def _diff(old: str, new: str, path: str) -> str:

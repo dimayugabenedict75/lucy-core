@@ -301,15 +301,16 @@ def test_command_paths_finds_windows_posix_and_home_paths():
 
 # ---------------------------------------------------------------------------------------------- whole drives (Windows rules)
 def test_whole_drive_permissions_with_windows_path_rules(monkeypatch):
-    """The shipped permissions.yaml (C:/ D:/ E:/), evaluated with Windows path semantics (ntpath works on any OS)."""
+    """The shipped permissions.yaml (P5 user decision: C: ask, D: full, E: storage, new drives = storage), evaluated
+    with Windows path semantics (ntpath works on any OS)."""
     import ntpath, types
-    monkeypatch.setattr(C, "os", types.SimpleNamespace(path=ntpath))
+    monkeypatch.setattr(C, "os", types.SimpleNamespace(path=ntpath, name="nt", exists=lambda p: False))
     from lucy.safety import policy as P
     yaml_path = pathlib.Path(__file__).resolve().parents[1] / ".core" / "permissions.yaml"
     root = pathlib.PureWindowsPath("C:/Users/me/Lucy/Lucy_Core")
     cfg = C.load(yaml_path, root=root, safe_root=pathlib.PureWindowsPath("C:/Users/me"),
                  runtime=root / "runtime", home=pathlib.PureWindowsPath("C:/Users/me"))
-    assert cfg.problems == [] and {"c:", "d:", "e:"} <= set(cfg.read_folders)
+    assert cfg.problems == [] and cfg.drives == {"c": "ask", "d": "full", "e": "storage"} and cfg.other_drive == "storage"
     prot = [C.norm_path(str(root / ".core/permissions.yaml"))]
     pol = P.Policy(cfg, protected=lambda p: any(C.is_inside(p, x) for x in prot), resolve=C.norm_path,
                    home="C:/Users/me", default_cwd="C:/Users/me")
@@ -317,8 +318,9 @@ def test_whole_drive_permissions_with_windows_path_rules(monkeypatch):
     W = lambda f: lv("write_local_file", "write", {"file_path": f, "content": "x"})
     R_ = lambda f: lv("read_local_file", "read", {"file_path": f})
     assert R_("D:/Games/a.txt") == AUTO and R_("E:/Backup/a.jpg") == AUTO and R_("C:/Windows/win.ini") == AUTO
-    assert W("D:/Projects/a.py") == AUTO and W("C:/Users/me/Desktop/a.txt") == AUTO
-    assert W("E:/Backup/a.txt") == ASK                                            # backups: always ask
+    assert R_("F:/new/drive.txt") == AUTO                                       # a drive added later: reachable
+    assert W("D:/Projects/a.py") == AUTO and W("E:/Backup/a.txt") == AUTO and W("F:/x.txt") == AUTO
+    assert W("C:/Users/me/Desktop/a.txt") == ASK                                 # C: asks before every change
     assert W("C:/Users/me/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/x.bat") == ASK
     assert W("C:/Windows/System32/drivers/etc/hosts") == DENY and W("c:\\PROGRAMDATA\\x.bat") == DENY
     assert R_("C:/Users/me/AppData/Local/Google/Chrome/User Data/Default/Login Data") == DENY
@@ -326,6 +328,16 @@ def test_whole_drive_permissions_with_windows_path_rules(monkeypatch):
     assert W(str(root / ".core/permissions.yaml")) == DENY and W(str(root / "src/lucy/x.py")) == ASK
     assert lv("run_shell_command", "exec", {"command": "format E:"}) == DENY
     assert lv("run_shell_command", "exec", {"command": "Remove-Item E:\\Backup -Recurse"}) == ASK_HARD
+    F = lambda **a: lv("file_ops", "write", a)
+    assert F(action="delete", path="D:/Games/old") == AUTO                       # D: full
+    assert F(action="delete", path="E:/Photos/a.jpg") == ASK_HARD               # E: deleting always asks
+    assert F(action="delete", path="F:/a.jpg") == ASK_HARD                       # new drives behave like E:
+    assert F(action="move", source="E:/Photos/a.jpg", destination="D:/a.jpg") == ASK_HARD
+    assert F(action="move", source="D:/Projects/x", destination="E:/Backup/x") == AUTO   # backing up to E: just runs
+    assert F(action="copy", source="C:/Users/me/Pictures/a.jpg", destination="E:/Backup/a.jpg") == AUTO
+    assert F(action="copy", source="E:/a.jpg", destination="C:/Users/me/a.jpg") == ASK
+    assert F(action="delete", path="C:/Users/me/Desktop/a.txt") == ASK
+    assert F(action="copy", source="D:/mod.dll", destination="C:/Program Files/Game/mod.dll") == ASK_HARD   # admin path
 
 
 def test_file_tools_reach_every_read_folder_not_just_safe_root(monkeypatch, tmp_path):

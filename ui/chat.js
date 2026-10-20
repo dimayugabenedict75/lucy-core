@@ -226,6 +226,7 @@ function newSession() {
     currentSessionId = null;
     chatContainer.innerHTML = '';
     renderHistory();
+    if (window.deskOnSwitch) deskOnSwitch();
     messageInput.focus();
     if (mobileQuery.matches) closeMobileSidebar();
 }
@@ -289,7 +290,7 @@ function formatTimestamp(ts) {
 async function renderHistory() {
     const allSessions = [];
     for (const [id, session] of Object.entries(sessions)) {
-        allSessions.push({id, ...session});
+        if (!window.deskShowSession || deskShowSession(id)) allSessions.push({id, ...session});
     }
     allSessions.sort((a, b) => {
         const ta = a.updated_at || '';
@@ -326,6 +327,7 @@ async function renderHistory() {
                 </button>
             </div>
         `;
+        if (window.deskDecorateSession) deskDecorateSession(item, session.id);
         chatHistoryEl.appendChild(item);
     });
 }
@@ -356,7 +358,8 @@ function renderStoredMessage(msg) {
         files.push({path: mediaPath, name: fileName, type: getMimeType(fileName),
                     url: `/api/file/${encodeURIComponent(relativePath)}?api_key=${encodeURIComponent(API_KEY)}`});
     });
-    addMessage(content.replace(/\nMEDIA:[^\s]+/g, '').trim(), isUser, files, msg.timestamp);
+    const _bub = addMessage(content.replace(/\nMEDIA:[^\s]+/g, '').trim(), isUser, files, msg.timestamp);
+    if (window.deskTagRow) deskTagRow(_bub, msg);
 }
 
 let switchSeq = 0;
@@ -387,6 +390,7 @@ async function switchSession(id, force) {
     scrollToBottom();
     messageInput.focus();
     renderHistory();
+    if (window.deskOnSwitch) deskOnSwitch();
     if (mobileQuery.matches) closeMobileSidebar();
 }
 
@@ -796,6 +800,7 @@ function setSending(sending) {
 }
 
 async function sendMessage(queued) {
+    if (!queued && window.deskPreSend && deskPreSend()) return;     // P9: /commands are handled here
     const fromQueue = !!queued;
     const message = fromQueue ? queued.message : messageInput.value.trim();
     const sendFiles = fromQueue ? queued.files : selectedFiles;
@@ -814,6 +819,8 @@ async function sendMessage(queued) {
 
     // The start page is a draft: the session is only created now, by the first message you send.
     const sendSid = await ensureSession();
+    if (window.deskOnSession) await deskOnSession(sendSid);
+    const deskOpts = window.deskTakeOpts ? deskTakeOpts() : {};
 
     currentActivity = null;
     window._toolShownAt = 0;
@@ -889,6 +896,8 @@ formData.append('message', message);
 formData.append('session_id', sendSid);
 formData.append('stream', 'true');
 formData.append('voice_mode', voiceMode ? 'true' : 'false');
+if (deskOpts.mode) formData.append('mode', deskOpts.mode);
+if (deskOpts.reuse && deskOpts.reuse.length) formData.append('reuse_shas', JSON.stringify(deskOpts.reuse));
 filesToSend.forEach(f => formData.append('files', f));
 
         const response = await fetch(`/api/chat?api_key=${API_KEY}`, {
@@ -939,6 +948,14 @@ filesToSend.forEach(f => formData.append('files', f));
                             } else {
                                 scrollToBottom();
                             }
+                        } else if (data.turn) {
+                            deskTurn(streamingBubble, data.turn);
+                        } else if (data.turn_done) {
+                            deskTurnDone(streamingBubble, data.turn_done);
+                        } else if (data.attachment) {
+                            const _af = attachmentToFile(data.attachment);
+                            if (_af) getFileGroup(streamingBubble).appendChild(renderFilePreview(_af));
+                            scrollToBottom();
                         } else if (data.approval_request) {
                             // Safety layer: the agent is waiting for your OK (Approve / Deny / Always allow).
                             getFileGroup(streamingBubble).appendChild(renderApprovalCard(data.approval_request, sendSid));
@@ -1068,6 +1085,7 @@ filesToSend.forEach(f => formData.append('files', f));
         // streamed chunk would re-colour the growing block hundreds of times).
         enhanceCodeBlocks(streamingBubble);
 
+        if (window.deskAfterTurn) deskAfterTurn(streamingBubble, deskOpts, fullResponse);
         const sess = sessions[sendSid] || (sessions[sendSid] = {title: 'New Session', message_count: 0, messages: [], updated_at: now});
         sess.messages = sess.messages || [];
         sess.messages.push({role: 'user', content: message, timestamp: now});
@@ -1309,6 +1327,10 @@ function closeSettings() {
 
 // ---- Settings Tabs ----
 function switchSettingsTab(tab) {
+    if (tab === 'persona') loadPersona();
+    if (tab === 'evolve') loadEvolve();
+    if (tab === 'overview') deskLoadOverview();
+    if (tab === 'tasks') startTasksPolling(); else stopTasksPolling();
     document.querySelectorAll('.settings-tab-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.tab === tab);
     });
@@ -2873,6 +2895,7 @@ async function loadLibrary(reset = true) {
     if (origin) p.set('origin', origin);
     const q = libraryEl('libSearch').value.trim();
     if (q) p.set('q', q);
+    if (window.deskLibPinned) p.set('pinned', '1');
     if (libraryEl('libScope').checked && currentSessionId) p.set('session_id', currentSessionId);
     try {
         const resp = await fetch('/api/library?' + p.toString(), {headers: authHeaders()});
@@ -3167,12 +3190,32 @@ async function loadSafety() {
         if (st.halted) bits.push('⚠ ' + st.halted);
         if (st.paused) bits.push('Agent is PAUSED: no tool runs anywhere.');
         (st.config_problems || []).forEach(p => bits.push('Config: ' + p));
-        bits.push('Writes without asking in: ' + (st.write_folders || []).join(', '));
+        if (st.drives) {
+            const order = {full: 0, storage: 1, ask: 2, off: 3};
+            const ds = Object.keys(st.drives).filter(k => k !== 'other')
+                .sort((a, b) => a.localeCompare(b))
+                .map(k => k + ' ' + st.drives[k]);
+            if (st.drives.other) ds.push('new drives ' + st.drives.other);
+            bits.push('Drives: ' + ds.join(', ') + '  (full = free, storage = deleting asks, ask = every change asks)');
+        }
+        if ((st.write_folders || []).length) bits.push('Also writes without asking in: ' + st.write_folders.join(', '));
         info.textContent = bits.join('\n');
         loadSafetyBackups();
+        loadBrokerStatus();
     } catch (e) {
         console.error('Failed to load safety status:', e);
     }
+}
+
+async function loadBrokerStatus() {
+    const el = document.getElementById('brokerStatus');
+    if (!el) return;
+    try {
+        const r = await fetch(`/api/safety/broker?api_key=${API_KEY}`);
+        const b = await r.json();
+        el.textContent = b.running ? 'Admin helper: running (starts on demand for admin actions, exits when idle).'
+                                   : 'Admin helper: not running. It starts with a Windows UAC prompt the first time Lucy needs admin.';
+    } catch (e) { el.textContent = ''; }
 }
 
 async function setSafetyMode(mode) {
@@ -3283,3 +3326,887 @@ async function loadSafetyBackups() {
         body.appendChild(tr);
     });
 }
+
+// ---- Persona (P6): Lucy's SELF notes, change log with Revert, daily note ----
+async function loadPersona() {
+    const status = document.getElementById('personaStatus');
+    if (!status) return;
+    try {
+        const st = await (await fetch(`/api/persona?api_key=${API_KEY}`)).json();
+        const r = st.reflection || {};
+        const bits = [`SELF: ${st.chars}/${st.chars_max} characters.`];
+        const e = st.edits_today || {};
+        bits.push(`Edits today: chat ${e.agent || 0}/${(st.daily_limits || {}).agent}, reflection ${e.reflection || 0}/${(st.daily_limits || {}).reflection}.`);
+        if (r.last_run) bits.push(`Last reflection: ${new Date(r.last_run * 1000).toLocaleString()} (${r.last_reason}, ${r.last_status}).`);
+        else bits.push(r.enabled ? 'No reflection yet: it runs when you have been away a while, and nightly.' : 'Automatic reflection is off (LUCY_REFLECT=0).');
+        if (st.flagged_memories) bits.push(`${st.flagged_memories} memories may contradict another one (see the daily note).`);
+        (st.problems || []).forEach(p => bits.push('SELF file: ' + p));
+        status.textContent = bits.join('\n');
+        const self = (st.sections || []).filter(s => s.items.length)
+            .map(s => s.title + ':\n' + s.items.map(i => '  - ' + i).join('\n')).join('\n');
+        document.getElementById('personaSelf').textContent = self || 'SELF is empty so far.';
+        loadPersonaChanges();
+        loadPersonaNote();
+    } catch (e) {
+        console.error('Failed to load persona:', e);
+    }
+}
+
+async function loadPersonaChanges() {
+    const body = document.getElementById('personaChangesBody');
+    if (!body) return;
+    const data = await (await fetch(`/api/persona/changelog?limit=30&api_key=${API_KEY}`)).json();
+    const items = (data.entries || []).filter(e => e.op !== 'revert');
+    if (!items.length) {
+        body.innerHTML = '<tr><td colspan="3" class="settings-table-empty">No changes yet</td></tr>';
+        return;
+    }
+    body.innerHTML = '';
+    items.forEach(en => {
+        const tr = document.createElement('tr');
+        const what = document.createElement('td');
+        what.textContent = `#${en.id} ${en.ts}  ${en.op} [${en.section}]  ${(en.diff || '').replace(/\n/g, '  ')}`;
+        what.title = en.reason || '';
+        if (en.reverted) what.style.opacity = '0.5';
+        const by = document.createElement('td');
+        by.textContent = en.actor;
+        const act = document.createElement('td');
+        if (en.revertible) {
+            const btn = document.createElement('button');
+            btn.className = 'settings-action-btn';
+            btn.textContent = 'Revert';
+            btn.onclick = async () => {
+                const r = await fetch(`/api/persona/revert?api_key=${API_KEY}`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: en.id})});
+                if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.detail || 'Could not revert'); }
+                loadPersona();
+            };
+            act.appendChild(btn);
+        } else if (en.reverted) {
+            act.textContent = 'reverted';
+        }
+        tr.append(what, by, act);
+        body.appendChild(tr);
+    });
+}
+
+async function loadPersonaNote() {
+    const el = document.getElementById('personaNote');
+    if (!el) return;
+    const data = await (await fetch(`/api/persona/notes?days=1&api_key=${API_KEY}`)).json();
+    const n = (data.notes || [])[0];
+    el.textContent = n ? n.text : 'No daily note yet.';
+}
+
+async function runReflectionNow() {
+    const btn = document.getElementById('personaReflectBtn');
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = 'Reflecting...';
+    try {
+        const r = await fetch(`/api/persona/reflect?api_key=${API_KEY}`, {method: 'POST'});
+        const d = await r.json();
+        if (!r.ok) alert(d.detail || 'Could not reflect');
+        else if (d.status === 'model_unavailable') alert('The model is not running. Start it in Settings > Model first.');
+    } catch (e) {
+        alert('Reflection failed: ' + e);
+    }
+    btn.disabled = false;
+    btn.textContent = old;
+    loadPersona();
+}
+
+// ---- Evolve (P7): Lane B proposals (Approve / Reject / diff), applied releases (Rollback), Lucy's own tools ----
+async function evolvePost(url, body) {
+    const r = await fetch(`${url}?api_key=${API_KEY}`, {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body || {})});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) alert(d.detail || 'That did not work');
+    return r.ok ? d : null;
+}
+
+function evolveBtn(label, onclick) {
+    const b = document.createElement('button');
+    b.className = 'settings-action-btn';
+    b.textContent = label;
+    b.onclick = onclick;
+    return b;
+}
+
+function evolveRows(bodyId, items, empty, render) {
+    const body = document.getElementById(bodyId);
+    if (!body) return;
+    if (!items.length) { body.innerHTML = `<tr><td colspan="3" class="settings-table-empty">${empty}</td></tr>`; return; }
+    body.innerHTML = '';
+    items.forEach(it => {
+        const tr = document.createElement('tr');
+        const [what, status, act] = [document.createElement('td'), document.createElement('td'), document.createElement('td')];
+        render(it, what, status, act);
+        tr.append(what, status, act);
+        body.appendChild(tr);
+    });
+}
+
+async function loadEvolve() {
+    let st;
+    try { st = await (await fetch(`/api/selfdev/status?api_key=${API_KEY}`)).json(); }
+    catch (e) { console.error('Failed to load Evolve:', e); return; }
+    const props = (st.proposals || []).filter(p => !['discarded', 'rejected'].includes(p.status)).slice(0, 15);
+    evolveRows('evolveProposalsBody', props, 'None', (p, what, status, act) => {
+        what.textContent = `${p.id}  ${p.title}`;
+        what.title = p.reason || '';
+        status.textContent = p.status + (p.failure ? ` (${p.failure})` : '');
+        act.appendChild(evolveBtn('Diff', () => showEvolveDiff(p.id)));
+        if (p.status === 'ready') {
+            act.appendChild(evolveBtn('Approve', async () => {
+                if (!confirm(`Apply "${p.title}" to Lucy Core? Lucy must be restarted afterwards. You can roll it back.`)) return;
+                if (await evolvePost(`/api/selfdev/proposals/${p.id}/approve`)) alert('Applied. Restart Lucy Core to use it.');
+                loadEvolve();
+            }));
+            act.appendChild(evolveBtn('Reject', async () => { await evolvePost(`/api/selfdev/proposals/${p.id}/reject`); loadEvolve(); }));
+        }
+    });
+    evolveRows('evolveReleasesBody', (st.releases || []).slice(0, 10), 'None', (m, what, status, act) => {
+        what.textContent = `${m.id}  ${m.title || ''}`;
+        status.textContent = m.status;
+        if (m.status === 'applied') act.appendChild(evolveBtn('Roll back', async () => {
+            if (!confirm(`Put back the files from before "${m.title}"? Restart Lucy afterwards.`)) return;
+            if (await evolvePost('/api/selfdev/rollback', {id: m.id})) alert('Rolled back. Restart Lucy Core.');
+            loadEvolve();
+        }));
+    });
+    const tiers = ['read', 'write', 'exec', 'system', 'network'];
+    evolveRows('evolveToolsBody', st.tools || [], 'None yet', (t, what, status, act) => {
+        what.textContent = `${t.name} v${t.version} [${t.enabled ? t.status : 'off'}] ${t.description}  (used ${t.uses_total}x, ${t.fails_total} failures)`;
+        what.title = (t.reason ? 'Why: ' + t.reason : '') + (t.disabled_reason ? '\nOff: ' + t.disabled_reason : '') + `\nNeeds: ${(t.needs || []).join(', ') || 'nothing'}`;
+        const sel = document.createElement('select');
+        tiers.slice(tiers.indexOf(t.tier_floor)).forEach(x => { const o = document.createElement('option'); o.value = o.textContent = x; sel.appendChild(o); });
+        sel.value = t.tier;
+        sel.title = 'read / write = runs without asking (in the default mode); exec and up = asks first';
+        sel.onchange = async () => { await evolvePost(`/api/selfdev/tools/${t.name}/tier`, {tier: sel.value}); loadEvolve(); };
+        status.appendChild(sel);
+        act.appendChild(evolveBtn(t.enabled ? 'Switch off' : 'Switch on', async () => {
+            await evolvePost(`/api/selfdev/tools/${t.name}/${t.enabled ? 'disable' : 'enable'}`); loadEvolve();
+        }));
+        if (t.version > 1) act.appendChild(evolveBtn('Previous version', async () => { await evolvePost(`/api/selfdev/tools/${t.name}/revert`); loadEvolve(); }));
+    });
+    const ideas = st.ideas || {};
+    const el = document.getElementById('evolveIdeas');
+    if (el) el.textContent = !ideas.ran ? 'No trace review yet (it runs weekly).'
+        : `Trace review ${ideas.window} (${ideas.events} events):\n` + ((ideas.ideas || []).map(i => `${i.n}. [${i.kind}] ${i.title}\n   ${i.suggestion}`).join('\n') || 'Nothing stood out.')
+          + '\nTo work on one, ask Lucy in the chat, e.g. "work on improvement idea 1".';
+}
+
+async function showEvolveDiff(id) {
+    const el = document.getElementById('evolveDiff');
+    const r = await fetch(`/api/selfdev/proposals/${id}?api_key=${API_KEY}`);
+    const p = await r.json();
+    const c = p.checks || {};
+    el.textContent = `${p.id} ${p.title}\nWhy: ${p.reason}\nTests: ${c.tests_ok === undefined ? '-' : (c.tests_ok ? 'passed' : 'FAILED')}  `
+        + `Trial run: ${c.canary_ok === undefined ? '-' : (c.canary_ok ? 'passed' : 'FAILED')}\n${(p.events || []).join('\n')}\n\n${p.diff || '(no diff yet)'}`;
+}
+
+async function runTraceReview() {
+    const btn = document.getElementById('evolveMineBtn');
+    btn.disabled = true;
+    await evolvePost('/api/selfdev/mine');
+    btn.disabled = false;
+    loadEvolve();
+}
+
+// ---- Tasks (P8): the job queue. Approve / Deny / Always for a parked step, OK-to-start, Run now, Continue, Cancel ----
+let tasksTimer = null;
+function startTasksPolling() { loadTasks(); stopTasksPolling(); tasksTimer = setInterval(loadTasks, 5000); }
+function stopTasksPolling() { if (tasksTimer) { clearInterval(tasksTimer); tasksTimer = null; } }
+
+async function tasksCall(method, url, body) {
+    const r = await fetch(`${url}?api_key=${API_KEY}`, {method, headers: {'Content-Type': 'application/json'},
+        body: body === undefined ? undefined : JSON.stringify(body)});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) alert(d.detail || 'That did not work');
+    return r.ok ? d : null;
+}
+
+async function loadTasks() {
+    let d;
+    try { d = await (await fetch(`/api/jobs?api_key=${API_KEY}`)).json(); }
+    catch (e) { console.error('Failed to load tasks:', e); return; }
+    const st = d.status || {};
+    const today = st.today || {}, caps = st.caps || {};
+    const stEl = document.getElementById('tasksStatus');
+    if (stEl) stEl.textContent = `${st.enabled ? 'On' : 'OFF (jobs.enabled in proactive.yaml)'} - ${st.active || 0} active, ${st.parked || 0} waiting for you. `
+        + `Today: ${today.runs || 0}/${caps.runs || '-'} runs, ${today.tool_calls || 0}/${caps.tool_calls || '-'} tool calls.`;
+    const body = document.getElementById('tasksBody');
+    if (!body) return;
+    const jobs = (d.jobs || []).filter(j => !j.system).concat((d.jobs || []).filter(j => j.system));
+    if (!jobs.length) { body.innerHTML = '<tr><td colspan="3" class="settings-table-empty">No tasks</td></tr>'; return; }
+    body.innerHTML = '';
+    jobs.forEach(j => {
+        const tr = document.createElement('tr');
+        const [what, status, act] = [document.createElement('td'), document.createElement('td'), document.createElement('td')];
+        const t = document.createElement('strong');
+        t.textContent = `#${j.id} ${j.title}`;
+        what.appendChild(t);
+        const meta = [j.system ? 'upkeep' : (j.access === 'full' ? 'full tools' : 'read-only'), j.repeat, j.due_in ? `next in ${j.due_in}` : ''].filter(Boolean).join(' - ');
+        const sub = document.createElement('div');
+        sub.className = 'llm-status';
+        sub.textContent = (j.goal && !j.system ? j.goal.slice(0, 140) + ' | ' : '') + meta;
+        what.appendChild(sub);
+        if (j.parked) {
+            const p = document.createElement('pre');
+            p.className = 'llm-status safety-status';
+            p.textContent = `Waiting for your OK: ${j.parked.summary}\n${j.parked.reason || ''}\n${j.parked.details || ''}`.slice(0, 1500);
+            what.appendChild(p);
+        } else if (j.progress && j.progress.length && !j.system) {
+            const p = document.createElement('div');
+            p.className = 'llm-status';
+            p.textContent = j.progress.map(x => x.text).slice(-2).join(' / ');
+            what.appendChild(p);
+        }
+        if (j.last_result && !j.system && j.status !== 'running') {
+            const r = document.createElement('div');
+            r.className = 'llm-status';
+            r.textContent = 'Last result: ' + j.last_result.slice(0, 200);
+            what.appendChild(r);
+        }
+        const u = j.usage || {}, b = j.budget || {};
+        status.textContent = j.status_label + (j.running || j.status === 'parked' || j.status === 'stopped'
+            ? ` (${u.tool_calls || 0}/${b.tool_calls || '-'} calls, ${Math.floor((u.seconds || 0) / 60)}/${Math.floor((b.seconds || 0) / 60)} min)` : '')
+            + (j.last_error && j.status !== 'done' ? ` - ${j.last_error.slice(0, 80)}` : '');
+        const go = (label, fn) => act.appendChild(evolveBtn(label, async () => { await fn(); loadTasks(); }));
+        if (j.status === 'parked' && j.parked) {
+            go('Approve', () => tasksCall('POST', `/api/jobs/${j.id}/decision`, {decision: 'approve', approval_id: j.parked.id}));
+            go('Deny', () => tasksCall('POST', `/api/jobs/${j.id}/decision`, {decision: 'deny', approval_id: j.parked.id}));
+            if (j.parked.can_always) go('Always for this task', () => tasksCall('POST', `/api/jobs/${j.id}/decision`, {decision: 'always', approval_id: j.parked.id}));
+        }
+        if (j.status === 'waiting_ok') go('OK to start', () => tasksCall('POST', `/api/jobs/${j.id}/ok`));
+        if (j.status === 'scheduled') go('Run now', () => tasksCall('POST', `/api/jobs/${j.id}/run`));
+        if (j.status === 'stopped') go('Continue', () => tasksCall('POST', `/api/jobs/${j.id}/extend`, {}));
+        if (['done', 'failed', 'cancelled'].includes(j.status)) go('Remove', () => tasksCall('DELETE', `/api/jobs/${j.id}`));
+        else go('Cancel', () => tasksCall('POST', `/api/jobs/${j.id}/cancel`));
+        tr.append(what, status, act);
+        body.appendChild(tr);
+    });
+}
+
+async function addTask() {
+    const goal = document.getElementById('taskGoal').value.trim();
+    if (!goal) return;
+    const d = await tasksCall('POST', '/api/jobs', {goal, when: document.getElementById('taskWhen').value.trim() || null,
+        repeat: document.getElementById('taskRepeat').value || null, access: document.getElementById('taskFull').checked ? 'full' : 'read'});
+    if (d) { document.getElementById('taskGoal').value = ''; document.getElementById('taskWhen').value = ''; loadTasks(); }
+}
+
+// =====================================================================================================================
+// P9 - desktop-style features (projects, edit/regenerate/branch, / commands and @files, usage meter, plan mode, rewind,
+// Library pins/cap/side pane, settings overview, export, quick entry). Backend: /api/projects, /api/desk/*, /api/library.
+// =====================================================================================================================
+const PLAN_APPROVE_TEXT = 'Plan approved. Carry it out now, step by step, and tell me when it is done.';
+const desk = {projects: [], sessionProject: {}, active: null, commands: null, plan: false, opts: {}, skipPre: false,
+              lastText: '', llm: null, popKind: '', popItems: [], popIdx: 0, fileTimer: 0};
+
+async function deskApi(method, url, body) {
+    const o = {method, headers: authHeaders(body && !(body instanceof FormData) ? {'Content-Type': 'application/json'} : {})};
+    if (body) o.body = body instanceof FormData ? body : JSON.stringify(body);
+    const r = await fetch(url, o);
+    if (!r.ok) {
+        let d = '';
+        try { d = (await r.json()).detail; } catch (e) { /* no body */ }
+        throw new Error(d || ('HTTP ' + r.status));
+    }
+    return r.json();
+}
+function deskEl(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+}
+function deskOverlay(title, onClose) {
+    const ov = deskEl('div', 'settings-overlay');
+    ov.style.display = 'flex';
+    const modal = deskEl('div', 'settings-modal desk-modal');
+    const head = deskEl('div', 'settings-header');
+    const h = deskEl('h3', '', title);
+    const x = deskEl('button', 'close-x-btn', '\u00D7');
+    const close = () => { ov.remove(); if (onClose) onClose(); };
+    x.onclick = close;
+    ov.addEventListener('click', (e) => { if (e.target === ov) close(); });
+    head.append(h, x);
+    const body = deskEl('div', 'desk-modal-body');
+    modal.append(head, body);
+    ov.appendChild(modal);
+    document.body.appendChild(ov);
+    return {body, close};
+}
+function deskField(label, el) {
+    const g = deskEl('div', 'setting-group');
+    g.append(deskEl('label', '', label), el);
+    return g;
+}
+
+// ---------------------------------------------------------------- 1. projects
+async function deskLoadProjects() {
+    try {
+        const d = await deskApi('GET', '/api/projects');
+        desk.projects = d.projects || [];
+        desk.sessionProject = d.sessions || {};
+        if (desk.active && !desk.projects.some(p => p.id === desk.active)) desk.active = null;
+    } catch (e) { console.error('projects:', e); }
+    deskRenderProjects();
+    renderHistory();
+    deskUpdateChip();
+}
+function deskShowSession(id) {
+    return !desk.active || desk.sessionProject[id] === desk.active;
+}
+function deskRenderProjects() {
+    const list = document.getElementById('deskProjectList');
+    if (!list) return;
+    list.innerHTML = '';
+    const add = (id, name, count) => {
+        const row = deskEl('div', 'desk-proj' + (desk.active === id ? ' active' : ''));
+        row.tabIndex = 0;
+        const n = deskEl('span', 'desk-proj-name', name);
+        const c = deskEl('span', 'desk-proj-count', count === null ? '' : String(count));
+        row.append(n, c);
+        if (id) {
+            const edit = deskEl('button', 'desk-mini-btn', '\u270E');
+            edit.title = 'Edit project';
+            edit.onclick = (e) => { e.stopPropagation(); deskProjectModal(id); };
+            row.appendChild(edit);
+        }
+        row.onclick = () => { desk.active = id; deskRenderProjects(); renderHistory(); };
+        list.appendChild(row);
+    };
+    add(null, 'All chats', null);
+    desk.projects.forEach(p => add(p.id, p.name, p.chats));
+}
+function deskUpdateChip() {
+    const chip = document.getElementById('deskProjectChip');
+    if (!chip) return;
+    const pid = currentSessionId ? desk.sessionProject[currentSessionId] : null;
+    const p = desk.projects.find(x => x.id === pid);
+    chip.hidden = !p;
+    chip.textContent = p ? '\uD83D\uDCC1 ' + p.name : '';
+}
+async function deskOnSession(sid) {
+    const s = sessions[sid] || {};
+    const fresh = !(s.message_count || 0) && !(s.messages || []).length;
+    if (desk.active && fresh && !desk.sessionProject[sid]) {
+        try {
+            await deskApi('POST', '/api/projects/assign', {session_id: sid, project_id: desk.active});
+            desk.sessionProject[sid] = desk.active;
+            renderHistory();
+            deskUpdateChip();
+        } catch (e) { console.error('assign:', e); }
+    }
+}
+async function deskProjectModal(pid) {
+    let p = {name: '', folder: '', instructions: '', files: [], notes: []};
+    if (pid) { try { p = await deskApi('GET', '/api/projects/' + pid); } catch (e) { alert(e.message); return; } }
+    const {body, close} = deskOverlay(pid ? 'Project' : 'New project');
+    const name = deskEl('input'); name.type = 'text'; name.value = p.name; name.placeholder = 'Project name';
+    const folder = deskEl('input'); folder.type = 'text'; folder.value = p.folder || ''; folder.placeholder = 'C:/path/to/folder (optional)';
+    const instr = deskEl('textarea', 'desk-textarea'); instr.rows = 5; instr.value = p.instructions || '';
+    instr.placeholder = 'Standing instructions Lucy follows in every chat of this project';
+    body.append(deskField('Name', name), deskField('Folder (Lucy works here by default)', folder), deskField('Instructions', instr));
+    const save = deskEl('button', 'settings-row-btn', pid ? 'Save' : 'Create project');
+    save.onclick = async () => {
+        try {
+            const payload = {name: name.value, folder: folder.value, instructions: instr.value};
+            const res = pid ? await deskApi('PATCH', '/api/projects/' + pid, payload) : await deskApi('POST', '/api/projects', payload);
+            close(); await deskLoadProjects();
+            if (!pid) { desk.active = res.id; deskRenderProjects(); renderHistory(); }
+        } catch (e) { alert(e.message); }
+    };
+    body.appendChild(save);
+    if (pid) {
+        const files = deskEl('div', 'desk-list');
+        const fresh = async () => { close(); deskProjectModal(pid); };
+        (p.files || []).forEach(f => {
+            const r = deskEl('div', 'desk-list-row');
+            r.append(deskEl('span', '', f.name + (f.missing ? ' (missing)' : '')));
+            const rm = deskEl('button', 'settings-row-btn', 'Remove');
+            rm.onclick = async () => { await deskApi('DELETE', `/api/projects/${pid}/files/${f.sha}`); fresh(); };
+            r.appendChild(rm); files.appendChild(r);
+        });
+        const up = deskEl('input'); up.type = 'file';
+        up.onchange = async () => {
+            if (!up.files[0]) return;
+            const fd = new FormData(); fd.append('file', up.files[0]);
+            try { await deskApi('POST', `/api/projects/${pid}/files`, fd); fresh(); } catch (e) { alert(e.message); }
+        };
+        body.append(deskEl('h4', 'desk-sub', 'Files'), files, up);
+        const notes = deskEl('div', 'desk-list');
+        if (!(p.notes || []).length) notes.appendChild(deskEl('div', 'desk-hint', 'Nothing yet. When Lucy remembers something in this project it shows up here.'));
+        (p.notes || []).forEach(n => {
+            const r = deskEl('div', 'desk-list-row');
+            r.append(deskEl('span', '', n.text));
+            const rm = deskEl('button', 'settings-row-btn', 'Forget');
+            rm.onclick = async () => { await deskApi('DELETE', `/api/projects/${pid}/notes/${n.id}`); fresh(); };
+            r.appendChild(rm); notes.appendChild(r);
+        });
+        body.append(deskEl('h4', 'desk-sub', 'Project notes (its own memory)'), notes);
+        const del = deskEl('button', 'settings-row-btn danger', 'Delete project (chats are kept)');
+        del.onclick = async () => {
+            if (!confirm('Delete this project? Its chats stay, without a project.')) return;
+            await deskApi('DELETE', '/api/projects/' + pid); close(); deskLoadProjects();
+        };
+        body.appendChild(del);
+    }
+}
+function deskPickProject(sid) {
+    const {body, close} = deskOverlay('Move chat to a project');
+    const mk = (id, label) => {
+        const b = deskEl('button', 'settings-row-btn desk-pick', label);
+        b.onclick = async () => {
+            try { await deskApi('POST', '/api/projects/assign', {session_id: sid, project_id: id}); } catch (e) { alert(e.message); }
+            close(); deskLoadProjects();
+        };
+        body.appendChild(b);
+    };
+    mk(null, 'No project');
+    desk.projects.forEach(p => mk(p.id, p.name));
+}
+function deskDecorateSession(item, sid) {
+    const menu = item.querySelector('.session-menu');
+    if (!menu) return;
+    const mk = (label, fn) => {
+        const b = deskEl('button', 'session-menu-item', label);
+        b.type = 'button'; b.setAttribute('role', 'menuitem');
+        b.onclick = (e) => { e.stopPropagation(); closeSessionMenus(); fn(); };
+        menu.insertBefore(b, menu.firstChild);
+    };
+    mk('Move to project\u2026', () => deskPickProject(sid));
+    mk('Export as JSON', () => deskExport('json', sid));
+    mk('Export as Markdown', () => deskExport('md', sid));
+}
+
+// ---------------------------------------------------------------- 2. edit / regenerate / branch (+ 11 export)
+function deskExport(fmt, sid) {
+    sid = sid || currentSessionId;
+    if (!sid) { alert('Open a chat first.'); return; }
+    const a = document.createElement('a');
+    a.href = `/api/desk/sessions/${encodeURIComponent(sid)}/export?format=${fmt}&api_key=${encodeURIComponent(API_KEY)}`;
+    a.download = '';
+    document.body.appendChild(a); a.click(); a.remove();
+}
+function deskSend(text, opts) {
+    if (isStreaming) { alert('Wait for the reply to finish (or press Stop) first.'); return; }
+    messageInput.value = text;
+    autosizeInput();
+    desk.opts = opts || {};
+    desk.skipPre = true;
+    sendMessage();
+}
+function deskTagRow(bubble, msg) {
+    const row = bubble && bubble.closest ? bubble.closest('.message-row') : null;
+    if (!row) return;
+    if (msg.id) row.dataset.mid = msg.id;
+    if (msg.role === 'user') row.dataset.raw = msg.content || '';
+    deskRefreshActions();
+}
+function deskRefreshActions() {
+    const rows = [...chatContainer.querySelectorAll('.message-row')];
+    const lastAssistant = [...rows].reverse().find(r => r.classList.contains('assistant-message') && r.dataset.mid);
+    rows.forEach(row => {
+        let bar = row.querySelector(':scope > .msg-actions');
+        if (bar) bar.remove();
+        if (!row.dataset.mid || !currentSessionId) return;
+        bar = deskEl('div', 'msg-actions');
+        const btn = (label, title, fn) => { const b = deskEl('button', 'msg-act', label); b.type = 'button'; b.title = title; b.onclick = fn; bar.appendChild(b); };
+        const isUser = row.classList.contains('user-message');
+        btn('Copy', 'Copy the text', () => copyText((row.querySelector('.message-bubble') || row).innerText));
+        if (isUser) btn('Edit', 'Edit this message and answer it again', () => deskEdit(row));
+        else {
+            if (row === lastAssistant) btn('Regenerate', 'Answer the last message again', () => deskRegenerate());
+            btn('Branch', 'Continue from here in a new chat', () => deskBranch(row.dataset.mid));
+        }
+        row.appendChild(bar);
+    });
+}
+function deskEdit(row) {
+    const bubble = row.querySelector('.message-bubble');
+    if (!bubble || row.dataset.editing) return;
+    row.dataset.editing = '1';
+    const old = bubble.innerHTML;
+    const ta = deskEl('textarea', 'desk-textarea'); ta.value = row.dataset.raw || bubble.innerText; ta.rows = 3;
+    const save = deskEl('button', 'settings-row-btn', 'Save & resend');
+    const cancel = deskEl('button', 'settings-row-btn', 'Cancel');
+    const bar = deskEl('div', 'desk-edit-bar'); bar.append(save, cancel);
+    bubble.innerHTML = ''; bubble.append(ta, bar);
+    cancel.onclick = () => { bubble.innerHTML = old; delete row.dataset.editing; };
+    save.onclick = async () => {
+        const text = ta.value.trim();
+        if (!text) return;
+        try {
+            const res = await deskApi('POST', `/api/desk/sessions/${encodeURIComponent(currentSessionId)}/edit`, {message_id: Number(row.dataset.mid)});
+            await switchSession(currentSessionId, true);
+            deskSend(text, {reuse: res.attachments});
+        } catch (e) { alert(e.message); cancel.onclick(); }
+    };
+    ta.focus();
+}
+async function deskRegenerate() {
+    if (!currentSessionId) return;
+    if (isStreaming) { alert('Wait for the reply to finish (or press Stop) first.'); return; }
+    try {
+        const res = await deskApi('POST', `/api/desk/sessions/${encodeURIComponent(currentSessionId)}/regenerate`);
+        await switchSession(currentSessionId, true);
+        deskSend(res.text, {reuse: res.attachments});
+    } catch (e) { alert(e.message); }
+}
+async function deskBranch(mid) {
+    if (!currentSessionId) return;
+    try {
+        if (!mid) {
+            const rows = [...chatContainer.querySelectorAll('.message-row[data-mid]')];
+            if (!rows.length) { alert('Nothing to branch from yet.'); return; }
+            mid = rows[rows.length - 1].dataset.mid;
+        }
+        const res = await deskApi('POST', `/api/desk/sessions/${encodeURIComponent(currentSessionId)}/branch`, {message_id: Number(mid)});
+        await loadSessions(); await deskLoadProjects();
+        switchSession(res.session_id, true);
+    } catch (e) { alert(e.message); }
+}
+function deskTurn(bubble, t) {
+    const row = bubble.closest('.message-row');
+    let prev = row ? row.previousElementSibling : null;
+    while (prev && !prev.classList.contains('message-row')) prev = prev.previousElementSibling;
+    if (prev) { prev.dataset.mid = t.user_id; prev.dataset.raw = desk.lastText; if (t.checkpoint) prev.dataset.cp = t.checkpoint; }
+}
+function deskTurnDone(bubble, t) {
+    const row = bubble.closest('.message-row');
+    if (row) row.dataset.mid = t.assistant_id;
+    deskRefreshActions();
+}
+
+// ---------------------------------------------------------------- 3. slash commands + @files
+function deskTakeOpts() {
+    const o = Object.assign({}, desk.opts);
+    if (desk.plan && !o.mode) o.mode = 'plan';
+    if (o.mode === 'plan') deskSetPlan(false);
+    desk.opts = {};
+    desk.lastText = messageInput.value.trim();
+    return o;
+}
+function deskClearInput() { messageInput.value = ''; autosizeInput(); updateSendButton(); }
+function deskPreSend() {
+    if (desk.skipPre) { desk.skipPre = false; return false; }
+    deskHidePop();
+    if (isStreaming || !desk.commands) return false;
+    const m = messageInput.value.trim().match(/^\/([A-Za-z]+)(?:[ \t]+([\s\S]*))?$/);
+    if (!m) return false;
+    const cmd = desk.commands.find(c => c.name === m[1].toLowerCase());
+    if (!cmd) return false;
+    const args = (m[2] || '').trim();
+    const need = () => { messageInput.placeholder = `/${cmd.name} ${cmd.args}`; messageInput.value = `/${cmd.name} `; messageInput.focus(); return true; };
+    switch (cmd.action) {
+        case 'plan':
+            if (!args) { deskClearInput(); deskSetPlan(true); return true; }
+            messageInput.value = args; desk.opts = {mode: 'plan'}; return false;
+        case 'research':
+            if (!args) return need();
+            messageInput.value = 'Research: ' + args; desk.opts = {mode: 'research'}; return false;
+        case 'text':
+            if (!args) return need();
+            messageInput.value = cmd.template.replace('{args}', args); return false;
+        case 'regenerate': deskClearInput(); deskRegenerate(); return true;
+        case 'branch': deskClearInput(); deskBranch(); return true;
+        case 'export': deskClearInput(); deskExport(args.toLowerCase() === 'json' ? 'json' : 'md'); return true;
+        case 'new': deskClearInput(); newSession(); return true;
+        case 'rewind': deskClearInput(); deskRewindOpen(); return true;
+        case 'help': {
+            deskClearInput();
+            addMessage('**Commands**\n\n' + desk.commands.map(c => `- \`/${c.name}${c.args ? ' ' + c.args : ''}\` \u2014 ${c.help}`).join('\n') +
+                       '\n\nType `@` to point at a file in your project or Lucy folder.', false, [], null);
+            return true;
+        }
+    }
+    return false;
+}
+function deskHidePop() { const p = document.getElementById('deskPop'); if (p) p.hidden = true; desk.popKind = ''; desk.popItems = []; }
+function deskShowPop(kind, items) {
+    const pop = document.getElementById('deskPop');
+    if (!pop || !items.length) { deskHidePop(); return; }
+    desk.popKind = kind; desk.popItems = items; desk.popIdx = 0;
+    pop.innerHTML = '';
+    items.forEach((it, i) => {
+        const b = deskEl('button', 'desk-pop-item' + (i === 0 ? ' sel' : ''));
+        b.type = 'button';
+        b.append(deskEl('span', 'desk-pop-main', kind === 'cmd' ? '/' + it.name + (it.args ? ' ' + it.args : '') : (it.dir ? '\uD83D\uDCC1 ' : '') + it.rel),
+                 deskEl('span', 'desk-pop-help', kind === 'cmd' ? it.help : (it.size != null ? formatFileSize(it.size) : '')));
+        b.onmousedown = (e) => { e.preventDefault(); deskPick(i); };
+        pop.appendChild(b);
+    });
+    pop.hidden = false;
+}
+function deskMovePop(d) {
+    const kids = [...document.querySelectorAll('#deskPop .desk-pop-item')];
+    if (!kids.length) return;
+    kids[desk.popIdx].classList.remove('sel');
+    desk.popIdx = (desk.popIdx + d + kids.length) % kids.length;
+    kids[desk.popIdx].classList.add('sel');
+    kids[desk.popIdx].scrollIntoView({block: 'nearest'});
+}
+function deskPick(i) {
+    const it = desk.popItems[i];
+    if (!it) return;
+    if (desk.popKind === 'cmd') {
+        deskHidePop();
+        if (it.args) { messageInput.value = '/' + it.name + ' '; messageInput.focus(); autosizeInput(); updateSendButton(); }
+        else { messageInput.value = '/' + it.name; sendMessage(); }
+    } else {
+        const pos = messageInput.selectionStart, v = messageInput.value;
+        const before = v.slice(0, pos).replace(/@"?[^\s"]*$/, '');
+        const ref = /\s/.test(it.rel) ? `@"${it.rel}" ` : `@${it.rel}${it.dir ? '/' : ''} `;
+        messageInput.value = before + ref + v.slice(pos);
+        const np = (before + ref).length;
+        messageInput.setSelectionRange(np, np);
+        deskHidePop(); autosizeInput(); updateSendButton(); messageInput.focus();
+    }
+}
+function deskPopInput() {
+    const v = messageInput.value, pos = messageInput.selectionStart || 0, before = v.slice(0, pos);
+    const sm = v.match(/^\/([A-Za-z]*)$/);
+    if (sm && desk.commands) { deskShowPop('cmd', desk.commands.filter(c => c.name.startsWith(sm[1].toLowerCase()))); return; }
+    const fm = before.match(/(?:^|\s)@"?([^\s"]*)$/);
+    if (fm) {
+        clearTimeout(desk.fileTimer);
+        desk.fileTimer = setTimeout(async () => {
+            try {
+                const q = new URLSearchParams({q: fm[1], limit: 10});
+                if (currentSessionId) q.set('session_id', currentSessionId);
+                const d = await deskApi('GET', '/api/desk/files?' + q.toString());
+                deskShowPop('file', d.files || []);
+            } catch (e) { deskHidePop(); }
+        }, 150);
+        return;
+    }
+    deskHidePop();
+}
+
+// ---------------------------------------------------------------- 4. usage meter + model / thinking, 5. plan mode
+function deskApplyLlm(st) {
+    desk.llm = st;
+    const sel = document.getElementById('deskModel');
+    if (sel) { sel.innerHTML = st.models.map(m => `<option value="${m.id}">${escapeHtml(m.label)}</option>`).join(''); sel.value = st.active; }
+    const t = document.getElementById('deskThink');
+    if (t) t.classList.toggle('on', !!st.reasoning);
+}
+async function deskRefreshMeter() {
+    const box = document.getElementById('deskMeter');
+    if (!box) return;
+    if (!currentSessionId) { box.hidden = true; return; }
+    try {
+        const u = await deskApi('GET', '/api/desk/usage?session_id=' + encodeURIComponent(currentSessionId));
+        const h = n => n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+        box.hidden = false;
+        box.className = 'desk-meter ' + u.level;
+        document.getElementById('deskMeterFill').style.width = u.pct + '%';
+        document.getElementById('deskMeterText').textContent = `${h(u.tokens)} / ${h(u.limit)}`;
+        box.title = `About ${u.pct}% of the model's memory for this chat is used (estimate). Start a new chat or branch when it is nearly full.`;
+    } catch (e) { box.hidden = true; }
+}
+function deskSetPlan(on) {
+    desk.plan = !!on;
+    const b = document.getElementById('deskPlan');
+    if (b) b.classList.toggle('on', desk.plan);
+    messageInput.placeholder = desk.plan ? 'Describe the task: Lucy will show a plan first...' : 'Type your message...';
+}
+function deskAfterTurn(bubble, opts, fullResponse) {
+    if (opts && opts.mode === 'plan' && (fullResponse || '').trim()) {
+        const card = deskEl('div', 'plan-card');
+        card.append(deskEl('div', 'plan-card-title', 'Plan ready \u2014 nothing has been changed yet.'));
+        const ok = deskEl('button', 'approval-btn ok', 'Approve & run');
+        const edit = deskEl('button', 'approval-btn', 'Change it\u2026');
+        ok.onclick = () => { card.remove(); deskSend(PLAN_APPROVE_TEXT); };
+        edit.onclick = () => { card.remove(); messageInput.placeholder = 'What should change in the plan?'; messageInput.focus(); desk.plan = false; };
+        card.append(ok, edit);
+        getFileGroup(bubble).appendChild(card);
+        scrollToBottom();
+    }
+    deskRefreshActions();
+    deskRefreshMeter();
+}
+
+// ---------------------------------------------------------------- 6. rewind
+async function deskRewindOpen() {
+    if (!currentSessionId) { alert('Open a chat first.'); return; }
+    let cps = [];
+    try { cps = (await deskApi('GET', `/api/desk/sessions/${encodeURIComponent(currentSessionId)}/checkpoints`)).checkpoints; }
+    catch (e) { alert(e.message); return; }
+    const {body, close} = deskOverlay('Rewind');
+    body.appendChild(deskEl('div', 'desk-hint', 'Go back to just before one of your messages. Files Lucy changed with her file tools are put back too. Changes made by shell commands cannot be undone.'));
+    if (!cps.length) body.appendChild(deskEl('div', 'desk-hint', 'No rewind points in this chat yet.'));
+    cps.forEach(cp => {
+        const r = deskEl('div', 'desk-list-row desk-rewind-row');
+        const info = deskEl('div', 'desk-rewind-info');
+        info.append(deskEl('div', 'desk-rewind-text', cp.preview || '(message)'),
+                    deskEl('div', 'desk-hint', `${formatTimestamp(cp.created_at) || ''} \u00B7 ${cp.files.length} file(s) changed`));
+        const go = async (files, conv) => {
+            const what = (files && conv) ? 'the chat and the files' : (files ? 'the files only' : 'the chat only');
+            if (!confirm(`Rewind ${what} to before this message?`)) return;
+            try {
+                const res = await deskApi('POST', `/api/desk/sessions/${encodeURIComponent(currentSessionId)}/rewind`, {checkpoint_id: cp.id, files, conversation: conv});
+                close();
+                if (conv) { await switchSession(currentSessionId, true); messageInput.value = res.text || ''; autosizeInput(); updateSendButton(); }
+                if (res.restored.length || res.failed.length) alert(`Restored ${res.restored.length} file(s).` + (res.failed.length ? '\nCould not restore:\n' + res.failed.join('\n') : ''));
+                deskRefreshMeter();
+            } catch (e) { alert(e.message); }
+        };
+        const both = deskEl('button', 'settings-row-btn', 'Rewind both'); both.onclick = () => go(true, true);
+        const fo = deskEl('button', 'settings-row-btn', 'Files only'); fo.onclick = () => go(true, false);
+        fo.disabled = !cp.files.length;
+        const co = deskEl('button', 'settings-row-btn', 'Chat only'); co.onclick = () => go(false, true);
+        r.append(info, both, fo, co);
+        body.appendChild(r);
+    });
+}
+
+// ---------------------------------------------------------------- 9. Library pins / cap / cleanup / side pane
+function deskDecorateCard(card, item) {
+    const foot = card.querySelector('.lib-foot');
+    if (!foot) return;
+    if (item.pinned) card.classList.add('pinned');
+    const pin = deskEl('button', 'lib-act' + (item.pinned ? ' on' : ''), item.pinned ? '\u2605' : '\u2606');
+    pin.type = 'button'; pin.title = item.pinned ? 'Unpin (it can be cleaned up again)' : 'Pin (never cleaned up)';
+    pin.onclick = async (e) => { e.stopPropagation(); try { await deskApi('POST', `/api/library/${item.sha}/pin`, {pinned: !item.pinned}); } catch (er) { alert(er.message); } loadLibrary(true); deskLibStats(); };
+    const side = deskEl('button', 'lib-act', '\u25E7');
+    side.type = 'button'; side.title = 'Open beside the chat';
+    side.onclick = (e) => { e.stopPropagation(); deskOpenSide(item); };
+    foot.insertBefore(side, foot.querySelector('a.lib-act'));
+    foot.insertBefore(pin, side);
+}
+async function deskLibStats() {
+    const el = document.getElementById('deskLibInfo');
+    if (!el) return;
+    try {
+        const s = await deskApi('GET', '/api/library/stats');
+        const cap = s.cap_bytes ? formatFileSize(s.cap_bytes) : 'no cap';
+        el.textContent = `Using ${formatFileSize(s.bytes)} of ${cap} \u00B7 ${s.pinned} pinned`;
+    } catch (e) { el.textContent = ''; }
+}
+function deskLibBar() {
+    if (document.getElementById('deskLibBar')) return;
+    const bar = deskEl('div', 'desk-libbar'); bar.id = 'deskLibBar';
+    const info = deskEl('span', 'desk-hint'); info.id = 'deskLibInfo';
+    const lab = deskEl('label', 'lib-scope'); const cb = deskEl('input'); cb.type = 'checkbox';
+    cb.onchange = () => { window.deskLibPinned = cb.checked; loadLibrary(true); };
+    lab.append(cb, deskEl('span', '', 'Pinned only'));
+    const cap = deskEl('button', 'settings-row-btn', 'Size cap\u2026');
+    cap.onclick = async () => {
+        const v = prompt('Maximum cache size in MB (0 = no limit). Oldest unpinned files are removed when it is full:', '2048');
+        if (v === null) return;
+        try { const r = await deskApi('POST', '/api/library/cap', {cap_mb: Number(v)}); if (r.removed) alert(`Removed ${r.removed} old file(s).`); } catch (e) { alert(e.message); }
+        loadLibrary(true); deskLibStats();
+    };
+    const clean = deskEl('button', 'settings-row-btn', 'Clean up\u2026');
+    clean.onclick = async () => {
+        const v = prompt('Remove unpinned files not used for how many days? (0 = all unpinned files)', '30');
+        if (v === null) return;
+        try {
+            const days = Math.max(0, Number(v) || 0);
+            const pv = await deskApi('GET', '/api/library/cleanup/preview?older_than_days=' + days);
+            if (!pv.files) { alert('Nothing to clean up.'); return; }
+            if (!confirm(`Remove ${pv.files} file(s), ${formatFileSize(pv.bytes)}? Chats will show them as removed. Pinned files stay.`)) return;
+            await deskApi('POST', '/api/library/cleanup', {older_than_days: days});
+        } catch (e) { alert(e.message); }
+        loadLibrary(true); deskLibStats();
+    };
+    bar.append(info, lab, cap, clean);
+    const tabs = document.getElementById('libTabs');
+    tabs.parentNode.insertBefore(bar, tabs.nextSibling);
+}
+async function deskOpenSide(item) {
+    closeLibrary();
+    const pane = document.getElementById('sidePane'), body = document.getElementById('sidePaneBody');
+    document.getElementById('sidePaneName').textContent = item.name;
+    const url = libraryFileUrl(item.sha);
+    document.getElementById('sidePaneDl').href = url.replace('/file/', '/file/') + '&download=1';
+    body.innerHTML = '';
+    if (item.kind === 'images') { const i = deskEl('img', 'side-img'); i.src = url; body.appendChild(i); }
+    else if (/\.pdf$/i.test(item.name)) { const f = deskEl('iframe', 'side-frame'); f.src = url; body.appendChild(f); }
+    else if (isTextFile(item.name)) {
+        try { const r = await fetchTextFile(url); const pre = deskEl('pre', 'side-text'); pre.textContent = r.binary ? '(binary file)' : r.text; body.appendChild(pre); }
+        catch (e) { body.appendChild(deskEl('div', 'desk-hint', 'Could not load the file.')); }
+    } else body.appendChild(deskEl('div', 'desk-hint', 'No preview for this file type. Use Download.'));
+    pane.hidden = false;
+    document.querySelector('.main-chat').classList.add('has-side');
+}
+function deskCloseSide() {
+    document.getElementById('sidePane').hidden = true;
+    document.querySelector('.main-chat').classList.remove('has-side');
+}
+
+// ---------------------------------------------------------------- 10. settings overview
+async function deskLoadOverview() {
+    const box = document.getElementById('overviewBody');
+    if (!box) return;
+    box.textContent = 'Loading...';
+    let o;
+    try { o = await deskApi('GET', '/api/desk/overview'); } catch (e) { box.textContent = 'Could not load: ' + e.message; return; }
+    box.innerHTML = '';
+    const card = (title, lines, tab) => {
+        const c = deskEl('div', 'ov-card');
+        const h = deskEl('div', 'ov-head'); h.append(deskEl('strong', '', title));
+        if (tab) { const b = deskEl('button', 'settings-row-btn', 'Open'); b.onclick = () => switchSettingsTab(tab); h.appendChild(b); }
+        c.appendChild(h);
+        (lines.length ? lines : ['Nothing here yet.']).forEach(l => c.appendChild(deskEl('div', 'desk-hint', l)));
+        box.appendChild(c);
+    };
+    const p = o.permission || {};
+    card('Permissions', [`Mode: ${p.label || p.mode || '?'}`, p.paused ? 'Agent is PAUSED' : 'Agent is running'], 'safety');
+    card('Connectors', (o.connectors || []).map(s => `${s.name}: ${s.error ? 'error' : !s.enabled ? 'off' : s.running ? 'running' : 'ready'}${s.tools ? ` (${s.tools} tools)` : ''}`), 'connectors');
+    const t = o.tasks || {};
+    card('Tasks', [t.enabled === false ? 'Background tasks are off' : `${t.active || 0} active, ${t.parked || 0} waiting for your approval, ${t.waiting_ok || 0} waiting for OK`], 'tasks');
+    const l = o.library || {};
+    card('Library', [`${l.files || 0} files, ${formatFileSize(l.bytes || 0)}${l.cap_bytes ? ' of ' + formatFileSize(l.cap_bytes) : ''}, ${l.pinned || 0} pinned`]);
+    card('Projects', [`${o.projects || 0} project(s)`]);
+}
+
+// ---------------------------------------------------------------- wiring
+(function deskInit() {
+    const _apply = _applyLlmStatus;
+    _applyLlmStatus = function (st) { _apply(st); try { deskApplyLlm(st); } catch (e) { /* bar not present */ } };
+    const _card = libCard;
+    libCard = function (item) { const c = _card(item); try { deskDecorateCard(c, item); } catch (e) { /* keep the plain card */ } return c; };
+    const _openLib = openLibrary;
+    openLibrary = function () { _openLib(); deskLibBar(); deskLibStats(); };
+    window.deskOnSwitch = function () { deskUpdateChip(); deskRefreshActions(); deskRefreshMeter(); };
+
+    const on = (id, fn) => { const e = document.getElementById(id); if (e) e.addEventListener('click', fn); };
+    on('deskNewProject', () => deskProjectModal(null));
+    on('deskPlan', () => deskSetPlan(!desk.plan));
+    on('deskRewind', () => deskRewindOpen());
+    on('deskThink', () => {
+        if (!desk.llm) return;
+        if (confirm('Changing Thinking reloads the model (takes a moment). Continue?')) saveLlmSetting('reasoning', desk.llm.reasoning ? 'off' : 'on');
+    });
+    const sel = document.getElementById('deskModel');
+    if (sel) sel.addEventListener('change', () => saveLlmSetting('model', sel.value));
+    on('sidePaneClose', deskCloseSide);
+
+    messageInput.addEventListener('input', deskPopInput);
+    messageInput.addEventListener('blur', () => setTimeout(deskHidePop, 150));
+    messageInput.addEventListener('keydown', (e) => {                    // capture: runs before the Enter-to-send handler
+        const pop = document.getElementById('deskPop');
+        if (!pop || pop.hidden) return;
+        if (e.key === 'ArrowDown') { e.preventDefault(); deskMovePop(1); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); deskMovePop(-1); }
+        else if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); e.stopImmediatePropagation(); deskPick(desk.popIdx); }
+        else if (e.key === 'Escape') { e.preventDefault(); deskHidePop(); }
+    }, true);
+
+    deskApi('GET', '/api/desk/commands').then(d => { desk.commands = d.commands; }).catch(() => {});
+    deskLoadProjects();
+    loadLlmStatus();
+    deskRefreshMeter();
+
+    const q = new URLSearchParams(location.search).get('q');           // quick entry (Ctrl+Alt+Space) opens /?q=text
+    if (q) {
+        history.replaceState(null, '', location.pathname);
+        setTimeout(() => { newSession(); messageInput.value = q; autosizeInput(); updateSendButton(); sendMessage(); }, 500);
+    }
+})();

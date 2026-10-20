@@ -145,6 +145,13 @@ class Library:
                 );
                 CREATE INDEX IF NOT EXISTS idx_lib_refs_sha     ON library_refs(sha);
                 CREATE INDEX IF NOT EXISTS idx_lib_refs_session ON library_refs(session_id);
+                -- P9: files that must survive even when no chat message references them (pins, project files)
+                CREATE TABLE IF NOT EXISTS library_keep (
+                    sha    TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    PRIMARY KEY (sha, reason)
+                );
+                CREATE TABLE IF NOT EXISTS library_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
             self.conn.commit()
 
@@ -304,7 +311,8 @@ class Library:
         return (" WHERE " + " AND ".join(where)) if where else "", args
 
     def list_items(self, session_id: str | None = None, categories: list[str] | None = None,
-                   origin: str | None = None, q: str | None = None, limit: int = 60, offset: int = 0) -> dict:
+                   origin: str | None = None, q: str | None = None, limit: int = 60, offset: int = 0,
+                   pinned_only: bool = False) -> dict:
         sub_where, sub_args = self._filters(session_id, origin)
         base = (f"FROM library_items i "
                 f"JOIN (SELECT sha, MAX(ref_id) AS rid, COUNT(*) AS n FROM library_refs{sub_where} GROUP BY sha) c ON c.sha = i.sha "
@@ -318,6 +326,8 @@ class Library:
         item_cond, item_args = list(cond), list(args)
         if cats:
             item_cond.append(f"i.category IN ({','.join('?' * len(cats))})"); item_args += cats
+        if pinned_only:
+            item_cond.append("i.sha IN (SELECT sha FROM library_keep WHERE reason = 'pin')")
         item_where = (" WHERE " + " AND ".join(item_cond)) if item_cond else ""
         with self.lock:
             counts = {r["category"]: r["n"] for r in self.conn.execute(
@@ -325,12 +335,15 @@ class Library:
             total = self.conn.execute(f"SELECT COUNT(*) AS n {base}{item_where}", item_args).fetchone()["n"]
             rows = self.conn.execute(
                 f"SELECT i.sha, i.category, i.mime, i.size, r.name, r.origin, r.session_id, r.created_at, "
-                f"s.title AS session_title, c.n AS refs {base}{item_where} ORDER BY r.ref_id DESC LIMIT ? OFFSET ?",
+                f"s.title AS session_title, c.n AS refs, "
+                f"EXISTS (SELECT 1 FROM library_keep k WHERE k.sha = i.sha AND k.reason = 'pin') AS pinned "
+                f"{base}{item_where} ORDER BY pinned DESC, r.ref_id DESC LIMIT ? OFFSET ?",
                 item_args + [max(1, min(int(limit), 200)), max(0, int(offset))]).fetchall()
         items = [{
             "sha": r["sha"], "name": r["name"], "type": r["mime"], "size": r["size"], "category": r["category"],
             "kind": r["category"].lower(), "origin": r["origin"], "session_id": r["session_id"],
             "session_title": r["session_title"] or "Deleted session", "created_at": r["created_at"], "refs": r["refs"],
+            "pinned": bool(r["pinned"]),
             "url": f"/api/library/file/{r['sha']}",
             "thumb_url": f"/api/library/thumb/{r['sha']}" if r["category"] == "Images" else None,
         } for r in rows]
@@ -396,7 +409,8 @@ class Library:
         """Remove cached files that no message references any more."""
         with self.lock:
             rows = self.conn.execute(
-                "SELECT sha, rel_path FROM library_items WHERE sha NOT IN (SELECT sha FROM library_refs)").fetchall()
+                "SELECT sha, rel_path FROM library_items WHERE sha NOT IN (SELECT sha FROM library_refs) "
+                "AND sha NOT IN (SELECT sha FROM library_keep)").fetchall()
             for r in rows:
                 self.conn.execute("DELETE FROM library_items WHERE sha = ?", (r["sha"],))
             self.conn.commit()
@@ -420,6 +434,7 @@ class Library:
             if not row:
                 return False
             self.conn.execute("DELETE FROM library_refs WHERE sha = ?", (sha,))
+            self.conn.execute("DELETE FROM library_keep WHERE sha = ?", (sha,))
             self.conn.execute("DELETE FROM library_items WHERE sha = ?", (sha,))
             self.conn.commit()
         self._drop_item(sha, row["rel_path"])
@@ -442,6 +457,7 @@ class Library:
                 continue
             missing += 1
             with self.lock:
+                self.conn.execute("DELETE FROM library_keep WHERE sha = ?", (r["sha"],))
                 self.conn.execute("DELETE FROM library_refs WHERE sha = ?", (r["sha"],))
                 self.conn.execute("DELETE FROM library_items WHERE sha = ?", (r["sha"],))
                 self.conn.commit()
@@ -467,13 +483,127 @@ class Library:
                      missing, removed, orphan_files)
         return {"missing_records": missing, "orphan_records": removed, "stray_files": orphan_files}
 
+    # ------------------------------------------------------------------ P9: pins, size cap, cleanup
+    def keep(self, sha: str, reason: str) -> bool:
+        """Protect a cached file from cleanup / orphan removal (reason: 'pin', 'project:<id>')."""
+        if not _SHA_RE.match(sha or ""):
+            return False
+        with self.lock:
+            if not self.conn.execute("SELECT 1 FROM library_items WHERE sha = ?", (sha,)).fetchone():
+                return False
+            self.conn.execute("INSERT OR IGNORE INTO library_keep (sha, reason) VALUES (?, ?)", (sha, reason))
+            self.conn.commit()
+        return True
+
+    def unkeep(self, sha: str, reason: str) -> None:
+        with self.lock:
+            self.conn.execute("DELETE FROM library_keep WHERE sha = ? AND reason = ?", (sha, reason))
+            self.conn.commit()
+        self.gc_orphans()
+
+    def set_pin(self, sha: str, pinned: bool) -> bool:
+        ok = self.keep(sha, "pin") if pinned else (self.unkeep(sha, "pin") or self.get(sha) is not None)
+        if ok:
+            self.rev += 1
+        return bool(ok)
+
+    def meta_get(self, key: str, default: str | None = None) -> str | None:
+        with self.lock:
+            row = self.conn.execute("SELECT value FROM library_meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def meta_set(self, key: str, value: str) -> None:
+        with self.lock:
+            self.conn.execute("INSERT INTO library_meta (key, value) VALUES (?, ?) "
+                              "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
+            self.conn.commit()
+
+    def cap_bytes(self) -> int:
+        """Size cap of the cache in bytes (0 = no cap). Setting: Library > cap; default LUCY_CACHE_CAP_MB or 2 GB."""
+        env = os.environ.get("LUCY_CACHE_CAP_MB", "2048")
+        try:
+            default = int(float(env) * 1024 * 1024)
+        except ValueError:
+            default = 2048 * 1024 * 1024
+        try:
+            return max(0, int(self.meta_get("cap_bytes", str(default))))
+        except ValueError:
+            return default
+
+    def set_cap_bytes(self, n: int) -> int:
+        n = max(0, int(n))
+        self.meta_set("cap_bytes", str(n))
+        return n
+
+    def _removable(self, older_than_days: float | None = None, categories: Iterable[str] | None = None) -> list:
+        """Unpinned, unprotected files, oldest first. `older_than_days` compares with the newest message using the file."""
+        cats = [c for c in (categories or []) if c in CATEGORIES]
+        cond = ["i.sha NOT IN (SELECT sha FROM library_keep)"]
+        args: list = []
+        if cats:
+            cond.append(f"i.category IN ({','.join('?' * len(cats))})"); args += cats
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT i.sha, i.rel_path, i.size, i.category, "
+                "COALESCE((SELECT MAX(created_at) FROM library_refs r WHERE r.sha = i.sha), i.created_at) AS last_used "
+                f"FROM library_items i WHERE {' AND '.join(cond)} ORDER BY last_used ASC, i.rowid ASC", args).fetchall()
+        if older_than_days is not None and older_than_days > 0:
+            cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - older_than_days * 86400))
+            rows = [r for r in rows if (r["last_used"] or "") < cutoff]
+        return rows
+
+    def cleanup_preview(self, older_than_days: float | None = None, categories: Iterable[str] | None = None) -> dict:
+        rows = self._removable(older_than_days, categories)
+        return {"files": len(rows), "bytes": sum(r["size"] for r in rows)}
+
+    def cleanup(self, older_than_days: float | None = None, categories: Iterable[str] | None = None) -> dict:
+        """Delete unpinned files (the chat keeps showing them as 'removed'). Pinned and project files are never touched."""
+        rows = self._removable(older_than_days, categories)
+        freed = 0
+        for r in rows:
+            if self._remove_one(r["sha"], r["rel_path"]):
+                freed += r["size"]
+        if rows:
+            self.rev += 1
+        return {"removed": len(rows), "bytes": freed}
+
+    def _remove_one(self, sha: str, rel_path: str) -> bool:
+        with self.lock:
+            self.conn.execute("DELETE FROM library_refs WHERE sha = ?", (sha,))
+            self.conn.execute("DELETE FROM library_items WHERE sha = ?", (sha,))
+            self.conn.commit()
+        self._drop_item(sha, rel_path)
+        return True
+
+    def enforce_cap(self, cap: int | None = None) -> dict:
+        """Over the cap -> delete the least recently used unpinned files until it fits. Returns what was removed."""
+        cap = self.cap_bytes() if cap is None else int(cap)
+        if cap <= 0:
+            return {"removed": 0, "bytes": 0}
+        total = self.stats()["bytes"]
+        if total <= cap:
+            return {"removed": 0, "bytes": 0}
+        removed = freed = 0
+        for r in self._removable():
+            if total <= cap:
+                break
+            self._remove_one(r["sha"], r["rel_path"])
+            total -= r["size"]; freed += r["size"]; removed += 1
+        if removed:
+            self.rev += 1
+            log.info("Library cap: removed %d file(s), freed %d bytes", removed, freed)
+        return {"removed": removed, "bytes": freed}
+
     def stats(self) -> dict:
         with self.lock:
             rows = self.conn.execute(
                 "SELECT category, COUNT(*) AS files, COALESCE(SUM(size),0) AS bytes FROM library_items GROUP BY category").fetchall()
         by = {r["category"]: {"files": r["files"], "bytes": r["bytes"]} for r in rows}
+        with self.lock:
+            pins = self.conn.execute("SELECT COUNT(DISTINCT sha) AS n FROM library_keep WHERE reason = 'pin'").fetchone()["n"]
         return {"dir": str(self.dir), "files": sum(v["files"] for v in by.values()),
-                "bytes": sum(v["bytes"] for v in by.values()), "by_category": by}
+                "bytes": sum(v["bytes"] for v in by.values()), "by_category": by,
+                "pinned": pins, "cap_bytes": self.cap_bytes()}
 
 
 # ---------------------------------------------------------------------- HTTP routes
@@ -491,9 +621,40 @@ def build_router(get_lib: Callable[[], Library], on_change: Callable[[], None] |
 
     @router.get("")
     def list_library(session_id: str | None = None, category: str | None = None, origin: str | None = None,
-                     q: str | None = None, limit: int = 60, offset: int = 0):
+                     q: str | None = None, limit: int = 60, offset: int = 0, pinned: int = 0):
         cats = [c.strip().capitalize() for c in (category or "").split(",") if c.strip()]
-        return get_lib().list_items(session_id, cats, origin, q, limit, offset)
+        return get_lib().list_items(session_id, cats, origin, q, limit, offset, pinned_only=bool(pinned))
+
+    @router.post("/{sha}/pin")
+    def library_pin(sha: str, body: dict | None = None):
+        pinned = bool((body or {}).get("pinned", True))
+        if not get_lib().set_pin(sha, pinned):
+            raise HTTPException(status_code=404, detail="Not in the library")
+        return {"sha": sha, "pinned": pinned}
+
+    @router.get("/cleanup/preview")
+    def library_cleanup_preview(older_than_days: float = 0, category: str | None = None):
+        cats = [c.strip().capitalize() for c in (category or "").split(",") if c.strip()]
+        return get_lib().cleanup_preview(older_than_days or None, cats)
+
+    @router.post("/cleanup")
+    def library_cleanup(body: dict | None = None):
+        b = body or {}
+        cats = [c.strip().capitalize() for c in str(b.get("category") or "").split(",") if c.strip()]
+        res = get_lib().cleanup(float(b.get("older_than_days") or 0) or None, cats)
+        if on_change:
+            on_change()
+        return res
+
+    @router.post("/cap")
+    def library_set_cap(body: dict):
+        try:
+            mb = float(body.get("cap_mb"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="cap_mb must be a number (0 = no cap)")
+        lib = get_lib()
+        lib.set_cap_bytes(int(mb * 1024 * 1024))
+        return {"cap_bytes": lib.cap_bytes(), **lib.enforce_cap()}
 
     @router.get("/stats")
     def library_stats():

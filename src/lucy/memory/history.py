@@ -29,8 +29,8 @@ def _ensure_index(conn: sqlite3.Connection) -> bool:
                      "USING fts5(content, session_id UNINDEXED, tokenize='unicode61')")
         conn.execute(
             "INSERT INTO messages_fts(rowid, content, session_id) "
-            "SELECT rowid_ref, content, session_id FROM messages "
-            "WHERE rowid_ref > COALESCE((SELECT MAX(rowid) FROM messages_fts), 0) "
+            "SELECT rowid, content, session_id FROM messages "
+            "WHERE rowid > COALESCE((SELECT MAX(rowid) FROM messages_fts), 0) "
             "AND role IN ('user', 'assistant')")
         conn.commit()
         return True
@@ -52,12 +52,12 @@ def _snippet(text: str, terms: list[str], width: int = 420) -> str:
     return ("..." if start else "") + text[start:end] + ("..." if end < len(text) else "")
 
 
-_SELECT = ("SELECT m.rowid_ref AS id, m.session_id, m.role, m.content, m.created_at, s.title "
+_SELECT = ("SELECT m.rowid AS id, m.session_id, m.role, m.content, m.created_at, s.title "
            "FROM messages m LEFT JOIN sessions s ON s.session_id = m.session_id ")
 
 
-_SELECT_FTS = ("SELECT m.rowid_ref AS id, m.session_id, m.role, m.content, m.created_at, s.title "
-               "FROM messages_fts JOIN messages m ON m.rowid_ref = messages_fts.rowid "
+_SELECT_FTS = ("SELECT m.rowid AS id, m.session_id, m.role, m.content, m.created_at, s.title "
+               "FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid "
                "LEFT JOIN sessions s ON s.session_id = m.session_id ")
 
 
@@ -89,7 +89,7 @@ def search_history(conn, lock, query: str, *, session_id: str | None = None,
                 try:
                     rows = conn.execute(
                         _SELECT_FTS + "WHERE messages_fts MATCH ?" + extra
-                        + " ORDER BY bm25(messages_fts), m.rowid_ref DESC LIMIT ?",
+                        + " ORDER BY bm25(messages_fts), m.rowid DESC LIMIT ?",
                         [match, *params_extra, limit]).fetchall()
                 except sqlite3.OperationalError:
                     rows = []
@@ -98,7 +98,7 @@ def search_history(conn, lock, query: str, *, session_id: str | None = None,
                     break
         if not rows:                                   # no FTS5, or e.g. Japanese text with no word breaks
             like = " AND ".join("m.content LIKE ?" for _ in terms)
-            rows = conn.execute(_SELECT + "WHERE " + like + extra + " ORDER BY m.rowid_ref DESC LIMIT ?",
+            rows = conn.execute(_SELECT + "WHERE " + like + extra + " ORDER BY m.rowid DESC LIMIT ?",
                                 [*(f"%{t}%" for t in terms), *params_extra, limit]).fetchall()
     out = []
     for r in rows:
@@ -114,7 +114,7 @@ def read_session(conn, lock, session_id: str, limit: int = 12) -> list[dict]:
     with lock:
         rows = conn.execute(
             _SELECT + "WHERE m.session_id = ? AND m.role IN ('user', 'assistant') "
-            "ORDER BY m.rowid_ref DESC LIMIT ?", (session_id, max(1, min(int(limit), 30)))).fetchall()
+            "ORDER BY m.rowid DESC LIMIT ?", (session_id, max(1, min(int(limit), 30)))).fetchall()
     out = []
     for r in reversed(rows):
         d = _row(r)

@@ -74,6 +74,12 @@
             <span class="btn-text">Create New Session</span>
         </button>
 
+        <div class="desk-projects" id="deskProjects">
+            <div class="desk-projects-head"><span class="sidebar-title">Projects</span>
+                <button type="button" class="desk-mini-btn" id="deskNewProject" title="New project" aria-label="New project">+</button></div>
+            <div class="desk-projects-list" id="deskProjectList"></div>
+        </div>
+
         <button type="button" class="sidebar-header recent-toggle" id="recentToggle" aria-expanded="true" aria-controls="chatHistory">
             <svg class="ico recent-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
             <span class="sidebar-title">Recent Sessions</span>
@@ -247,6 +253,15 @@
             <div class="chat-container" id="chatContainer"></div>
         </div>
 
+        <div class="desk-bar" id="deskBar">
+            <select id="deskModel" class="desk-select" title="Model" aria-label="Model"></select>
+            <button type="button" class="desk-pill" id="deskThink" title="Thinking (reasoning). Changing it reloads the model.">Thinking</button>
+            <button type="button" class="desk-pill" id="deskPlan" title="Plan first: Lucy shows a plan and waits for your OK before changing anything">Plan first</button>
+            <button type="button" class="desk-pill" id="deskRewind" title="Go back to an earlier point (chat and files)">Rewind</button>
+            <span class="desk-chip" id="deskProjectChip" hidden></span>
+            <span class="desk-meter" id="deskMeter" hidden><span class="desk-meter-bar"><i id="deskMeterFill"></i></span><span id="deskMeterText"></span></span>
+        </div>
+
         <form class="input-area" id="chatForm" autocomplete="off" onsubmit="return false;">
             <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileSelect(event)">
             <button type="button" class="upload-btn" id="uploadBtn" title="Attach files" aria-label="Attach files"
@@ -272,8 +287,17 @@
                 <div class="picker-body" id="pickerEmoji" role="tabpanel"></div>
                 <div class="picker-body" id="pickerStickers" role="tabpanel" hidden></div>
             </div>
+            <div class="desk-pop" id="deskPop" hidden></div>
         </form>
     </div>
+
+    <!-- Side pane: a Library file opened beside the chat -->
+    <aside class="side-pane" id="sidePane" hidden>
+        <div class="side-pane-head"><span id="sidePaneName"></span>
+            <a class="settings-row-btn" id="sidePaneDl" download>Download</a>
+            <button type="button" class="settings-row-btn" id="sidePaneClose">Close</button></div>
+        <div class="side-pane-body" id="sidePaneBody"></div>
+    </aside>
 
     <!-- Settings Modal -->
     <div class="settings-overlay" id="settingsOverlay" onclick="closeSettings()">
@@ -291,6 +315,10 @@
                 <button class="settings-tab-btn" data-tab="connectors"
                     onclick="switchSettingsTab('connectors')">Connectors</button>
                 <button class="settings-tab-btn" data-tab="safety" onclick="switchSettingsTab('safety')">Safety</button>
+                <button class="settings-tab-btn" data-tab="persona" onclick="switchSettingsTab('persona')">Persona</button>
+                <button class="settings-tab-btn" data-tab="evolve" onclick="switchSettingsTab('evolve')">Evolve</button>
+                <button class="settings-tab-btn" data-tab="tasks" onclick="switchSettingsTab('tasks')">Tasks</button>
+                <button class="settings-tab-btn" data-tab="overview" onclick="switchSettingsTab('overview')">Overview</button>
             </div>
 
             <div class="settings-panels">
@@ -420,6 +448,7 @@
                         <div class="llm-status">Stops every tool (chat, background tasks, reminders) and kills running background commands.</div>
                     </div>
                     <div class="llm-status safety-status" id="safetyStatus"></div>
+                    <div class="llm-status safety-status" id="brokerStatus"></div>
                     <div class="settings-table-wrap">
                         <table class="settings-table" id="safetyBackupsTable">
                             <thead>
@@ -438,7 +467,87 @@
                     </div>
                 </div>
 
+                <!-- PERSONA (P6): what Lucy wrote about herself, changes with Revert, the daily note -->
+                <div class="settings-panel" id="panel-persona">
+                    <div class="llm-status">Lucy keeps her own notes (SELF) next to her fixed persona (CORE, which only you can edit). Every change is logged here and you can undo any of them.</div>
+                    <div class="settings-toolbar">
+                        <button class="settings-action-btn" id="personaReflectBtn" onclick="runReflectionNow()">Reflect now</button>
+                    </div>
+                    <div class="llm-status safety-status" id="personaStatus"></div>
+                    <div class="llm-status safety-status" id="personaSelf"></div>
+                    <div class="settings-table-wrap">
+                        <table class="settings-table" id="personaChangesTable">
+                            <thead>
+                                <tr>
+                                    <th>Recent SELF changes</th>
+                                    <th>By</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="personaChangesBody">
+                                <tr>
+                                    <td colspan="3" class="settings-table-empty">No changes yet</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="llm-status safety-status" id="personaNote"></div>
+                </div>
+
+                <!-- EVOLVE (P7): Lucy's own tools (Lane A) and changes to Lucy Core that wait for your approval (Lane B) -->
+                <div class="settings-panel" id="panel-evolve">
+                    <div class="llm-status">Lucy can write small tools for herself (tested and sandboxed; they ask before running until you promote them) and propose changes to her own code. A code change is tested, run as a trial copy, and only applied when you click Approve. You can always roll it back here or with rollback.bat.</div>
+                    <div class="settings-toolbar">
+                        <button class="settings-action-btn" onclick="loadEvolve()">Refresh</button>
+                        <button class="settings-action-btn" id="evolveMineBtn" onclick="runTraceReview()">Review traces now</button>
+                    </div>
+                    <div class="settings-table-wrap">
+                        <table class="settings-table">
+                            <thead><tr><th>Proposed changes to Lucy Core</th><th>Status</th><th></th></tr></thead>
+                            <tbody id="evolveProposalsBody"><tr><td colspan="3" class="settings-table-empty">None</td></tr></tbody>
+                        </table>
+                    </div>
+                    <div class="llm-status safety-status" id="evolveDiff"></div>
+                    <div class="settings-table-wrap">
+                        <table class="settings-table">
+                            <thead><tr><th>Applied changes</th><th>Status</th><th></th></tr></thead>
+                            <tbody id="evolveReleasesBody"><tr><td colspan="3" class="settings-table-empty">None</td></tr></tbody>
+                        </table>
+                    </div>
+                    <div class="settings-table-wrap">
+                        <table class="settings-table">
+                            <thead><tr><th>Lucy's own tools</th><th>Tier</th><th></th></tr></thead>
+                            <tbody id="evolveToolsBody"><tr><td colspan="3" class="settings-table-empty">None yet</td></tr></tbody>
+                        </table>
+                    </div>
+                    <div class="llm-status safety-status" id="evolveIdeas"></div>
+                </div>
+
+                <!-- TASKS (P8): long-running, repeating and idle-time jobs; approvals a job is waiting for -->
+                <div class="settings-panel" id="panel-tasks">
+                    <div class="llm-status">Tasks run in the background through the same agent as chat, one at a time, within a time / tool-call budget. A task that needs your OK for a risky step waits here until you answer. Lucy can create tasks herself ("keep an eye on...", "every morning..."); one that wants full tools never starts until you press OK.</div>
+                    <div class="llm-status safety-status" id="tasksStatus"></div>
+                    <div class="settings-toolbar">
+                        <input type="text" id="taskGoal" placeholder="New task: what should Lucy do? (be specific)" style="flex:1;min-width:200px">
+                        <input type="text" id="taskWhen" placeholder="when (blank = soon)" style="width:130px">
+                        <select id="taskRepeat"><option value="">once</option><option value="daily">daily</option><option value="weekdays">weekdays</option><option value="weekly">weekly</option></select>
+                        <label><input type="checkbox" id="taskFull"> full tools</label>
+                        <button class="settings-action-btn" onclick="addTask()">Add</button>
+                        <button class="settings-action-btn" onclick="loadTasks()">Refresh</button>
+                    </div>
+                    <div class="settings-table-wrap">
+                        <table class="settings-table">
+                            <thead><tr><th>Task</th><th>Status</th><th></th></tr></thead>
+                            <tbody id="tasksBody"><tr><td colspan="3" class="settings-table-empty">No tasks</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- CONNECTORS -->
+                <div class="settings-panel" id="panel-overview">
+                    <div id="overviewBody" class="ov-grid"></div>
+                </div>
+
                 <div class="settings-panel" id="panel-connectors">
                     <div class="settings-toolbar">
                         <input type="text" id="connectorSearchInput" name="connector_search"

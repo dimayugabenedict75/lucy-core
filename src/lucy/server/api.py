@@ -24,6 +24,7 @@ if _SRC_DIR in sys.path:
 sys.path.insert(0, _SRC_DIR)
 
 from lucy.memory.manager import MemoryManager
+from lucy import persona as _persona_mod
 from lucy.skills.memory.hook import detect_memory_candidate, render_confirmation
 from lucy.skills.skills_manager import SkillsManager
 from lucy.server.voice_control import router as voice_router
@@ -37,8 +38,11 @@ from lucy.server.stickers_tool import StickerLibrary, send_sticker as _send_stic
 from lucy.server import library as _library_mod            # persistent file/image cache + Library view
 from lucy.server.harness_info import build_harness_digest   # accurate map of Lucy Core for the agent
 from lucy import proactive as _proactive                    # reminders, follow-ups, greetings (Lucy can speak first)
+from lucy import autonomy as _autonomy                      # P8: persistent job queue (tasks, schedules, budgets, parked approvals)
 from lucy import safety as _safety                          # P1: permissions, approvals, audit, undo, constitution lock
 from lucy import mcp as _mcp                                # P4: MCP servers (tools found with tool_search, never all in the prompt)
+from lucy import desk as _desk                              # P9: projects, edit/branch, @files, plan mode, rewind, citations, research
+from lucy.desk import web as _desk_web                      # P9: its HTTP routes
 import base64
 
 # Persona is loaded from file
@@ -300,9 +304,14 @@ try:
             "AND updated_at < strftime('%Y-%m-%d %H:%M:%S', 'now', ?, '-1 hour')", (_get_tz_modifier(),))
         _conn.commit()
     _library.reconcile()
+    _library.enforce_cap()                                                # P9: keep the cache under its size cap
 except Exception as _e:                                                   # housekeeping must never block startup
     logger.warning(f"Library housekeeping skipped: {_e}")
 app.include_router(_library_mod.build_router(lambda: _library), dependencies=[Depends(verify_api_key)])
+
+# P9 desk features: tables + logic live in lucy/desk/ (hooks and routes are wired at the bottom of this file)
+_desk_ctx = _desk.init(_conn, _db_lock, _library, backups_fn=lambda: _safety.get().backups,
+                       roots_fn=lambda: [SAFE_ROOT], now_fn=_now_str)
 
 
 def _mask_token(token: str) -> str:
@@ -445,7 +454,7 @@ def _get_messages_full(session_id: str) -> list[dict]:
     """Messages for the web UI: like _get_messages, plus each message's attachments (files, images, stickers)."""
     with _db_lock:
         rows = _conn.execute(
-            "SELECT role, content, created_at, attachments FROM messages WHERE session_id = ? ORDER BY rowid ASC",
+            "SELECT rowid AS rid, role, content, created_at, attachments FROM messages WHERE session_id = ? ORDER BY rowid ASC",
             (session_id,),
         ).fetchall()
     out, all_shas = [], set()
@@ -457,7 +466,7 @@ def _get_messages_full(session_id: str) -> list[dict]:
             except (ValueError, TypeError):
                 atts = []
         all_shas.update(a.get("sha") for a in atts if a.get("sha"))
-        out.append({"role": r["role"], "content": r["content"], "timestamp": r["created_at"], "attachments": atts})
+        out.append({"id": r["rid"], "role": r["role"], "content": r["content"], "timestamp": r["created_at"], "attachments": atts})
     alive = _library.existing_shas(all_shas)
     for m in out:
         for a in m["attachments"]:
@@ -517,13 +526,13 @@ def _delete_session_db(session_id: str) -> bool:
 _memory_manager = MemoryManager()
 _skills_manager = SkillsManager()
 
-# --- Load Persona ---
-try:
-    with open(PERSONA_PATH, "r", encoding="utf-8") as f:
-        _persona_prompt = f.read()
-except FileNotFoundError:
-    logger.warning(f"Persona file not found at {PERSONA_PATH}. Using default.")
-    _persona_prompt = "You are Lucy, a helpful and witty AI companion."
+# --- Persona (P6): CORE = .core/personas/lucy.md (human-owned, hash-locked) + SELF = lucy_self.md (written by Lucy via
+# update_self and the reflection job). Both are re-read when the files change: no restart needed.
+_persona = _persona_mod.get_loader()
+
+
+def _persona_text() -> str:
+    return _persona.prompt()
 
 # --- Tool Definitions ---
 # These match the function names from agents-harness/tools.py so the model
@@ -618,6 +627,7 @@ TOOLS = [
 
 _MEMORY_TOOLS = ("remember", "recall_memory", "forget", "search_conversations")
 TOOLS.extend(_proactive.TOOL_DEFS)       # set_reminder, schedule_task, manage_reminders, proactive_control
+TOOLS.extend(_autonomy.TOOL_DEFS)        # task (P8)
 
 # Tools living in src/lucy/tools/ (one file per tool, auto-discovered). A registry tool replaces an old inline
 # schema of the same name in place; new ones are appended.
@@ -874,6 +884,15 @@ def _run_memory_tool(tool_name: str, args: dict) -> str:
         if _SECRET_RE.search(content):
             return json.dumps({"status": "refused",
                                "error": "That looks like a password/token/API key. Secrets are never stored in memory."})
+        _sid = _current_session.get()
+        _proj = _desk_ctx.projects.project_of(_sid) if _sid else None
+        if _proj:                           # P9: inside a project, memories belong to the project (its own memory scope)
+            try:
+                note = _desk_ctx.projects.add_note(_proj["id"], content)
+            except Exception as e:           # noqa: BLE001
+                return json.dumps({"status": "error", "error": str(e)})
+            _agent_saved_turn.add(_sid)
+            return json.dumps({"status": "saved", "id": note["id"], "text": note["text"], "scope": f"project {_proj['name']}"})
         rid = args.get("replaces_id")
         result = _memory_manager.save_memory(
             content, category=str(args.get("category") or "fact"), importance=args.get("importance", 3),
@@ -894,7 +913,8 @@ def _run_memory_tool(tool_name: str, args: dict) -> str:
         docs = _memory_manager.recall(query, limit) if query else _memory_manager.list_all()[-limit:]
         if not docs:
             return "No matching memories." if query else "Your memory is empty."
-        return "\n".join(f"#{d['id']} [{d['category']}, importance {d['importance']}] {d['text']}" for d in docs)
+        return "\n".join(f"#{d['id']} [{d['category']}, importance {d['importance']}] {d['text']}"
+                         + (f" [{d['flag']}: check it, then fix it with replaces_id]" if d.get("flag") else "") for d in docs)
 
     if tool_name == "forget":
         ok = _memory_manager.forget(args.get("memory_id"))
@@ -934,6 +954,10 @@ def _register_adapter_tools() -> None:
     proactive = {"set_reminder": ("write", "remember"), "schedule_task": ("write", "remember"),
                  "manage_reminders": ("write", "recall"), "proactive_control": ("write", "remember")}   # UI labels that already exist
     items = [(n, memory_handler(n), t, l) for n, t, l in memory]
+
+    async def task_handler(args, ctx):
+        return await _autonomy.run_tool("task", args, ctx.session_id)
+    items.append(("task", task_handler, "write", "remember"))
     for n in _proactive.TOOL_NAMES:
         t, l = proactive.get(n, ("write", "remember"))
         items.append((n, proactive_handler(n), t, l))
@@ -992,7 +1016,7 @@ def _prompt_order() -> str:
 
 def _build_messages(session_id: str, user_message: str, image_paths: List[str] = None) -> List[Dict[str, Any]]:
     """Build the full message list for the llama-server request."""
-    persona = {"role": "system", "content": _persona_prompt}
+    persona = {"role": "system", "content": _persona_text()}
     facts = digest = skills = None        # facts + skills change with every message: see the assembly below
 
     # Inject long-term memory
@@ -1014,7 +1038,9 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
         "details. When the user refers to an earlier conversation ('last time', 'we talked about', "
         "'what did I say about') or you lack background you need, call `search_conversations` (past "
         "chats) or `recall_memory` BEFORE answering instead of guessing. Only say you saved or "
-        "remembered something if the tool call succeeded."
+        "remembered something if the tool call succeeded. SELF: when the user corrects how you talk or act, or you "
+        "notice a lasting pattern about yourself or them, call `update_self` (one short line plus the reason); it "
+        "shows up as [SELF] in your prompt and never changes your rules."
     )}
 
     try:                                   # accurate map of Lucy Core: paths, files, tools, stickers, how to edit
@@ -1064,11 +1090,20 @@ def _build_messages(session_id: str, user_message: str, image_paths: List[str] =
     # request, counted from the START. So the parts that never change come first and what changes every message
     # (recalled facts, matching skills) comes after them. LUCY_PROMPT_ORDER: static_first (default) | late (facts and
     # skills ride on the last user message, so even the history stays cached) | legacy (the old order).
+    project_msg = None                     # P9: the chat's project (folder, instructions, files, notes) - stable per chat
+    try:
+        _proj = _desk_ctx.projects.project_of(session_id)
+        _pb = _desk_ctx.projects.prompt_block(_proj["id"]) if _proj else ""
+        if _pb:
+            project_msg = {"role": "system", "content": _pb}
+    except Exception as e:
+        logger.warning(f"Failed to build the project block: {e}")
+
     order = _prompt_order()
     if order == "legacy":
-        messages = [m for m in (persona, facts, memory_rules, digest, skills, tool_rules) if m]
+        messages = [m for m in (persona, facts, memory_rules, digest, skills, tool_rules, project_msg) if m]
     else:
-        messages = [m for m in (persona, memory_rules, digest, tool_rules) if m]
+        messages = [m for m in (persona, memory_rules, digest, tool_rules, project_msg) if m]
         if order != "late":
             messages += [m for m in (facts, skills) if m]
     late_context = [m["content"] for m in (facts, skills) if m] if order == "late" else []
@@ -1346,6 +1381,17 @@ def _mcp_for_turn():
         return [], {}, set(), None, ""
 
 
+def _user_tools_for_turn():
+    """(schemas, search keywords) of Lucy's own enabled tools (P7 Lane A). Catalog only, like MCP. Never breaks a chat."""
+    try:
+        from lucy import selfdev as _selfdev
+        m = _selfdev.get_tools()
+        return m.schemas(), m.keywords()
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning(f"user tools unavailable this turn: {e}")
+        return [], {}
+
+
 def _tools_for_turn(messages: List[Dict[str, Any]], skill_list: list[dict] | None = None, session_id: str | None = None):
     """(tools shown to the model this turn, catalog of every tool for tool_search / auto-add).
 
@@ -1361,13 +1407,18 @@ def _tools_for_turn(messages: List[Dict[str, Any]], skill_list: list[dict] | Non
         names += [t["function"]["name"] for t in _resolve_skills_to_tools(skill_list) if t["function"]["name"] not in names]
     keep = _sticky_tool_names(session_id, names)
     mcp_tools, mcp_kw, mcp_core, mcp_more, mcp_hint = _mcp_for_turn()
+    user_tools, user_kw = _user_tools_for_turn()
+    names_in_tools = {t["function"]["name"] for t in TOOLS}
+    user_tools = [t for t in user_tools if t["function"]["name"] not in names_in_tools]
     shown = ([t for t in TOOLS if t["function"]["name"] in keep]                 # TOOLS order = stable prompt
              + [t for t in mcp_tools if t["function"]["name"] in keep]           # MCP tools the model pulled in recently
+             + [t for t in user_tools if t["function"]["name"] in keep]          # P7: Lucy's own tools, same rule
              + [_routing.tool_search_schema(mcp_hint)])
-    return shown, _routing.ToolCatalog(TOOLS + mcp_tools, keywords=mcp_kw, core=mcp_core, more=mcp_more)
+    return shown, _routing.ToolCatalog(TOOLS + mcp_tools + user_tools, keywords={**user_kw, **mcp_kw}, core=mcp_core,
+                                       more=mcp_more, live=lambda: _user_tools_for_turn()[0])
 
 
-async def _stream_response(messages: List[Dict[str, Any]], temperature: float | None = None, skill_list: list[dict] = None, voice_mode: bool = False, session_id: str | None = None):
+async def _stream_response(messages: List[Dict[str, Any]], temperature: float | None = None, skill_list: list[dict] = None, voice_mode: bool = False, session_id: str | None = None, plan_mode: bool = False):
     """Stream a response from llama-server, handling tool calls in a loop.
 
     The loop itself lives in lucy.server.agent_loop (retries, tool validation, timeouts, loop and
@@ -1400,13 +1451,30 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
         messages = list(messages)             # Word / Excel / PowerPoint / PDF turn: add the office guidance (.core/skills/definitions/office/SKILL.md)
         _at = next((i for i, m in enumerate(messages) if m.get("role") != "system"), len(messages))
         messages.insert(_at, {"role": "system", "content": _routing.office_guidance()})
+    if plan_mode:                         # P9 plan mode: look things up and write a plan; nothing is changed until the user approves
+        _spec_tier = lambda n: getattr(_tool_registry.default.get(n), "tier", None)      # noqa: E731
+        available_tools = _desk.plan.filter_tools(available_tools, _spec_tier)
+        _catalog = None
+        messages = _desk.plan.with_note(messages)
     _tts_filter = TTSStreamFilter(_tool_names())    # strips tool calls, paths, MEDIA: ... (all tools, not just the ones shown)
+    _sources = _desk.sources.SourceCollector()      # P9: pages this turn read -> numbered Sources list under the answer
+
+    async def _run_tool(name, args):
+        res = await execute_tool_call(name, args)   # looked up at call time
+        if name in ("web_search", "web_extract"):
+            try:
+                _sources.add(name, args, res if isinstance(res, str) else str(res))
+            except Exception:                       # noqa: BLE001  (citations must never break a turn)
+                pass
+        return res
+
     agent = AgentLoop(
         brain=_BRAIN, tools=available_tools,
-        execute=lambda name, args: execute_tool_call(name, args),   # looked up at call time
+        execute=_run_tool,
         activity_for=_tool_to_activity, count_tokens=_count_tokens, temperature=temperature,
         cfg=LoopConfig(max_rounds=MAX_TOOL_ROUNDS, max_tokens=LUCY_MAX_TOKENS, tool_timeout=LUCY_TOOL_TIMEOUT,
-                       ctx_tokens=int(llm.cfg.get("context_length", 100000)), http_timeout=LUCY_TIMEOUT),
+                       ctx_tokens=int(llm.cfg.get("context_length", 100000)), http_timeout=LUCY_TIMEOUT,
+                       plan_tool=not plan_mode),
         trace=_agent_trace, session_id=session_id, tool_catalog=_catalog,
         on_tools_added=lambda names: _note_added_tools(session_id, names),
         gate=_safety.get().gate_for(session_id))    # may pause the turn to show an approval card
@@ -1460,6 +1528,13 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
         async for line in _speak(_tts_buffer.strip()):
             yield line
 
+    try:                                               # P9 citations (never spoken: added after the voice work)
+        _foot = _sources.footer(_full_response_text)
+    except Exception:                                  # noqa: BLE001
+        _foot = ""
+    if _foot:
+        yield f"data: {json.dumps({'content': _foot})}\n\n"
+
     # Emit final metrics line per SSE protocol: [METRICS]{json}
     _elapsed = max(_time_mod.time() - _start_time, 0.001)
     _token_count = _count_tokens(_full_response_text)
@@ -1475,6 +1550,39 @@ async def _stream_response(messages: List[Dict[str, Any]], temperature: float | 
     yield f"data: [METRICS]{_metrics_json}\n\n"
 
 
+_RESEARCH_PREFIX = re.compile(r"^\s*(?:/research|research)\s*:?\s*", re.IGNORECASE)
+
+
+async def _stream_research(topic: str, session_id: str | None):
+    """P9 deep research as a chat turn (see lucy/desk/research.py): activity labels, then a summary + the report file."""
+    _current_session.set(session_id)
+    _halt = _safety.get().halt_reason()
+    if _halt:
+        yield f"data: {json.dumps({'error': _halt})}\n\n"
+        return
+
+    async def _llm(msgs, max_tokens):
+        return await _proactive_llm_complete(msgs, {"temperature": 0.3, "max_tokens": max_tokens, "timeout": 300.0})
+
+    async def _search(q, limit):
+        return await execute_tool_call("web_search", {"query": q, "limit": limit})
+
+    async def _extract(urls, limit):
+        return await execute_tool_call("web_extract", {"urls": urls, "char_limit": limit})
+
+    out_dir = _paths.RUNTIME / "data" / "research"
+    async for ev in _desk.research.run(_RESEARCH_PREFIX.sub("", topic or "", count=1), llm=_llm, search=_search,
+                                       extract=_extract, out_dir=out_dir):
+        if "activity" in ev:
+            yield f"data: {json.dumps({'activity': ev['activity']})}\n\n"
+        elif "content" in ev:
+            yield f"data: {json.dumps({'content': ev['content']})}\n\n"
+        elif "file" in ev:
+            att = await asyncio.to_thread(_library.ingest_path, Path(ev["file"]), "assistant")
+            if att:
+                yield f"data: {json.dumps({'attachment': att})}\n\n"
+
+
 @app.post("/api/chat")
 async def chat_endpoint(
     request: Request,
@@ -1482,6 +1590,8 @@ async def chat_endpoint(
     session_id: Optional[str] = Form("default"),
     stream: Optional[bool] = Form(True),
     voice_mode: Optional[str] = Form(None),
+    mode: Optional[str] = Form(None),            # P9: "plan" | "research" | None
+    reuse_shas: Optional[str] = Form(None),      # P9: JSON [{sha, name}] - attachments of a message being edited / regenerated
     files: Optional[List[UploadFile]] = File(None),
     _: bool = Depends(verify_api_key),
 ):
@@ -1575,6 +1685,29 @@ async def chat_endpoint(
             if str(target).lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp')):
                 image_paths.append(str(target))
 
+    # P9: edit / regenerate re-send the files the original message had (they are still in the Library)
+    if reuse_shas:
+        try:
+            _reuse = json.loads(reuse_shas)
+        except ValueError:
+            _reuse = []
+        upload_dir = _paths.RUNTIME / "tmp"
+        for _r in (_reuse if isinstance(_reuse, list) else [])[:10]:
+            _it = _library.get(str((_r or {}).get("sha") or ""))
+            if not _it or not _it["path"].is_file():
+                continue
+            _nm = os.path.basename(str((_r or {}).get("name") or _it["name"]).replace("\\", "/")) or "file"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            fpath = upload_dir / _nm
+            _bytes = _it["path"].read_bytes()
+            fpath.write_bytes(_bytes)
+            upload_records.append((_bytes, _nm))
+            uploaded_file_paths.append(str(fpath))
+            if str(fpath).lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp')):
+                image_paths.append(str(fpath))
+    _mode = (mode or "").strip().lower()
+    _mode = _mode if _mode in ("plan", "research") else ""
+
     # If the user just stopped a reply in this session, let it finish saving first
     await _wait_for_previous_reply(session_id)
 
@@ -1589,6 +1722,13 @@ async def chat_endpoint(
     elif image_paths:
         # Let the model know images were received (redundant but harmless)
         pass
+    if message and "@" in message:                       # P9: @file mentions -> the real paths (inside the allowed folders only)
+        try:
+            _mention_note = await asyncio.to_thread(_desk.commands.expand, message, _desk_ctx.roots_for(session_id))
+            if _mention_note:
+                messages.append({"role": "system", "content": _mention_note})
+        except Exception as _e:                          # noqa: BLE001
+            logger.warning(f"@mention expansion skipped: {_e}")
     # Store user message in session, with its files/images cached so they survive a page refresh.
     # (Stickers - "[sticker: N.png]" - are skipped: they already live in assets/stickers.)
     user_atts: list[dict] = []
@@ -1601,7 +1741,12 @@ async def chat_endpoint(
             _a = await asyncio.to_thread(_library.ingest_path, _rp, "user")
             if _a:
                 user_atts.append(_a)
-    _append_message(session_id, "user", message or "", user_atts)
+    _user_rowid = _append_message(session_id, "user", message or "", user_atts)
+    _cp_id = None
+    try:                                                 # P9: a rewind point for this turn (files + chat)
+        _cp_id = await asyncio.to_thread(_desk_ctx.checkpoints.begin, session_id, _user_rowid)
+    except Exception as _e:                              # noqa: BLE001
+        logger.warning(f"Checkpoint skipped: {_e}")
     _proactive.touch(session_id)
     # Check for memory-worthy fact in the user message
     memory_fact = detect_memory_candidate(message)
@@ -1617,13 +1762,18 @@ async def chat_endpoint(
         # Parse voice_mode from form field (string "true" or "false")
         voice_mode_bool = voice_mode and voice_mode.lower() == "true"
         try:
-            async for event_data in _stream_response(messages, voice_mode=voice_mode_bool, session_id=session_id):
+            yield f"data: {json.dumps({'turn': {'user_id': _user_rowid, 'checkpoint': _cp_id}})}\n\n"
+            _gen = (_stream_research(message or "", session_id) if _mode == "research"
+                    else _stream_response(messages, voice_mode=voice_mode_bool, session_id=session_id, plan_mode=(_mode == "plan")))
+            async for event_data in _gen:
                 if event_data.startswith("data: "):
                     chunk_data = event_data[6:]
                     try:
                         parsed = json.loads(chunk_data)
                         if "content" in parsed:
                             full_response += parsed["content"]
+                        elif parsed.get("attachment"):         # P9: a file already in the Library (the research report)
+                            media_atts.append(parsed["attachment"])
                         elif parsed.get("media"):
                             att = await asyncio.to_thread(_ingest_generated_media, parsed["media"], bool(voice_mode_bool))
                             if att and not any((att.get("sha") and att.get("sha") == m.get("sha")) or
@@ -1635,7 +1785,12 @@ async def chat_endpoint(
 
             # Store assistant response in session history (including any media markers)
             if full_response.strip() or media_atts:
-                _append_message(session_id, "assistant", full_response, media_atts)
+                _aid = _append_message(session_id, "assistant", full_response, media_atts)
+                yield f"data: {json.dumps({'turn_done': {'assistant_id': _aid}})}\n\n"
+                try:
+                    await asyncio.to_thread(_library.enforce_cap)      # P9: keep the cache under its cap
+                except Exception:                                      # noqa: BLE001
+                    pass
                 # Append memory confirmation UI to the streamed response if a fact was detected
                 if memory_fact and session_id not in _agent_saved_turn:
                     confirmation = render_confirmation(memory_fact, session_id)
@@ -2368,7 +2523,7 @@ def _load_timezone_cache() -> dict | None:
     if cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text())
-            if cached.get("_expires", 0) > _time_mod.time():
+            if cached.get("_expires", 0) > _time_mod.time() and len(cached.get("timezones") or []) > 10:   # a 2-entry list = a bad (tzdata-less) result: rebuild
                 _timezone_cache = cached
                 _timezone_cache_expires = cached["_expires"]
                 return _timezone_cache
@@ -2530,6 +2685,8 @@ async def _refresh_timezone_cache():
     # --- Primary: local zoneinfo (instant, no network, DST-aware) ---
     try:
         zones = _fetch_timezone_zones_local()
+        if len(zones) < 10:                 # Windows without the tzdata package: zoneinfo knows no zones (and does not raise)
+            raise RuntimeError("zoneinfo has no timezone data - run: .venv\\Scripts\\python.exe -m pip install tzdata")
         offset_map = {}
         for zone in zones:
             secs = _resolve_zone_offset_local(zone)
@@ -2817,6 +2974,65 @@ def _proactive_health() -> dict:
             "llm_label": llm.active["label"]}
 
 
+def _jobs_make_agent(job, execute, gate, session_id, access, read_tools):
+    """P8: the normal AgentLoop for a background job (same retries / no-give-up behaviour as chat). `gate` parks approvals;
+    the job's budget (not a round cap) bounds it."""
+    eng = _proactive.get_engine()
+    blocked = set(((eng.cfg.get("jobs") or {}).get("blocked_tools")) or []) if eng else set()
+    catalog = None
+    if access == "read":
+        tools = [TOOL_REGISTRY[n] for n in read_tools if n in TOOL_REGISTRY and n not in blocked]
+    else:
+        tools, catalog = _tools_for_turn([{"role": "user", "content": job["goal"]}], None, session_id)
+        tools = [t for t in tools if t["function"]["name"] not in blocked]
+    if not tools:
+        raise RuntimeError("none of the job's tools exist")
+    return AgentLoop(
+        brain=_BRAIN, tools=tools, execute=execute, activity_for=_tool_to_activity, count_tokens=_count_tokens,
+        temperature=min(llm.temperature, 0.5),
+        cfg=LoopConfig(max_rounds=0, max_tokens=LUCY_MAX_TOKENS, tool_timeout=LUCY_TOOL_TIMEOUT,
+                       ctx_tokens=int(llm.cfg.get("context_length", 100000)), http_timeout=LUCY_TIMEOUT,
+                       plan_tool=(access != "read")),
+        trace=_agent_trace, session_id=session_id, tool_catalog=catalog,
+        on_tools_added=lambda names: _note_added_tools(session_id, names), gate=gate)
+
+
+def _jobs_hooks():
+    return _autonomy.JobHostHooks(
+        make_agent=_jobs_make_agent, execute=lambda name, args: execute_tool_call(name, args), persona=_persona_text,
+        llm_ready=_proactive_llm_ready, llm_complete=_proactive_llm_complete, count_tokens=_count_tokens,
+        layer=lambda: _safety.get(), tier_of=lambda name: _safety.get()._tier_of(name),
+        begin_session=lambda sid: _current_session.set(sid))
+
+
+_JOBS_UPKEEP = False
+
+
+def _jobs_register_upkeep(reflect_sched) -> bool:
+    """P8: reflection and the weekly trace review run as upkeep jobs on the queue (jobs.system_jobs: false = their own
+    loops, like before). Returns True when the queue took them over."""
+    eng = _proactive.get_engine()
+    if eng is None or eng.jobs is None or not (eng.cfg.get("jobs") or {}).get("system_jobs", True):
+        return False
+
+    async def reflect():
+        res = await reflect_sched.tick() if reflect_sched else None
+        if not res:
+            return ""
+        return f"Reflection ({res.get('status')}): {len(res.get('self_ok') or [])} change(s) to SELF"
+
+    async def mining():
+        if _safety.get().paused or not _selfdev.get_miner().due():
+            return ""
+        await asyncio.to_thread(_selfdev.get_miner().run, "weekly")
+        return "Weekly trace review done"
+
+    eng.jobs.register_builtin("reflect", reflect, label="Reflection (SELF + memory upkeep)", needs_llm=True, every_minutes=5)
+    eng.jobs.register_builtin("trace_mining", mining, label="Weekly trace review", every_minutes=60)
+    eng.jobs.ensure_system_jobs()
+    return True
+
+
 @app.on_event("startup")
 async def _proactive_start():
     try:
@@ -2824,9 +3040,10 @@ async def _proactive_start():
             root=_paths.ROOT, runtime=_paths.RUNTIME, append_message=_append_message,
             pick_session=_proactive_pick_session, recent_messages=lambda sid, n: _get_messages(sid)[-n:],
             is_busy=_proactive_is_busy, health=_proactive_health, app_timezone=_proactive_app_timezone,
-            persona=lambda: _persona_prompt, llm_ready=_proactive_llm_ready, llm_complete=_proactive_llm_complete,
+            persona=_persona_text, llm_ready=_proactive_llm_ready, llm_complete=_proactive_llm_complete,
             run_agent=_proactive_run_agent, memory_context=_memory_manager.get_contextual_memory,
-            sticker=_proactive_sticker, speak=_proactive_speak, paused=lambda: _safety.get().paused))
+            sticker=_proactive_sticker, speak=_proactive_speak, paused=lambda: _safety.get().paused,
+            job_hooks=_jobs_hooks()))
         await _proactive.start()
     except Exception as e:                                # noqa: BLE001 - Lucy must start even if this cannot
         logger.error(f"Proactive system failed to start: {e}", exc_info=True)
@@ -2895,7 +3112,25 @@ async def safety_pause(request: Request, _ = Depends(verify_api_key)):
             if j.running:
                 j.kill()
                 killed += 1
+        try:                                                # P5: also stop the elevated admin helper (restarts on demand)
+            from lucy.tools import _pc
+            if _pc._client is not None:
+                _pc.get_client().stop()
+        except Exception:                                   # noqa: BLE001
+            pass
     return {**_safety.get().status(body.get("session_id")), "killed_jobs": killed}
+
+
+@app.get("/api/safety/broker")
+async def safety_broker(_ = Depends(verify_api_key)):
+    """P5: whether the elevated admin helper is running right now (it starts on demand and exits when idle)."""
+    try:
+        from lucy.tools import _pc
+        if _pc._client is None:
+            return {"running": False, "started": False}
+        return {"started": True, **_pc.get_client().status()}
+    except Exception as e:                                   # noqa: BLE001
+        return {"running": False, "error": str(e)}
 
 
 @app.get("/api/safety/backups")
@@ -2967,5 +3202,266 @@ async def mcp_stop(key: str, _ = Depends(verify_api_key)):
     return _mcp.get().status()
 
 
+# === Persona that grows (P6): SELF file, changelog + revert, the idle/nightly reflection job, daily notes. These routes are
+# for the USER (Settings > Persona). The agent can only call update_self; it has no tool for revert or reflect.
+_reflector = None
+_reflect_sched = None
+
+
+def _reflect_fetch(after_id: int, limit: int) -> list:
+    """The newest `limit` chat messages after `after_id`, oldest first (background / CLI sessions are left out)."""
+    with _db_lock:
+        rows = _conn.execute(
+            "SELECT rowid AS id, session_id, role, content, created_at FROM messages WHERE rowid > ? "
+            "AND role IN ('user', 'assistant') AND session_id NOT LIKE 'cli-%' AND session_id NOT LIKE 'proactive%' "
+            "ORDER BY rowid DESC LIMIT ?", (after_id, limit)).fetchall()
+    return [{k: r[k] for k in r.keys()} for r in reversed(rows)]
+
+
+def _reflect_idle_for():
+    eng = _proactive.get_engine()
+    ts = float(getattr(eng, "last_user_ts", 0) or 0) if eng else 0.0
+    return (time.time() - ts) if ts else None
+
+
+@app.on_event("startup")
+async def _persona_start():
+    global _reflector, _reflect_sched
+    try:
+        from lucy.persona import reflect as _reflect_mod
+        _reflector = _reflect_mod.Reflector(
+            store=_persona_mod.get_store(), memory=_memory_manager, fetch_messages=_reflect_fetch,
+            llm_complete=_proactive_llm_complete, llm_ready=_proactive_llm_ready,
+            state_path=_paths.RUNTIME / "data" / "reflection_state.json", notes_dir=_paths.RUNTIME / "data" / "learned",
+            trace_path=_AGENT_TRACE_PATH)
+        _reflect_sched = _reflect_mod.ReflectionScheduler(
+            _reflector, paused=lambda: _safety.get().paused, busy=_proactive_is_busy, idle_for=_reflect_idle_for,
+            enabled=os.environ.get("LUCY_REFLECT", "1") != "0")
+        global _JOBS_UPKEEP
+        _JOBS_UPKEEP = _jobs_register_upkeep(_reflect_sched)
+        if not _JOBS_UPKEEP:
+            _reflect_sched.start()
+        for p in _persona_mod.get_store().problems():
+            logger.warning(f"SELF file: {p}")
+    except Exception as e:                                # noqa: BLE001 - Lucy must start even if this cannot
+        logger.error(f"Reflection job failed to start: {e}", exc_info=True)
+
+
+@app.on_event("shutdown")
+async def _persona_stop():
+    if _reflect_sched:
+        await _reflect_sched.stop()
+
+
+@app.get("/api/persona")
+async def persona_status(_ = Depends(verify_api_key)):
+    """SELF sections + size/limits, the reflection job's state, how many memories are flagged as conflicting."""
+    st = await asyncio.to_thread(_persona_mod.get_store().stats)
+    state = _reflector.state() if _reflector else {}
+    st["reflection"] = {"enabled": os.environ.get("LUCY_REFLECT", "1") != "0", "running": bool(_reflector and _reflector.running),
+                        "last_run": state.get("last_run_ts"), "last_reason": state.get("last_reason"),
+                        "last_status": state.get("last_status"), "last_summary": state.get("last_summary")}
+    st["flagged_memories"] = len(_memory_manager.flagged())
+    st["core_chars"] = len(_persona.core())
+    return st
+
+
+@app.get("/api/persona/changelog")
+async def persona_changelog(limit: int = 40, _ = Depends(verify_api_key)):
+    return {"entries": await asyncio.to_thread(_persona_mod.get_store().changelog, limit)}
+
+
+@app.post("/api/persona/revert")
+async def persona_revert(request: Request, _ = Depends(verify_api_key)):
+    """{id}: undo one logged SELF change (the user's button; the agent has no tool for this)."""
+    body = await request.json()
+    try:
+        entry_id = int(body.get("id"))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="give the change number as id")
+    try:                                                   # (SelfError is a ValueError: it must not share the clause above)
+        entry = await asyncio.to_thread(_persona_mod.get_store().revert, entry_id)
+    except _persona_mod.SelfError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"status": "reverted", "entry": {k: v for k, v in entry.items() if k not in ("before_text", "after_text")}}
+
+
+@app.post("/api/persona/reflect")
+async def persona_reflect(_ = Depends(verify_api_key)):
+    """Run the reflection now (needs the model running). Returns what changed; the daily note gets it too."""
+    if _reflector is None:
+        raise HTTPException(status_code=503, detail="reflection is not available")
+    res = await _reflector.run_once(reason="manual", force=True)
+    res["self_ok"] = [{k: v for k, v in e.items() if k not in ("before_text", "after_text")} for e in res.get("self_ok", [])]
+    return res
+
+
+@app.get("/api/persona/notes")
+async def persona_notes(days: int = 7, _ = Depends(verify_api_key)):
+    return {"notes": _reflector.notes(days) if _reflector else []}
+
+
+# === P7 self-evolution (lucy.selfdev, a constitution package). Lane A = Lucy's own sandboxed tools, Lane B = gated changes
+# to Lucy Core. These routes are for the USER (Settings > Evolve): approving a Lane B change, rolling back, promoting a
+# user tool's tier or switching it back on are decisions the agent has no tool for.
+from lucy import selfdev as _selfdev                         # noqa: E402
+from lucy.selfdev.lane_b import LaneBError as _LaneBError    # noqa: E402
+from lucy.selfdev.user_tools import ToolError as _UserToolError   # noqa: E402
+
+_mine_task = None
+
+
+async def _mine_loop():
+    """Weekly trace review (deterministic, no model): checked hourly, skipped while paused."""
+    while True:
+        try:
+            if not _safety.get().paused and _selfdev.get_miner().due():
+                await asyncio.to_thread(_selfdev.get_miner().run, "weekly")
+        except Exception as e:                            # noqa: BLE001
+            logger.warning(f"trace mining failed: {e}")
+        await asyncio.sleep(3600)
+
+
+@app.on_event("startup")
+async def _selfdev_start():
+    global _mine_task
+    try:
+        n = await asyncio.to_thread(_selfdev.get_tools().sync)
+        if n:
+            logger.info(f"Self-evolution: {n} user tool(s) registered")
+        if os.environ.get("LUCY_CANARY") != "1" and not _JOBS_UPKEEP:
+            _mine_task = asyncio.get_running_loop().create_task(_mine_loop())
+    except Exception as e:                                # noqa: BLE001 - Lucy must start even if this cannot
+        logger.error(f"Self-evolution failed to start: {e}", exc_info=True)
+
+
+@app.on_event("shutdown")
+async def _selfdev_stop():
+    if _mine_task:
+        _mine_task.cancel()
+
+
+async def _json_body(request: Request) -> dict:
+    try:
+        b = await request.json()
+        return b if isinstance(b, dict) else {}
+    except Exception:                                     # noqa: BLE001
+        return {}
+
+
+@app.get("/api/selfdev/status")
+async def selfdev_status(_ = Depends(verify_api_key)):
+    lb, ut, mn = _selfdev.get_lane_b(), _selfdev.get_tools(), _selfdev.get_miner()
+    return {"root": str(_paths.ROOT), "canary": os.environ.get("LUCY_CANARY") == "1",
+            "tools": await asyncio.to_thread(ut.list), "proposals": await asyncio.to_thread(lb.list),
+            "releases": await asyncio.to_thread(lb.releases), "ideas": await asyncio.to_thread(mn.load)}
+
+
+@app.get("/api/selfdev/proposals/{pid}")
+async def selfdev_proposal(pid: str, _ = Depends(verify_api_key)):
+    try:
+        rec = await asyncio.to_thread(_selfdev.get_lane_b().get, pid)
+    except _LaneBError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    rec.pop("base", None)
+    return rec
+
+
+@app.post("/api/selfdev/proposals/{pid}/{action}")
+async def selfdev_decide(pid: str, action: str, _ = Depends(verify_api_key)):
+    lb = _selfdev.get_lane_b()
+    try:
+        if action == "approve":
+            rec = await asyncio.to_thread(lb.approve, pid, "user")
+        elif action == "reject":
+            rec = await asyncio.to_thread(lb.discard, pid, "user")
+        else:
+            raise HTTPException(status_code=400, detail="action must be approve or reject")
+    except _LaneBError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    _safety.get().audit.write(event="lane_b_" + action, by="user", proposal=pid, release=rec.get("release"))
+    rec.pop("base", None)
+    rec.pop("diff", None)
+    return rec
+
+
+@app.post("/api/selfdev/rollback")
+async def selfdev_rollback(request: Request, _ = Depends(verify_api_key)):
+    rid = (await _json_body(request)).get("id") or None
+    try:
+        m = await asyncio.to_thread(_selfdev.get_lane_b().rollback, rid, "user")
+    except _LaneBError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    _safety.get().audit.write(event="lane_b_rollback", by="user", release=m.get("id"))
+    return m
+
+
+@app.post("/api/selfdev/tools/{name}/{action}")
+async def selfdev_tool(name: str, action: str, request: Request, _ = Depends(verify_api_key)):
+    ut = _selfdev.get_tools()
+    body = await _json_body(request)
+    try:
+        if action == "enable":
+            t = await asyncio.to_thread(ut.enable, name)
+        elif action == "disable":
+            t = await asyncio.to_thread(ut.disable, name, "switched off by the user", "user")
+        elif action == "tier":
+            t = await asyncio.to_thread(ut.set_tier, name, str(body.get("tier") or ""))
+        elif action == "revert":
+            t = await asyncio.to_thread(ut.revert, name)
+        elif action == "delete":
+            await asyncio.to_thread(ut.delete, name)
+            t = {"name": name, "deleted": True}
+        else:
+            raise HTTPException(status_code=400, detail="action must be enable, disable, tier, revert or delete")
+    except _UserToolError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    _safety.get().audit.write(event="user_tool_" + action, by="user", tool=name, tier=body.get("tier"))
+    return {k: v for k, v in t.items() if k != "history"}
+
+
+@app.get("/api/selfdev/log")
+async def selfdev_log(limit: int = 60, _ = Depends(verify_api_key)):
+    return {"entries": await asyncio.to_thread(_selfdev.get_tools().log, limit)}
+
+
+@app.post("/api/selfdev/mine")
+async def selfdev_mine(_ = Depends(verify_api_key)):
+    return await asyncio.to_thread(_selfdev.get_miner().run, "manual")
+
+
 app.include_router(_proactive.router, dependencies=[Depends(verify_api_key)])
 app.include_router(_proactive.public_router)
+app.include_router(_autonomy.router, dependencies=[Depends(verify_api_key)])     # P8: /api/jobs/* (the Tasks panel)
+
+
+# === P9 desk routes (projects, edit / branch / rewind, @files, usage meter, export, settings overview) ===
+async def _desk_usage(session_id):
+    limit = int(llm.cfg.get("context_length", 100000))
+    tokens = 0
+    if session_id and _session_exists(session_id):
+        tokens = _count_message_tokens(await asyncio.to_thread(_build_messages, session_id, ""))
+    return {"tokens": tokens, "limit": limit, "model": llm.model_name, "reasoning": bool(llm.reasoning), "estimate": True}
+
+
+def _desk_title(session_id):
+    with _db_lock:
+        row = _conn.execute("SELECT title FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+    return row["title"] if row else ""
+
+
+async def _desk_overview():
+    st = _safety.get().status(None)
+    servers = _mcp.get().status().get("servers", [])
+    runner = _autonomy.get_runner()
+    jobs = runner.status() if runner else {}
+    return {"permission": {"mode": st.get("mode"), "label": st.get("mode_label"), "paused": st.get("paused")},
+            "connectors": [{"name": s["name"], "enabled": s["enabled"], "running": s["running"], "tools": s["tools"],
+                            "error": s["error"]} for s in servers],
+            "tasks": {k: jobs.get(k) for k in ("enabled", "running", "active", "parked", "waiting_ok")},
+            "library": _library.stats(), "projects": len(_desk_ctx.projects.list())}
+
+
+_desk_ctx.hooks.update({"usage": _desk_usage, "now": _now_str, "title_of": _desk_title, "overview": _desk_overview,
+                        "audit": lambda event, **kw: _safety.get().audit.write(event=event, by="user (ui)", **kw)})
+app.include_router(_desk_web.build_router(lambda: _desk_ctx), dependencies=[Depends(verify_api_key)])

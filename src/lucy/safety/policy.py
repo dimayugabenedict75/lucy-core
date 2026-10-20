@@ -25,6 +25,36 @@ LEVEL_NAMES = {AUTO: "auto", ASK: "ask", ASK_HARD: "ask", DENY: "deny"}
 PATH_KEYS = ("file_path", "dir_path", "image_path", "path", "cwd", "folder", "directory", "source", "destination",
              "dest", "target")
 SHELL_TOOLS = {"run_shell_command"}
+
+# P5 PC tools: harmless actions get a lower tier than the tool's TIER (listing, reading, focusing a window...).
+ACTION_TIERS = {
+    "service": {"list": "read", "status": "read"},
+    "process": {"list": "read"},
+    "winget": {"search": "read", "list": "read", "poll": "read"},
+    "scheduled_task": {"list": "read", "info": "read"},
+    "registry": {"read": "read"},
+    "system_info": {"disk": "read", "firewall": "read", "events": "read", "updates": "read", "": "read"},
+    "window": {"list": "read"},                               # focus/min/max = system (control)
+    "desktop": {"clipboard_get": "read"},                     # the rest control the PC
+    "file_ops": {"poll": "read"},
+    "user_tool": {"list": "read"},                            # P7: create/improve/disable = write (sandboxed tests)
+    "core_change": {"status": "read", "ideas": "read", "start": "write", "discard": "write"},   # submit = exec
+}
+# Ask every time, in every mode (no "Always allow"): changes a small model should never make alone.
+HARD_ACTIONS = {("registry", "write"), ("service", "stop"), ("service", "restart"), ("winget", "uninstall"),
+                ("scheduled_task", "disable"), ("process", "kill")}
+# Tools whose `dry_run: true` only describes what would happen (each handler honours it; checked by tests).
+DRY_RUN_TOOLS = {"service", "process", "winget", "scheduled_task", "registry", "file_ops", "window", "desktop",
+                 "click_on_screen"}
+# file_ops: which path argument is read, changed or removed, per action. A removed path is also a changed one.
+FILE_OPS = "file_ops"
+_FILE_OPS_ROLES = {
+    "copy": {"source": "read", "destination": "write"},
+    "move": {"source": "delete", "destination": "write"},
+    "delete": {"path": "delete", "source": "delete"},
+    "mkdir": {"path": "write", "destination": "write"},
+}
+_DELETE_VERBS = re.compile(r"(?i)\b(remove-item|ri|del|erase|rd|rmdir|rm|move-item|mi|mv|move|clear-content)\b|\s/(mov|move|purge|mir)\b")
 WEB_READ_TOOLS = {"web_search", "web_extract"}
 
 # Never runs, whatever the mode (Windows + POSIX). Kept short and obvious; the user adds more in permissions.yaml.
@@ -93,6 +123,10 @@ class Decision:
 def effective_tier(name: str, tier: str, args: dict) -> str:
     """Some actions of a tool are harmless (polling a job, reading the cursor position)."""
     action = str((args or {}).get("action") or "").strip().lower()
+    if name in DRY_RUN_TOOLS and (args or {}).get("dry_run") is True:
+        return "read"                   # only describes what it would do
+    if name in ACTION_TIERS and action in ACTION_TIERS[name]:
+        return ACTION_TIERS[name][action]
     if name in SHELL_TOOLS and action in ("poll", "list", "kill"):
         return "read"                   # kill only ever touches Lucy's own background jobs
     if name == "cua_cursor" and action in ("", "get"):
@@ -158,6 +192,16 @@ class Policy:
     def _in(self, p: str, folders: List[str]) -> bool:
         return any(is_inside(p, f) for f in folders)
 
+    def _readable(self, p: str) -> bool:
+        return self._in(p, self.cfg.read_folders) or self.cfg.drive_profile(p) in ("ask", "storage", "full")
+
+    def _writable(self, p: str) -> bool:
+        return self._in(p, self.cfg.write_folders) or self.cfg.drive_profile(p) in ("storage", "full")
+
+    def _cmd_ok(self, p: str) -> bool:
+        """auto_in_allowed: a command may run alone where it stays inside these."""
+        return self._in(p, self.cfg.write_folders) or self.cfg.drive_profile(p) == "full"
+
     def _paths(self, args: dict) -> List[Tuple[str, str]]:
         out = []
         for k in PATH_KEYS:
@@ -181,13 +225,29 @@ class Policy:
 
         paths = self._paths(args)
         writes = eff in ("write", "exec", "system") or (name == "restore_from_backup" and eff != "read")
+        roles = _FILE_OPS_ROLES.get(str(args.get("action") or "").strip().lower(), {}) if name == FILE_OPS else {}
         for key, p in paths:
             if self._in(p, cfg.denied_paths):
                 d.raise_to(DENY, f"{p} is a blocked location (secrets / private data)", "denied_path")
+            role = roles.get(key, "write") if name == FILE_OPS else "write"
+            if role == "read" and writes:
+                if not self._readable(p):
+                    d.raise_to(ASK, f"reads outside the allowed folders ({p})", "mode")
+                continue
+            if writes and role == "delete" and not self.protected(p):
+                prof = cfg.drive_profile(p)
+                if prof == "storage":
+                    d.raise_to(ASK_HARD, f"deletes or moves something out of {p[:2].upper()} (that drive always asks "
+                                         f"before removing anything)", "delete_storage")
+                elif prof in ("ask", "off") and not self._in(p, cfg.write_folders):
+                    d.raise_to(ASK, f"removes {p}", "mode")
             if writes and key != "cwd":
                 d.write_paths.append(p)
                 if self.protected(p):
                     d.raise_to(DENY, f"{p} is one of Lucy's safety files; only the user can change it", "constitution")
+                elif self._in(p, cfg.readonly_paths) and name == FILE_OPS:
+                    d.raise_to(ASK_HARD, f"{p} is a protected system location: changing it needs administrator rights "
+                                         "(Windows will show a UAC prompt)", "admin_path")
                 elif self._in(p, cfg.readonly_paths):
                     d.raise_to(DENY, f"{p} is read-only for Lucy (system folder)", "readonly_path")
                 elif self._in(p, cfg.ask_paths):
@@ -209,7 +269,11 @@ class Policy:
                     d.raise_to(ASK_HARD, "risky command (system settings, accounts, downloads-and-run or bulk delete)",
                                "command_ask")
                     break
+            deletes = bool(_DELETE_VERBS.search(cmd))
             for p in command_paths(cmd, self.home):
+                if deletes and cfg.drive_profile(p) == "storage":
+                    d.raise_to(ASK_HARD, f"the command may delete or move files on {p[:2].upper()} (that drive always "
+                                         "asks before removing anything)", "delete_storage")
                 if self._in(p, cfg.denied_paths):
                     d.raise_to(ASK_HARD, f"the command mentions a blocked location ({p})", "denied_path")
                 elif self.protected(p):
@@ -222,6 +286,9 @@ class Policy:
             elif _private(h):
                 d.raise_to(ASK_HARD, f"{h} is a private network address", "private_host")
 
+        action = str(args.get("action") or "").strip().lower()
+        if (name, action) in HARD_ACTIONS and eff != "read":
+            d.raise_to(ASK_HARD, f"{name} {action} always asks (system change)", "hard_action")
         if override == "ask":
             d.raise_to(ASK, f"{name} is set to 'ask' in permissions.yaml", "tool_override")
         if d.level >= ASK_HARD:
@@ -240,20 +307,25 @@ class Policy:
         if mode == "full_auto":
             return AUTO, ""
         if eff == "read":
-            outside = [p for _k, p in paths if not self._in(p, cfg.read_folders)]
+            outside = [p for _k, p in paths if not self._readable(p)]
             return (ASK, f"reads outside the allowed folders ({outside[0]})") if outside else (AUTO, "")
         if eff == "write":
             if mode == "ask_every_time":
                 return ASK, "changes something (mode: Ask every time)"
-            targets = [p for k, p in paths if k != "cwd"]
-            outside = [p for p in targets if not self._in(p, cfg.write_folders)]
-            return (ASK, f"writes outside the allowed folders ({outside[0]})") if outside else (AUTO, "")
+            roles = _FILE_OPS_ROLES.get(str(args.get("action") or "").strip().lower(), {}) if name == FILE_OPS else {}
+            targets = [p for k, p in paths if k != "cwd" and roles.get(k) != "read"]
+            outside = [p for p in targets if not self._writable(p)]
+            if not outside:
+                return AUTO, ""
+            if cfg.drive_profile(outside[0]) == "ask":
+                return ASK, f"changes something on {outside[0][:2].upper()} (that drive asks before every change)"
+            return ASK, f"writes outside the allowed folders ({outside[0]})"
         if eff == "exec":
             if mode != "auto_in_allowed":
                 return ASK, "runs a program or command"
             cwd = next((p for k, p in paths if k == "cwd"), None) or self.default_cwd
             mentioned = command_paths(cmd, self.home) if cmd else []
-            if cwd and self._in(cwd, cfg.write_folders) and all(self._in(p, cfg.write_folders) for p in mentioned):
+            if cwd and self._cmd_ok(cwd) and all(self._cmd_ok(p) for p in mentioned):
                 return AUTO, ""
             return ASK, "runs a command that may reach outside the allowed folders"
         if eff == "system":

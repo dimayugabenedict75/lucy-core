@@ -23,8 +23,12 @@ REPEAT_CHOICES = ("none", "daily", "weekdays", "weekly", "monthly", "yearly")
 
 
 def make_rule(repeat: str | None, every_minutes: int | None, first: datetime,
-              min_interval_minutes: int = 10) -> dict | None:
-    """Build the rule for a new reminder whose first occurrence is `first`. Raises ValueError on bad input."""
+              min_interval_minutes: int = 10, cron: str | None = None) -> dict | None:
+    """Build the rule for a new reminder whose first occurrence is `first`. Raises ValueError on bad input.
+    `cron` ("30 8 * * mon-fri") wins over the other arguments."""
+    if cron not in (None, ""):
+        from . import cron as _cron                        # CronError is a ValueError
+        return {"type": "cron", "expr": _cron.validate(cron)}
     r = (repeat or "none").strip().lower()
     if every_minutes not in (None, 0, ""):
         try:
@@ -61,6 +65,9 @@ def next_after(rule: dict, after: datetime) -> datetime:
         step = int(rule["every_minutes"]) * 60
         n = max(1, int((after.timestamp() - float(rule["anchor"])) // step) + 1)
         return datetime.fromtimestamp(float(rule["anchor"]) + n * step, tz)
+    if kind == "cron":
+        from . import cron as _cron
+        return _cron.next_after(rule["expr"], after)
     hh, mm = (int(x) for x in rule["time"].split(":"))
     if kind in ("daily", "weekdays", "weekly"):
         days = set(rule.get("days") or [])
@@ -99,6 +106,9 @@ def describe_rule(rule: dict | None) -> str:
     if k == "interval":
         n = int(rule["every_minutes"])
         return f"every {n // 60}h" + (f" {n % 60}m" if n % 60 else "") if n >= 60 else f"every {n}m"
+    if k == "cron":
+        from . import cron as _cron
+        return _cron.describe(rule["expr"])
     if k == "daily":
         return "daily"
     if k == "weekdays":

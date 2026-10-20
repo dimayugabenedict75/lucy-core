@@ -55,3 +55,12 @@ class EmbeddingEngine:
         vectorizer = TfidfVectorizer(lowercase=True, token_pattern=r"(?u)\b\w+\b", ngram_range=(1, 2))
         vectors = vectorizer.fit_transform(texts).toarray()
         return vectors.tolist()
+
+    def similarity_matrix(self, texts: list):
+        """Cosine similarity of every text with every other text (one fit for the whole list): used by memory
+        consolidation to find near-duplicates without refitting per pair. Returns an n x n numpy array."""
+        if len(texts) < 2:
+            return np.ones((len(texts), len(texts)))
+        vectorizer = TfidfVectorizer(lowercase=True, token_pattern=r"(?u)\b\w+\b", ngram_range=(1, 2))
+        matrix = vectorizer.fit_transform(texts)
+        return cosine_similarity(matrix)

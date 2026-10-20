@@ -1,29 +1,30 @@
 """
 RAG Conductor for Lucy Core.
 
-Persistent long-term memory (runtime/data/knowledge_store.json) plus retrieval.
+Persistent long-term memory (runtime/data/knowledge.sqlite: SQLite + FTS5, see memory/store.py) plus retrieval.
+The old runtime/data/knowledge_store.json is imported once on first start and then left alone as a backup.
 
-Each memory is a small JSON object:
+Each memory is a small dict:
     {"id": 7, "text": "...", "category": "preference", "importance": 4,
      "created": "2026-10-10 14:03:11", "updated": "...", "last_used": "...", "uses": 3,
-     "source": "agent" | "user" | None}
+     "source": "agent" | "user" | "reflection" | None,
+     "flag": None | "may conflict with #12"}
 Memories written by older versions only have "text"; they get an id and defaults on load, so
-nothing already saved is lost.
+nothing already saved is lost. Consolidation (memory/consolidate.py) archives instead of deleting.
 
 Retrieval for the prompt has two parts:
   * PINNED   - preferences / standing instructions / importance-5 memories are always included
                (a preference like "keep answers short" never matches a query by words alone)
-  * RELEVANT - the best TF-IDF matches for the current message
+  * RELEVANT - the best TF-IDF matches for the current message (FTS5 keyword hits fill in when TF-IDF finds little)
 """
 
 from __future__ import annotations
 
-import json
-import os
 import threading
 import time
 
 from lucy.paths import RUNTIME
+from lucy.memory.store import MemoryStore
 from .embedding_engine import EmbeddingEngine
 
 CATEGORIES = ("preference", "instruction", "fact", "person", "project", "other")
@@ -43,47 +44,32 @@ class Conductor:
     # At or above this score a new memory is treated as a restatement of an existing one.
     DUPLICATE_SCORE = 0.7
 
-    def __init__(self):
+    def __init__(self, store_path=None, json_path=None):
         self.embedding_engine = EmbeddingEngine()
-        self.vector_store_path = RUNTIME / "data" / "knowledge_store.json"
-        self.vector_store_path.parent.mkdir(parents=True, exist_ok=True)
+        data_dir = RUNTIME / "data"
+        self.json_path = json_path or (data_dir / "knowledge_store.json")      # legacy file: imported once, kept as backup
+        self.store = MemoryStore(store_path or (data_dir / "knowledge.sqlite"))
         self._lock = threading.RLock()
         self.knowledge_store: list[dict] = []
         self._load()
 
     # -- persistence -------------------------------------------------------------
     def _load(self) -> None:
-        raw = []
-        if self.vector_store_path.exists():
-            try:
-                with open(self.vector_store_path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-            except (OSError, ValueError):
-                raw = []
-        next_id = max([d.get("id", 0) for d in raw if isinstance(d, dict)] + [0]) + 1
-        docs, migrated = [], False
-        for d in raw:
-            if not isinstance(d, dict) or not str(d.get("text", "")).strip():
-                continue
-            if "id" not in d:
-                d["id"], next_id, migrated = next_id, next_id + 1, True
-            for k, v in (("category", "fact"), ("importance", 3), ("created", None), ("updated", None),
-                         ("last_used", None), ("uses", 0), ("source", None)):
-                if k not in d:
-                    d[k], migrated = v, True
-            docs.append(d)
-        self.knowledge_store = docs
-        if migrated:
-            self._save()
+        with self._lock:
+            self.store.migrate_json(self.json_path)
+            docs = self.store.load_active()
+            for d in docs:                                   # defaults for rows written by older versions
+                for k, v in (("category", "fact"), ("importance", 3), ("uses", 0)):
+                    if d.get(k) is None:
+                        d[k] = v
+            self.knowledge_store = docs
 
     def _save(self) -> None:
-        tmp = self.vector_store_path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.knowledge_store, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, self.vector_store_path)         # atomic: never leaves a half-written file
+        self.store.sync(self.knowledge_store)
 
     def _next_id(self) -> int:
-        return max([d["id"] for d in self.knowledge_store] + [0]) + 1
+        # ids are never reused, not even those of archived memories (they stay in the database)
+        return max([d["id"] for d in self.knowledge_store] + [self.store.max_id(), 0]) + 1
 
     # -- writing -------------------------------------------------------------------
     def add_to_knowledge(self, text: str, category: str = "fact", importance: int = 3,
@@ -107,7 +93,7 @@ class Conductor:
                 if doc is None:
                     return {"status": "error", "error": f"no memory with id {replaces_id}"}
                 doc.update(text=text, category=category, importance=importance, updated=_now(),
-                           source=source or doc.get("source"))
+                           source=source or doc.get("source"), flag=None)
                 self._save()
                 return {"status": "updated", "id": doc["id"], "text": text}
 
@@ -122,13 +108,14 @@ class Conductor:
                 if score >= self.DUPLICATE_SCORE:
                     doc = self.knowledge_store[idx]
                     doc.update(text=text, category=category,
-                               importance=max(doc["importance"], importance), updated=_now())
+                               importance=max(doc["importance"], importance), updated=_now(), flag=None)
                     self._save()
                     return {"status": "updated", "id": doc["id"], "text": text,
                             "note": "replaced a very similar existing memory"}
 
             doc = {"id": self._next_id(), "text": text, "category": category, "importance": importance,
-                   "created": _now(), "updated": _now(), "last_used": None, "uses": 0, "source": source}
+                   "created": _now(), "updated": _now(), "last_used": None, "uses": 0, "source": source,
+                   "flag": None, "merged_into": None, "decayed_at": None}
             self.knowledge_store.append(doc)
             self._save()
             return {"status": "saved", "id": doc["id"], "text": text}
@@ -155,13 +142,21 @@ class Conductor:
             return [dict(d) for d in self.knowledge_store]
 
     def search(self, query: str, limit: int = 5) -> list[dict]:
-        """Memories ranked by relevance to `query` (each with a 'score'); irrelevant ones are dropped."""
+        """Memories ranked by relevance to `query` (each with a 'score'); irrelevant ones are dropped.
+        TF-IDF ranks; when it finds fewer than `limit`, FTS5 keyword hits fill the gap (low fixed score)."""
         with self._lock:
             if not self.knowledge_store or not str(query).strip():
                 return []
             ranked = self.embedding_engine.rank(query, [d["text"] for d in self.knowledge_store])
-            return [dict(self.knowledge_store[i], score=round(float(s), 3))
-                    for s, i in ranked[:limit] if s >= self.MIN_RELEVANCE]
+            out = [dict(self.knowledge_store[i], score=round(float(s), 3))
+                   for s, i in ranked[:limit] if s >= self.MIN_RELEVANCE]
+            if len(out) < limit:
+                have = {d["id"] for d in out}
+                for mid in self.store.fts_search(query, limit=limit):
+                    doc = self._get(mid)
+                    if doc is not None and mid not in have and len(out) < limit:
+                        out.append(dict(doc, score=self.MIN_RELEVANCE))
+            return out
 
     def pinned(self, limit: int = PINNED_LIMIT) -> list[dict]:
         """Always-on memories: preferences / standing instructions / importance 5."""
@@ -190,3 +185,36 @@ class Conductor:
                 return ""
             self.mark_used([d["id"] for d in chosen])
             return "\n".join(f"- {d['text']}" for d in chosen)
+
+    # -- consolidation support (memory/consolidate.py decides what to do; these only apply it) ------
+    def flagged(self) -> list[dict]:
+        """Active memories marked as possibly conflicting with another one."""
+        with self._lock:
+            return [dict(d) for d in self.knowledge_store if d.get("flag")]
+
+    def set_flags(self, flags: dict) -> None:
+        """{memory_id: text or None}: replaces every flag at once (consolidation recomputes them from scratch)."""
+        with self._lock:
+            for d in self.knowledge_store:
+                d["flag"] = flags.get(d["id"])
+            self._save()
+
+    def archive(self, memory_id, merged_into: int | None = None) -> bool:
+        """Take a memory out of use but keep it in the database (reversible with unarchive)."""
+        with self._lock:
+            doc = self._get(memory_id)
+            if doc is None:
+                return False
+            self._save()                                    # persist pending bookkeeping (e.g. last_used) first
+            self.knowledge_store.remove(doc)
+            return self.store.archive(doc["id"], merged_into)
+
+    def unarchive(self, memory_id) -> bool:
+        with self._lock:
+            ok = self.store.unarchive(int(memory_id))
+            if ok:
+                self._load()
+            return ok
+
+    def archived(self, limit: int = 200) -> list[dict]:
+        return self.store.archived(limit)

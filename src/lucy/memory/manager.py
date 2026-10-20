@@ -28,3 +28,11 @@ class MemoryManager:
 
     def list_all(self) -> list[dict]:
         return self.conductor.all()
+
+    def consolidate(self, dry_run: bool = False) -> dict:
+        """Dedupe/merge, decay, flag conflicts (memory/consolidate.py). Nothing is deleted: merged rows are archived."""
+        from lucy.memory import consolidate as _c
+        return _c.consolidate(self.conductor, dry_run=dry_run)
+
+    def flagged(self) -> list[dict]:
+        return self.conductor.flagged()

@@ -289,7 +289,7 @@ def _run(args: dict) -> str:
         if rel.startswith("src/") and target.suffix == ".py":
             extra = " This is Lucy Core code: the change takes effect after Lucy Core restarts."
         elif rel.startswith(".core/personas/"):
-            extra = " Persona changes take effect after Lucy Core restarts."
+            extra = " Persona changes apply from the next message."
     except ValueError:
         pass
     unit = "edit" if edits is not None else "hunk"

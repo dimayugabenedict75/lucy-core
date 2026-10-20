@@ -156,7 +156,7 @@ class Store:
         return self._x("UPDATE reminders SET status='cancelled' WHERE status='active'")
 
     def task_runs_since(self, ts: float) -> int:
-        return self._q("SELECT COUNT(*) AS n FROM events WHERE kind='task' AND status='sent' AND ts>=?", (ts,))[0]["n"]
+        return self._q("SELECT COUNT(*) AS n FROM events WHERE kind='task' AND status='sent' AND ts>=? AND COALESCE(key,'') NOT LIKE 'job%'", (ts,))[0]["n"]
 
     # ------------------------------------------------------------------ events
     def add_event(self, kind: str, text: str, *, key: str = "", session_id: str | None = None,

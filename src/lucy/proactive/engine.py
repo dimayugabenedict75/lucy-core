@@ -67,6 +67,7 @@ class ProactiveEngine:
         self._why: dict = {}                          # (kind, key) -> last refusal reason (log only on change)
         self.counters = {"sent": 0, "suppressed": 0, "errors": 0}
         self.started_at = 0.0
+        self.jobs = self._make_jobs()                  # P8: the job queue; this engine is its scheduler
 
     # ================================================================== small helpers
     @property
@@ -94,10 +95,31 @@ class ProactiveEngine:
     def ui_clients(self) -> int:
         return self.bus.count()
 
+    def _make_jobs(self):
+        """The P8 job queue (lucy.autonomy). Imported late (it imports this module); a failure here never stops reminders."""
+        import os
+        if os.environ.get("LUCY_CANARY") == "1":       # a Lane B canary must never run the real queue's jobs
+            return None
+        try:
+            from lucy.autonomy import JobHostHooks, JobRunner, JobStore
+            hooks = self.host.job_hooks or JobHostHooks()
+            hooks.paused = self.host.paused
+            return JobRunner(JobStore(Path(self.host.runtime) / "data" / "jobs.sqlite"), hooks, cfg=lambda: self.config.data,
+                             clock=self.clock, now_local=self.now_local, policy=self.policy, deliver=self._deliver,
+                             llm_idle=self._llm_idle, busy=self.busy, last_user_ts=lambda: self.last_user_ts, wake=self.wake)
+        except Exception:                              # noqa: BLE001
+            logger.exception("proactive: the job queue could not be created; tasks are off")
+            return None
+
     # ================================================================== lifecycle
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
+        if self.jobs:
+            try:
+                self.jobs.recover()                    # a job that was running when the server stopped continues
+            except Exception:                          # noqa: BLE001
+                logger.exception("proactive: job recovery failed")
         self._stop.clear()
         self.bus.closed = False
         self.started_at = self.clock()
@@ -108,6 +130,11 @@ class ProactiveEngine:
     async def stop(self) -> None:
         self._stop.set()
         self._wake.set()
+        if self.jobs:
+            try:
+                await self.jobs.stop()                 # checkpoint the running job; it continues after the next start
+            except Exception:                          # noqa: BLE001
+                logger.exception("proactive: stopping the job queue failed")
         self.bus.close()
         if self._task:
             self._task.cancel()
@@ -154,6 +181,14 @@ class ProactiveEngine:
             pass
         now = self.clock()
         await self._process_due(now)
+        if self.jobs:
+            try:
+                await self.jobs.tick(now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:                          # noqa: BLE001 - jobs must never stop reminders
+                self.counters["errors"] += 1
+                logger.exception("proactive: job queue tick failed")
         if now - self._last_watch >= float(cfg["watch_interval_seconds"]):
             self._last_watch = now
             await self._process_watchers(now)
@@ -326,6 +361,7 @@ class ProactiveEngine:
             "sent_today": self.store.count_sent(self.policy.local_midnight_ts(), ("greeting", "checkin", "alert", "reminder", "task")),
             "ignored_streak": self.policy.ignored_streak(),
             "voice": self.cfg["delivery"]["voice"], "counters": dict(self.counters),
+            "jobs": self.jobs.status() if self.jobs else None,
         }
 
     def status_text(self) -> str:

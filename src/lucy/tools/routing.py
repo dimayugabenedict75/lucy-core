@@ -73,6 +73,11 @@ FAMILIES: List[tuple] = [
     ("reminders", re.compile(r"\b(remind|reminders?|alarm|timer|schedule|follow[- ]?up|every\s+(?:day|week|morning|hour)|"
                              r"tomorrow|tonight|later|quiet hours|mute|check in|check-in)\b", _F),
      ("set_reminder", "schedule_task", "manage_reminders", "proactive_control")),
+    # P8: long-running / repeating background work (the `task` tool). Bare "task" is NOT a trigger (too common).
+    ("tasks", re.compile(r"\b(keep (?:an eye|track)|monitor|watch (?:for|over)|background tasks?|in the background|overnight|"
+                         r"(?:my|the|your|open|active|running|all) tasks|task (?:list|status|queue)|recurring|cron|deadline|finish (?:this|it|the \w+) by|"
+                         r"while i(?:'m| am) (?:away|out|asleep|sleeping|gone)|(?:cancel|stop|resume|continue) (?:the )?task)\b", _F),
+     ("task",)),
     ("memory", re.compile(r"\b(forget|memor(?:y|ies)|what do you know about me)\b", _F), ("forget", "search_conversations")),
     ("history", re.compile(r"\b(earlier|last time|we talked|we discussed|yesterday|previous(?:ly)?|before|remember when|"
                            r"conversations?|chat history|you said|i told you)\b", _F), ("search_conversations",)),
@@ -101,10 +106,45 @@ FAMILIES: List[tuple] = [
     ("ppt_edit", _intent(_PPT, _CHANGE), ("pptx_edit", "office_render")),
     ("pdf_read", re.compile(_PDF, _F), ("office_read",)),
     ("pdf_new", _intent(_PDF, _MAKE), ("pdf_create", "office_render")),
+    # --- P6 SELF persona: corrections about HOW Lucy talks/behaves -> update_self (the prompt also tells her to call it by name) ---
+    ("self", re.compile(r"\b(from now on|stop (?:being|doing|saying|using|talking)|don'?t (?:be|talk|sound|say|use|call me)|"
+                        r"i (?:like|prefer|want|love|hate) (?:it )?when you|you (?:should|shouldn'?t|always|never|keep|tend to) |"
+                        r"your (?:personality|tone|style|habit|habits)|talk to me|speak to me|call me|that was (?:funny|rude|too)|"
+                        r"too (?:long|formal|wordy|chatty|blunt)|be more|be less)\b", _F), ("update_self",)),
     ("undo", re.compile(r"\b(undo|revert|restore|roll\s?back|put (?:it|that) back|backups?|previous version)\b", _F),
      ("restore_from_backup",)),
+    # --- P7 self-evolution: Lucy's own tools (Lane A) and gated changes to Lucy Core (Lane B) ---
+    ("selfdev_tool", re.compile(r"\b(?:(?:make|write|create|build|add|code)\s+(?:yourself\s+)?(?:a\s+|an\s+|your\s+own\s+|new\s+)?tool|"
+                                r"new tool|your (?:own )?tools?|user tools?|custom tool|improve (?:the|your|that) tool|"
+                                r"(?:disable|switch off|turn off) (?:the|your|that) tool)\b", _F), ("user_tool",)),
+    ("selfdev_core", re.compile(r"\b(?:improve|change|fix|upgrade|update|modify|edit|patch)\s+(?:your\s*self|your (?:own )?"
+                                r"(?:code|source|harness|core)|lucy core)\b|\bself[- ]?(?:improve|improvement|evolv\w*|"
+                                r"modif\w*)|\bcore[_ ]change\b|\b(?:trace (?:review|mining)|improvement ideas)\b", _F),
+     ("core_change",)),
+    # --- P5 PC agent: words -> the small set of PC tools (the rest stay one tool_search away) ---
+    ("pc_apps", re.compile(r"\b(install|uninstall|upgrade|update)\b.{0,30}\b(app|apps|program|software|package)\b|\bwinget\b|"
+                          r"\b(install|uninstall|reinstall)\s+[\w.\-]+", _F), ("winget",)),
+    ("pc_service", re.compile(r"\b(service|services|daemon|background service|spooler|print spooler|windows service)\b", _F), ("service",)),
+    ("pc_process", re.compile(r"\b(process(?:es)?|task manager|not responding|frozen|hung|hang(?:ing)?|using (?:all )?(?:my )?(?:ram|memory|cpu)|"
+                             r"kill|force[- ]?close|end task|close\s+[\w.]+\.exe)\b", _F), ("process",)),
+    ("pc_task", re.compile(r"\b(scheduled task|task scheduler|schtasks|startup task|runs at (?:login|startup|boot)|cron)\b", _F), ("scheduled_task",)),
+    ("pc_registry", re.compile(r"\b(registry|regedit|reg key|hkcu|hklm|hkey)\b", _F), ("registry",)),
+    ("pc_info", re.compile(r"\b(disk space|free space|how much space|storage left|drive (?:full|space)|biggest (?:files|folders)|"
+                          r"what(?:'s| is) taking up|firewall|event log|event viewer|windows update|updates? (?:pending|available)|"
+                          r"crash(?:ed|ing)?|blue ?screen|bsod)\b", _F), ("system_info",)),
+    ("pc_files", re.compile(r"\b(back\s?up|backup|copy\s+(?:it|this|the|all|my)|move\s+(?:it|this|the|all|my|to)|duplicate|"
+                           r"recycle bin|to the trash|make (?:a )?folder|create (?:a )?folder|new folder)\b", _F), ("file_ops",)),
+    ("pc_window", re.compile(r"\b(window|windows (?:open|list)|bring.{0,15}(?:front|focus)|switch to|minimi[sz]e|maximi[sz]e|"
+                            r"focus (?:the|on)|which apps? (?:are )?open|windows? (?:are )?open|open windows?)\b", _F), ("window",)),
+    ("pc_desktop", re.compile(r"\b(clipboard|copy to clipboard|notif(?:y|ication)|remind me on screen|volume|mute|unmute|"
+                             r"turn (?:it )?(?:up|down)|open\s+(?:chrome|edge|notepad|the app|the file|the folder|calculator|"
+                             r"explorer)|launch\s+)\b", _F), ("desktop",)),
+    ("pc_screen", re.compile(r"\b(screenshot|screen ?shot|screen capture|capture (?:the|my) screen|what(?:'s| is) on (?:my |the )?screen|"
+                            r"look at (?:my |the )?screen|see my screen|read the screen)\b", _F), ("screenshot", "analyze_image")),
+    ("pc_click", re.compile(r"\b(click (?:the|on) [\w ]+ (?:button|link|menu|tab|icon)|press the [\w ]+ button|click [\"'][^\"']+[\"'])\b", _F),
+     ("ui_click", "screenshot")),
     ("desktop", re.compile(r"\b(click|double[- ]?click|mouse|cursor|keyboard|type\s+(?:in|into)|press|hotkey|minimi[sz]e|"
-                           r"window|desktop|screen)\b", _F), ("cua_cursor", "cua_mouse", "cua_keyboard")),
+                           r"window|desktop|screen)\b", _F), ("ui_click", "screenshot", "cua_mouse", "cua_keyboard", "cua_cursor")),
 ]
 
 
@@ -149,7 +189,7 @@ class ToolCatalog:
     `core` is the set of main tools of each server (they win ties), `more` returns a line about sibling tools."""
 
     def __init__(self, tools: Iterable[dict], keywords: Optional[Dict[str, str]] = None,
-                 core: Optional[Iterable[str]] = None, more: Any = None):
+                 core: Optional[Iterable[str]] = None, more: Any = None, live: Any = None):
         self._by_name: Dict[str, dict] = {}
         for t in tools:
             name = (t.get("function") or {}).get("name")
@@ -158,11 +198,25 @@ class ToolCatalog:
         self._keywords = dict(keywords or {})
         self._core = set(core or ())
         self._more = more
+        self._live = live                # P7: () -> schemas of tools that may appear mid-turn (Lucy's own new tools)
+
+    def _refresh(self) -> None:
+        if self._live is None:
+            return
+        try:
+            for t in self._live() or ():
+                name = (t.get("function") or {}).get("name")
+                if name and name != TOOL_SEARCH_NAME and name not in self._by_name:
+                    self._by_name[name] = t
+        except Exception:                                # noqa: BLE001 - a lookup must never break the turn
+            pass
 
     def names(self) -> List[str]:
         return list(self._by_name)
 
     def get(self, name: str) -> Optional[dict]:
+        if name not in self._by_name:
+            self._refresh()
         return self._by_name.get(name)
 
     def more_hint(self, found: Iterable[dict]) -> str:
@@ -175,6 +229,7 @@ class ToolCatalog:
             return ""
 
     def search(self, query: str, limit: int = 4) -> List[dict]:
+        self._refresh()
         q = str(query or "").lower()
         words = {w for w in re.findall(r"[a-z0-9]+", q) if len(w) >= 3}
         scores: Dict[str, int] = {}
