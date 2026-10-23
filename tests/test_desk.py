@@ -1,4 +1,4 @@
-"""P9 desk features (items 1-8, 11, 12) without the web app. Run: python -m pytest tests/test_p9_desk.py"""
+"""P9 desk features (items 1-8, 11, 12) without the web app. Run: python -m pytest tests/test_desk.py"""
 import asyncio
 import json
 import sqlite3

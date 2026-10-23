@@ -6,7 +6,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import pytest  # noqa: E402
-from test_p9_desk import Env  # noqa: E402
+from test_desk import Env  # noqa: E402
 
 fastapi = pytest.importorskip("fastapi")
 from fastapi import FastAPI  # noqa: E402

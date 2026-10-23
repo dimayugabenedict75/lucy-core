@@ -270,21 +270,9 @@ function formatTimestamp(ts) {
     if (!ts) return '';
     const d = new Date(ts.replace(' ', 'T'));
     if (isNaN(d.getTime())) return ts;
+    // Stored times are the server PC's local clock ("YYYY-MM-DD HH:MM:SS"): show them exactly as they are.
     const options = {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true};
-    const tzSelect = document.getElementById('timezoneSelect');
-    let tz = 'en-US';
-    if (tzSelect) {
-        const selectedText = tzSelect.options[tzSelect.selectedIndex]?.text || '';
-        const match = selectedText.match(/GMT([+-])(\d+)/);
-        if (match) {
-            tz = match[1] + match[2].padStart(2, '0');
-        }
-    }
-    try {
-        return d.toLocaleString(navigator.language || 'en-US', {...options, timeZone: tz});
-    } catch {
-        return d.toLocaleString(navigator.language || 'en-US', options);
-    }
+    return d.toLocaleString(navigator.language || 'en-US', options);
 }
 
 async function renderHistory() {
@@ -1130,37 +1118,12 @@ async function readFileAsDataURL(file) {
     });
 }
 
-async function loadSettings() {
-    try {
-        const res = await fetch(`/api/settings/timezone?api_key=${API_KEY}`);
-        const data = await res.json();
-        const tzSelect = document.getElementById('timezoneSelect');
-        if (tzSelect) {
-            tzSelect.innerHTML = data.available_timezones.map(opt =>
-                `<option value="${opt.value}" ${opt.value === data.timezone ? 'selected' : ''}>${opt.label}</option>`
-            ).join('');
-        }
-    } catch (e) {
-        console.error('Failed to load settings:', e);
-    }
-}
-
-function saveSettings() {
-    const tz = document.getElementById('timezoneSelect').value;
-    fetch(`/api/settings/timezone?api_key=${API_KEY}`, {
-        method: 'POST',
-        body: JSON.stringify({timezone: tz}),
-        headers: {'Content-Type': 'application/json'}
-    });
-}
-
 // ---- Autosave (fires on every field change, no Save button needed) ----
 const AUTOSAVE_FIELDS = [
     {id: 'themeSelect', key: 'theme'},
     {id: 'fontSelect', key: 'font'},
     {id: 'fontSizeSelect', key: 'font_size'},
     {id: 'languageSelect', key: 'language'},
-    {id: 'timezoneSelect', key: 'timezone'},
     {id: 'providerSelect', key: 'provider'},
     {id: 'modelSelect', key: 'model'},
     {id: 'temperatureInput', key: 'temperature'},
@@ -1208,9 +1171,6 @@ function applyTheme(theme, persist = false) {
 function saveSetting(key, value) {
     if (key === 'theme') {
         applyTheme(value, true);
-    } else if (key === 'timezone') {
-        // Already wired to a real endpoint
-        saveSettings();
     } else if (key === 'model' || key === 'temperature' || key === 'reasoning' || key === 'kv_cache') {
         saveLlmSetting(key, value);
         return;                       // flashSaved() is called once the server confirms
@@ -1313,7 +1273,6 @@ function flashSaved() {
 
 function openSettings() {
     settingsOverlay.style.display = 'flex';
-    loadSettings();
     loadLlmStatus();
     loadSkills();
     loadConnectors();
@@ -2459,7 +2418,6 @@ const greetingTime = document.getElementById('greetingTime');
 if (greetingTime) {
     greetingTime.textContent = formatTime(new Date().toISOString()) || '';
 }
-loadSettings();
 loadSessions();
 loadVoiceStatus();
 bindAutosave();
@@ -3200,11 +3158,41 @@ async function loadSafety() {
         }
         if ((st.write_folders || []).length) bits.push('Also writes without asking in: ' + st.write_folders.join(', '));
         info.textContent = bits.join('\n');
+        loadSealState();
         loadSafetyBackups();
         loadBrokerStatus();
     } catch (e) {
         console.error('Failed to load safety status:', e);
     }
+}
+
+// Settings > Safety: accept changes YOU made to the safety files (same as seal.bat). Shown only when something differs from the lock.
+async function loadSealState() {
+    const group = document.getElementById('sealGroup');
+    if (!group) return;
+    try {
+        const r = await fetch(`/api/safety/seal?api_key=${API_KEY}`);
+        const s = await r.json();
+        const files = s.pending || [];
+        group.style.display = files.length ? '' : 'none';
+        document.getElementById('sealFiles').textContent = files.join('\n');
+    } catch (e) { group.style.display = 'none'; }
+}
+
+async function sealSafetyChanges() {
+    const files = document.getElementById('sealFiles').textContent;
+    const typed = prompt('These safety files differ from the lock:\n\n' + files +
+        '\n\nDid YOU make these changes and want to keep them? Type SEAL to accept.');
+    if (typed === null) return;
+    if (typed.trim() !== 'SEAL') { alert('Not sealed.'); return; }
+    const resp = await fetch(`/api/safety/seal?api_key=${API_KEY}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({confirm: 'SEAL'})
+    });
+    if (!resp.ok) { alert('Could not seal: ' + await resp.text()); return; }
+    const s = await resp.json();
+    flashSaved();
+    if (s.needs_restart) alert('Sealed. Restart Lucy Core so the changed safety code is the code that runs.');
+    loadSafety();
 }
 
 async function loadBrokerStatus() {

@@ -25,9 +25,6 @@ logger = logging.getLogger("lucy.core.proactive")
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "user_name": "Benny",
-    # "app"  -> follow Settings > Timezone.  Otherwise "Asia/Manila", "+08:00", "utc" or "system".
-    # NOTE: if Settings says UTC but you live elsewhere, set this - quiet hours depend on it.
-    "timezone": "Asia/Manila",
     "startup_delay_seconds": 5,
     "tick_seconds": 10,
     "watch_interval_seconds": 60,
@@ -209,7 +206,6 @@ class Config:
 
 # ------------------------------------------------------------------------------------ time helpers
 _HHMM = re.compile(r"^\s*(\d{1,2})(?::(\d{2}))?\s*$")
-_OFFSET = re.compile(r"^(?:utc|gmt)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
 
 
 def parse_hhmm(value: Any) -> tuple[int, int]:
@@ -223,29 +219,8 @@ def parse_hhmm(value: Any) -> tuple[int, int]:
 
 
 def local_tz() -> tzinfo:
+    """This PC's timezone (Windows date / time / timezone settings). There is no timezone setting in Lucy."""
     return datetime.now().astimezone().tzinfo or timezone.utc
-
-
-def resolve_tz(setting: str | None, app_tz: str | None = None) -> tzinfo:
-    """The user's timezone. `setting` is the proactive `timezone` value, `app_tz` the Settings > Timezone value."""
-    s = str(setting or "app").strip()
-    if s.lower() == "app":
-        s = str(app_tz or "system").strip()
-    low = s.lower()
-    if low in ("", "system", "local"):
-        return local_tz()
-    if low in ("utc", "gmt", "z"):
-        return timezone.utc
-    m = _OFFSET.match(s)
-    if m:
-        sign = -1 if m.group(1) == "-" else 1
-        return timezone(sign * timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0)))
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo(s)
-    except Exception:
-        logger.warning(f"Unknown timezone '{s}' (on Windows IANA names need 'pip install tzdata'); using the system timezone")
-        return local_tz()
 
 
 def tz_label(dt: datetime) -> str:

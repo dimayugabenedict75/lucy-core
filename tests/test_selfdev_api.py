@@ -6,7 +6,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import pytest  # noqa: E402
 from _safety_helpers import Env  # noqa: E402
-from test_p7_lane_b import make_repo, edit  # noqa: E402
+from test_selfdev_lane_b import make_repo, edit  # noqa: E402
 from lucy import selfdev  # noqa: E402
 from lucy.selfdev import lane_b as LB, user_tools as UT, trace_mining as TM  # noqa: E402
 from lucy.server import api  # noqa: E402

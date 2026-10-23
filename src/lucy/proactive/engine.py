@@ -27,7 +27,7 @@ from typing import Callable
 from . import compose as _compose
 from . import watchers as _watchers
 from .bus import EventBus
-from .config import Config, SETTABLE, resolve_tz, tz_label
+from .config import Config, SETTABLE, tz_label
 from .host import ProactiveHost
 from .policy import MUTABLE_KINDS, Policy
 from .schedule import describe_rule, make_rule, next_after
@@ -81,7 +81,7 @@ class ProactiveEngine:
             return {}
 
     def tz(self):
-        return resolve_tz(self.cfg.get("timezone"), self.host.app_timezone())
+        return self.host.tz()                                  # always the PC's own timezone
 
     def now_local(self, ts: float | None = None) -> datetime:
         return datetime.fromtimestamp(self.clock() if ts is None else ts, self.tz())

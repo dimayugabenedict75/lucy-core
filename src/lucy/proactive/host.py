@@ -8,6 +8,7 @@ Every field has a harmless default, so tests (and a half-wired install) still ru
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -28,7 +29,7 @@ class ProactiveHost:
     is_busy: Callable[[], bool] = lambda: False                      # a chat reply is being generated right now
     paused: Callable[[], bool] = lambda: False                       # the user pressed "Pause agent" (safety layer)
     health: Callable[[], dict] = lambda: {}                          # {"llm_phase","llm_error","llm_label"}
-    app_timezone: Callable[[], str] = lambda: "system"               # Settings > Timezone value
+    tz: Callable[[], tzinfo] = lambda: datetime.now().astimezone().tzinfo   # this PC's own timezone (tests inject a fixed one)
     # --- model -----------------------------------------------------------------------------------------
     persona: Callable[[], str] = lambda: "You are Lucy, a companion."
     llm_ready: Callable[[], Awaitable[bool]] = _false                # model is up and idle-able (never start it for us)
