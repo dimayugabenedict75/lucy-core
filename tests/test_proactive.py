@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from lucy.proactive import ProactiveHost, ProactiveEngine, normalize_history, run_tool, set_engine  # noqa: E402
 from lucy.proactive import compose, schedule  # noqa: E402
 from lucy.proactive.chat_format import LEAD_PLACEHOLDER  # noqa: E402
-from lucy.proactive.config import in_quiet_hours, resolve_tz  # noqa: E402
+from lucy.proactive.config import in_quiet_hours, local_tz  # noqa: E402
 from lucy.proactive.timeparse import parse_when, parse_duration  # noqa: E402
 
 TZ = timezone(timedelta(hours=8))
@@ -69,8 +69,19 @@ def test_quiet_hours_and_tz():
     assert in_quiet_hours(datetime(2026, 1, 1, 6, 59), "23:00", "07:00")
     assert not in_quiet_hours(datetime(2026, 1, 1, 7, 0), "23:00", "07:00")
     assert not in_quiet_hours(datetime(2026, 1, 1, 12, 0), "09:00", "09:00")
-    assert resolve_tz("+08:00").utcoffset(None) == timedelta(hours=8)
-    assert resolve_tz("app", "utc").utcoffset(None) == timedelta(0)
+    assert datetime.now(local_tz()).utcoffset() == datetime.now().astimezone().utcoffset()    # the PC's own timezone
+
+
+def test_there_is_no_timezone_setting_lucy_follows_the_pc(tmp_path):
+    """No Settings > Timezone, no timezone key in the proactive config: the engine uses the PC's timezone."""
+    from lucy.proactive.config import DEFAULTS
+    from lucy.proactive.engine import ProactiveEngine
+    from lucy.proactive.host import ProactiveHost
+    assert "timezone" not in DEFAULTS
+    eng = ProactiveEngine(ProactiveHost(root=tmp_path, runtime=tmp_path / "runtime", append_message=lambda s, r, c: None))
+    ts = datetime(2026, 7, 1, 12, 0).timestamp()
+    assert eng.now_local(ts).utcoffset() == datetime.fromtimestamp(ts).astimezone().utcoffset()
+    assert eng.now_local(ts).replace(tzinfo=None) == datetime.fromtimestamp(ts)                 # same wall-clock as the PC
 
 
 # ------------------------------------------------------------------ sanitizing / history
@@ -114,7 +125,7 @@ class Fake:
             root=Path(tmp), runtime=Path(tmp) / "runtime",
             append_message=lambda s, r, c: self.msgs.append((s, r, c)),
             pick_session=lambda: "sess1", recent_messages=lambda s, n: self.history[-n:],
-            is_busy=lambda: self.busy, health=lambda: self.health, app_timezone=lambda: "+08:00",
+            is_busy=lambda: self.busy, health=lambda: self.health, tz=lambda: TZ,
             persona=lambda: "You are Lucy.", llm_ready=self._ready, llm_complete=self._complete,
             run_agent=self._agent, memory_context=lambda q: "- Benny likes concise answers",
             sticker=lambda e: f"assets/stickers/Dark/{e}.png", speak=self._speak)

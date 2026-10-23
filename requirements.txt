@@ -10,7 +10,6 @@ numpy
 pillow
 scikit-learn
 tiktoken
-tzdata      # Windows needs this for zoneinfo (e.g. "Asia/Manila")
 google-api-python-client
 google-auth-oauthlib
 python-docx   # P3: Word files

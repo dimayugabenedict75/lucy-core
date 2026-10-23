@@ -357,10 +357,6 @@
                             <option value="en" selected>English</option>
                         </select>
                     </div>
-                    <div class="setting-group">
-                        <label for="timezoneSelect">Timezone</label>
-                        <select id="timezoneSelect"></select>
-                    </div>
                 </div>
 
                 <!-- MODEL -->
@@ -446,6 +442,12 @@
                         <label for="safetyPauseToggle">Pause agent</label>
                         <input type="checkbox" id="safetyPauseToggle" onchange="setSafetyPaused(this.checked)">
                         <div class="llm-status">Stops every tool (chat, background tasks, reminders) and kills running background commands.</div>
+                    </div>
+                    <div class="setting-group" id="sealGroup" style="display:none">
+                        <label>Safety files changed</label>
+                        <div class="llm-status safety-status" id="sealFiles"></div>
+                        <button type="button" id="sealBtn" onclick="sealSafetyChanges()">Seal changes</button>
+                        <div class="llm-status">Only accept changes you made yourself. Lucy runs no tools until the files are sealed.</div>
                     </div>
                     <div class="llm-status safety-status" id="safetyStatus"></div>
                     <div class="llm-status safety-status" id="brokerStatus"></div>

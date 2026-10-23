@@ -14,7 +14,7 @@ from lucy.persona.self_store import SelfStore, DAILY_LIMITS  # noqa: E402
 from lucy.persona import reflect as RF  # noqa: E402
 from lucy.rag.conductor import Conductor  # noqa: E402
 from lucy.memory.manager import MemoryManager  # noqa: E402
-from test_p6_persona import uniq  # noqa: E402
+from test_persona import uniq  # noqa: E402
 
 
 class World:

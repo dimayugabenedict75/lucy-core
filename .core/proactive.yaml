@@ -5,10 +5,8 @@
 enabled: true
 user_name: Benny
 
-# Your timezone. Quiet hours, rest days, repeat rules and tasks all follow it.
-#   "Asia/Manila" (needs tzdata, which is in requirements.txt), "+08:00" (always works), "app" (= Settings > Timezone,
-#   which was UTC for you), "utc", "system".
-timezone: "Asia/Manila"
+# Time: Lucy always follows this PC's own date, time and timezone (Windows settings). Quiet hours, rest days,
+# repeat rules and tasks all use it. There is no timezone setting.
 
 startup_delay_seconds: 5
 tick_seconds: 10              # how often due reminders are checked

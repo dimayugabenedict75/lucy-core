@@ -733,7 +733,7 @@ class Eng:
         self.msgs = []
         self.t = MON_10AM
         host = ProactiveHost(root=tmp_path, runtime=tmp_path / "runtime", append_message=lambda s, r, c: self.msgs.append((s, r, c)),
-                             pick_session=lambda: "sess1", app_timezone=lambda: "+08:00", persona=lambda: "You are Lucy.",
+                             pick_session=lambda: "sess1", tz=lambda: TZ, persona=lambda: "You are Lucy.",
                              job_hooks=self.w.runner.hooks)
         self.eng = ProactiveEngine(host, clock=lambda: self.t)
         self.eng.cfg["jobs"]["poll_seconds"] = 0.02
@@ -857,13 +857,11 @@ def test_routing_shows_the_task_tool_for_background_work_but_not_for_the_word_ta
         assert "task" not in pick(no), no
 
 
-def test_the_shipped_defaults_use_manila_time_and_describe_the_jobs_section():
+def test_the_shipped_defaults_follow_the_pc_clock_and_describe_the_jobs_section():
     root = HERE.parent
     import yaml
-    from lucy.proactive.config import resolve_tz
     y = yaml.safe_load((root / ".core" / "proactive.yaml").read_text(encoding="utf-8"))
-    assert y["timezone"] == "Asia/Manila"
-    assert datetime(2026, 1, 1, tzinfo=resolve_tz(y["timezone"], "utc")).utcoffset() == timedelta(hours=8)   # needs tzdata (in requirements.txt)
+    assert "timezone" not in y and "timezone" not in DEFAULTS                  # no timezone setting: the PC's clock is used
     assert y["jobs"]["auto_start_model_full"] is False and y["jobs"]["system_jobs"] is True
     assert set(DEFAULTS["jobs"]["blocked_tools"]) >= {"task", "core_change", "user_tool"}
     assert all(s in STATUS_LABELS for s in ("scheduled", "running", "parked", "waiting_ok", "stopped"))

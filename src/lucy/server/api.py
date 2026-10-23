@@ -221,29 +221,11 @@ _conn.row_factory = sqlite3.Row
 
 
 def _get_tz_modifier():
-    """Return the SQLite timezone modifier string for the configured timezone."""
-    with _db_lock:
-        row = _conn.execute("SELECT value FROM tz_config WHERE key = 'timezone'").fetchone()
-    tz = row["value"] if row else "system"
-    if tz == "system":
-        return "localtime"
-    if tz == "utc":
-        return "utc"
-    # For explicit offsets like "+08:00" or "-05:00"
-    return tz
+    """SQLite time modifier: stored times are this PC's own local clock (Windows date / time / timezone)."""
+    return "localtime"
 
 
-# Create tz_config first so _get_tz_modifier() can query it
-_conn.execute("""
-    CREATE TABLE IF NOT EXISTS tz_config (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    )
-""")
-_conn.execute("INSERT OR IGNORE INTO tz_config (key, value) VALUES ('timezone', 'system')")
-_conn.commit()
-
-# Now create sessions and messages with the dynamic timezone default
+# Sessions and messages (timestamps default to the PC local clock)
 _tz_mod = _get_tz_modifier()
 _conn.execute(f"""
     CREATE TABLE IF NOT EXISTS sessions (
@@ -2504,216 +2486,6 @@ async def create_session(_: bool = Depends(verify_api_key)):
     return {"session_id": session_id, "title": "New Session", "message_count": 0, "updated_at": now}
 
 
-# === Timezone settings via TimeAPI.io with caching ===
-
-import time as _time_mod  # noqa: E402
-
-_TIMEZONE_CACHE_PATH = str(_paths.RUNTIME / "tz_cache.json")
-_TIMEZONE_CACHE_MAX_AGE = 24 * 3600  # 24 hours
-_timezone_cache: dict | None = None
-_timezone_cache_expires: float = 0.0
-
-
-def _load_timezone_cache() -> dict | None:
-    """Load cached timezone list from disk, if fresh enough."""
-    global _timezone_cache, _timezone_cache_expires
-    if _timezone_cache is not None and _time_mod.time() < _timezone_cache_expires:
-        return _timezone_cache
-    cache_path = Path(_TIMEZONE_CACHE_PATH)
-    if cache_path.exists():
-        try:
-            cached = json.loads(cache_path.read_text())
-            if cached.get("_expires", 0) > _time_mod.time() and len(cached.get("timezones") or []) > 10:   # a 2-entry list = a bad (tzdata-less) result: rebuild
-                _timezone_cache = cached
-                _timezone_cache_expires = cached["_expires"]
-                return _timezone_cache
-        except Exception:
-            pass
-    return None
-
-
-def _save_timezone_cache(data: dict):
-    """Persist timezone list to disk for future requests."""
-    global _timezone_cache, _timezone_cache_expires
-    data["_expires"] = _time_mod.time() + _TIMEZONE_CACHE_MAX_AGE
-    _timezone_cache = data
-    _timezone_cache_expires = data["_expires"]
-    try:
-        Path(_TIMEZONE_CACHE_PATH).parent.mkdir(parents=True, exist_ok=True)
-        Path(_TIMEZONE_CACHE_PATH).write_text(json.dumps(data, ensure_ascii=False))
-    except Exception as e:
-        logger.debug(f"Failed to save timezone cache: {e}")
-
-
-# Static fallback list (kept for offline resilience)
-_STATIC_TIMEZONES = [
-    {"value": "system", "label": "System Default"},
-    {"value": "utc", "label": "UTC"},
-    {"value": "+08:00", "label": "GMT+8 (Beijing, Singapore)"},
-    {"value": "+00:00", "label": "GMT+0 (London)"},
-    {"value": "-05:00", "label": "GMT-5 (New York)"},
-    {"value": "-08:00", "label": "GMT-8 (Los Angeles)"},
-]
-
-
-def _fetch_timezone_zones_local() -> list[str]:
-    """Get IANA timezone names from Python's zoneinfo (local, no network)."""
-    from zoneinfo import available_timezones
-    zones = sorted(available_timezones())
-    # Filter out some known-invalid / internal zones
-    return [z for z in zones if z and not z.lower().startswith("factory")]
-
-
-def _resolve_zone_offset_local(zone: str) -> int | None:
-    """Resolve the current UTC offset for a zone using zoneinfo (local)."""
-    from zoneinfo import ZoneInfo
-    from datetime import datetime
-    try:
-        tz = ZoneInfo(zone)
-        now = datetime.now(tz)
-        offset = now.utcoffset()
-        if offset is not None:
-            return int(offset.total_seconds())
-    except Exception:
-        pass
-    return None
-
-
-async def _fetch_timezone_zones() -> list[str]:
-    """Fetch the list of IANA timezone names from TimeAPI.io."""
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-        resp = await client.get(
-            "https://timeapi.io/api/timezone/availabletimezones",
-            headers={"Accept": "application/json"},
-        )
-        if resp.status_code == 200:
-            zones = resp.json()
-            if isinstance(zones, list):
-                return zones
-    raise RuntimeError(f"TimeAPI returned status {resp.status_code if resp else 'N/A'}")
-
-
-async def _resolve_zone_offsets(client: httpx.AsyncClient, zones: list[str]) -> dict:
-    """Resolve UTC offsets for IANA zone strings via TimeAPI.io.
-
-    Returns {zone_name: offset_seconds}. Parallel with semaphore=5 and
-    429-retry-with-backoff to handle TimeAPI rate limiting.
-    """
-    results: dict[str, int] = {}
-    semaphore = asyncio.Semaphore(5)
-
-    async def _fetch_one(zone: str):
-        async with semaphore:
-            for attempt in range(3):
-                try:
-                    resp = await client.get(
-                        f"https://timeapi.io/api/TimeZone/zone?timeZone={zone}",
-                        headers={"Accept": "application/json"},
-                    )
-                    if resp.status_code == 429:
-                        await asyncio.sleep(0.5 * (2 ** attempt))
-                        continue
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        secs = data.get("currentUtcOffset", {}).get("seconds")
-                        if secs is not None:
-                            results[zone] = secs
-                    return
-                except Exception:
-                    if attempt < 2:
-                        await asyncio.sleep(0.2 * (attempt + 1))
-                        continue
-                    return
-
-    # Process in small batches to avoid overwhelming TimeAPI
-    batch_size = 10
-    for i in range(0, len(zones), batch_size):
-        batch = zones[i:i + batch_size]
-        tasks = [_fetch_one(z) for z in batch]
-        await asyncio.gather(*tasks)
-        await asyncio.sleep(0.3)
-    return results
-
-
-def _format_offset_label(seconds: int) -> str:
-    """Convert offset seconds to 'UTC+8' / 'UTC-5:30' style."""
-    sign = "+" if seconds >= 0 else "-"
-    abs_sec = abs(seconds)
-    hours = abs_sec // 3600
-    minutes = (abs_sec % 3600) // 60
-    if minutes:
-        return f"UTC{sign}{hours}:{minutes:02d}"
-    return f"UTC{sign}{hours}"
-
-
-def _build_timezone_list(zones: list[str], offset_map: dict) -> list[dict]:
-    """Build the label/value list for the frontend from live zone data."""
-    def _sort_key(zone: str):
-        return (offset_map.get(zone, 0), zone)
-
-    items = []
-    seen_values = {"system", "utc"}
-    items.append({"value": "system", "label": "System Default"})
-    items.append({"value": "utc", "label": "UTC"})
-
-    for zone in sorted(zones, key=_sort_key):
-        if zone in seen_values:
-            continue
-        seen_values.add(zone)
-        offset = offset_map.get(zone)
-        label_zone = zone.replace("_", " ")
-        if offset is not None:
-            items.append({
-                "value": zone,
-                "label": f"{_format_offset_label(offset)} {label_zone}",
-            })
-        else:
-            items.append({
-                "value": zone,
-                "label": label_zone,
-            })
-    return items
-
-
-async def _refresh_timezone_cache():
-    """One-shot: build full zone list with offsets and cache to disk.
-
-    Primary source: Python's zoneinfo (local, instant, DST-aware, no network).
-    Fallback source: TimeAPI.io (network, ~60s for 597 zones).
-    Cached for 24h. On total failure, keeps existing cache or static fallback.
-    """
-    # --- Primary: local zoneinfo (instant, no network, DST-aware) ---
-    try:
-        zones = _fetch_timezone_zones_local()
-        if len(zones) < 10:                 # Windows without the tzdata package: zoneinfo knows no zones (and does not raise)
-            raise RuntimeError("zoneinfo has no timezone data - run: .venv\\Scripts\\python.exe -m pip install tzdata")
-        offset_map = {}
-        for zone in zones:
-            secs = _resolve_zone_offset_local(zone)
-            if secs is not None:
-                offset_map[zone] = secs
-        available = _build_timezone_list(zones, offset_map)
-        _save_timezone_cache({"timezones": available, "_source": "zoneinfo_local"})
-        logger.info(f"Timezone cache refreshed from zoneinfo: {len(available)} zones, "
-                    f"{len(offset_map)} with resolved offsets")
-        return
-    except Exception as e:
-        logger.warning(f"zoneinfo local timezone resolution failed: {e}; falling back to TimeAPI.io")
-
-    # --- Fallback: TimeAPI.io (network) ---
-    try:
-        zones = await _fetch_timezone_zones()
-        logger.info(f"TimeAPI returned {len(zones)} zones; resolving offsets...")
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            offset_map = await _resolve_zone_offsets(client, zones)
-        available = _build_timezone_list(zones, offset_map)
-        _save_timezone_cache({"timezones": available, "_source": "timeapi_io"})
-        logger.info(f"Timezone cache refreshed from TimeAPI.io: {len(available)} zones total, "
-                    f"{len(offset_map)} with resolved offsets")
-    except Exception as e:
-        logger.warning(f"Failed to refresh timezone cache from TimeAPI.io: {e}")
-
-
 @app.on_event("startup")
 async def _llm_autostart():
     """Load the model chosen in Settings > Model as soon as Lucy Core starts.
@@ -2752,47 +2524,6 @@ async def llm_settings(request: Request, _ = Depends(verify_api_key)):
     if todo:
         llm.phase, llm.message = "loading", "Switching..." if "switch" in todo else "Reloading with new settings..."
     return await llm.status()
-
-
-@app.get("/api/settings/timezone")
-async def get_timezone_setting(_ = Depends(verify_api_key)):
-    """Returns the current timezone configuration with live IANA zone list.
-
-    Zone list is resolved once from Python's zoneinfo (instant, local, DST-aware)
-    and cached for 24h. Falls back to TimeAPI.io if zoneinfo/tzdata is unavailable,
-    then to a static list if the network is unreachable.
-    """
-    with _db_lock:
-        row = _conn.execute("SELECT value FROM tz_config WHERE key = 'timezone'").fetchone()
-    tz = row["value"] if row else "system"
-
-    # Try cache first (in-memory or on-disk)
-    cached = _load_timezone_cache()
-    if cached and cached.get("timezones"):
-        available = cached["timezones"]
-    else:
-        # Cache miss — perform refresh. zoneinfo is instant; TimeAPI fallback ~60s.
-        logger.info("Timezone cache cold — performing refresh...")
-        await _refresh_timezone_cache()
-        cached = _load_timezone_cache()
-        available = cached.get("timezones", []) if cached else _STATIC_TIMEZONES
-
-    return {"timezone": tz, "available_timezones": available}
-
-
-@app.post("/api/settings/timezone")
-async def set_timezone_setting(request: Request, _ = Depends(verify_api_key)):
-    """Sets the timezone configuration."""
-    body = await request.json()
-    tz = body.get("timezone", "system")
-    with _db_lock:
-        _conn.execute(
-            "INSERT INTO tz_config (key, value) VALUES ('timezone', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (tz,),
-        )
-        _conn.commit()
-    return {"status": "ok", "timezone": tz}
 
 
 @app.get("/api/sessions/{session_id}")
@@ -2963,12 +2694,6 @@ async def _proactive_speak(text: str) -> None:
             pass
 
 
-def _proactive_app_timezone() -> str:
-    with _db_lock:
-        row = _conn.execute("SELECT value FROM tz_config WHERE key = 'timezone'").fetchone()
-    return row["value"] if row else "system"
-
-
 def _proactive_health() -> dict:
     return {"llm_phase": llm.phase, "llm_error": llm.message if llm.phase == "error" else None,
             "llm_label": llm.active["label"]}
@@ -3039,7 +2764,7 @@ async def _proactive_start():
         _proactive.init(_proactive.ProactiveHost(
             root=_paths.ROOT, runtime=_paths.RUNTIME, append_message=_append_message,
             pick_session=_proactive_pick_session, recent_messages=lambda sid, n: _get_messages(sid)[-n:],
-            is_busy=_proactive_is_busy, health=_proactive_health, app_timezone=_proactive_app_timezone,
+            is_busy=_proactive_is_busy, health=_proactive_health,
             persona=_persona_text, llm_ready=_proactive_llm_ready, llm_complete=_proactive_llm_complete,
             run_agent=_proactive_run_agent, memory_context=_memory_manager.get_contextual_memory,
             sticker=_proactive_sticker, speak=_proactive_speak, paused=lambda: _safety.get().paused,
@@ -3097,6 +2822,32 @@ async def safety_mode(request: Request, _ = Depends(verify_api_key)):
     except PermissionError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return _safety.get().status(body.get("session_id"))
+
+
+@app.get("/api/safety/seal")
+async def safety_seal_pending(_ = Depends(verify_api_key)):
+    """Safety files that differ from the lock = what the Seal button would accept (same list as `seal.bat status`)."""
+    c = _safety.get().constitution
+    diff = c.diff() if c.lock.exists() else ["constitution.lock is missing or unreadable"]
+    return {"pending": diff, "needs_restart": any(d.split(":", 1)[0].endswith(".py") for d in diff)}
+
+
+@app.post("/api/safety/seal")
+async def safety_seal(request: Request, _ = Depends(verify_api_key)):
+    """{confirm: "SEAL"}. User accepts changes THEY made to the safety files (same as `seal.bat`). A shell command that
+    mentions /api/safety always raises an approval card (policy.SAFETY_MARKERS), so the agent cannot call this quietly."""
+    body = await request.json()
+    if str(body.get("confirm", "")).strip() != "SEAL":
+        raise HTTPException(status_code=400, detail='type SEAL to confirm')
+    layer = _safety.get()
+    c = layer.constitution
+    diff = c.diff() if c.lock.exists() else ["constitution.lock is missing or unreadable"]
+    if not diff:
+        return {"ok": True, "sealed": False, "pending": [], "needs_restart": False}
+    c.seal(by="user (settings)")
+    layer.audit.write(event="seal", by="user (settings)", files=diff)
+    return {"ok": True, "sealed": True, "pending": [],
+            "needs_restart": any(d.split(":", 1)[0].endswith(".py") for d in diff), "files": diff}
 
 
 @app.post("/api/safety/pause")

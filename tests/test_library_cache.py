@@ -1,4 +1,4 @@
-"""P9 item 9: Library pins, size cap, cleanup. Run: python -m pytest tests/test_p9_library.py"""
+"""P9 item 9: Library pins, size cap, cleanup. Run: python -m pytest tests/test_library_cache.py"""
 import sqlite3
 import sys
 import threading
