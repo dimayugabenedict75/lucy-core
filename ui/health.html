@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lucy Core - Health</title>
+<style>
+:root{--bg:#fff;--fg:#1c1c1e;--mut:#6b6b70;--card:#f4f4f6;--line:#dcdce0;--ok:#1a9b4b;--bad:#d03a3a;--warn:#c27c00;--acc:#5b5bd6}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--fg:#ececf0;--mut:#9a9aa3;--card:#1e1e22;--line:#34343a;--ok:#3ccf74;--bad:#ff6b6b;--warn:#f0b34a;--acc:#8c8cff}}
+*{box-sizing:border-box}body{margin:0;padding:20px;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,sans-serif;max-width:980px;margin-inline:auto}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:22px 0 8px}
+.sub{color:var(--mut);margin-bottom:12px}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}tr:last-child td{border-bottom:0}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:var(--bad)}.dot.up{background:var(--ok)}.dot.mid{background:var(--warn)}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:7px 12px;font:inherit;cursor:pointer;margin:0 6px 6px 0}button.alt{background:transparent;color:var(--fg);border:1px solid var(--line)}
+input[type=number]{width:70px;padding:6px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit}
+.bar{height:10px;background:var(--line);border-radius:6px;overflow:hidden;margin:4px 0}.bar>div{height:100%;background:var(--acc)}
+.pill{padding:2px 8px;border-radius:99px;font-size:12px;background:var(--line)}.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}
+.log{font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word}.log div{padding:3px 0;border-bottom:1px solid var(--line)}
+a{color:var(--acc)}#toast{position:fixed;bottom:16px;right:16px;background:var(--fg);color:var(--bg);padding:8px 14px;border-radius:8px;display:none}
+</style></head><body>
+<h1>Lucy Core health</h1>
+<div class="sub"><span id="now"></span> &middot; <a href="/">chat</a> &middot; <a href="/memory-panel">memory</a></div>
+
+<div class="card" id="banner">loading...</div>
+
+<h2>Controls</h2>
+<div class="card">
+  <button id="sleepBtn">Unload models now (free the GPU)</button>
+  <button id="wakeBtn" class="alt">Load models now</button>
+  <button id="embBtn" class="alt">Restart embed server</button>
+  <button id="chkBtn" class="alt">Re-check llama.cpp flags</button><br>
+  Unload after <input type="number" id="idle" min="0" max="1440"> min idle (0 = never) <button id="idleBtn" class="alt">Save</button>
+  <div class="sub" id="idleNote" style="margin:6px 0 0"></div>
+</div>
+
+<h2>Servers</h2><div class="card"><table id="servers"></table></div>
+<h2>GPU memory</h2><div class="card" id="vram"></div>
+<h2>llama.cpp</h2><div class="card" id="llama"></div>
+<h2>Memory and search index</h2><div class="card" id="mem"></div>
+<h2>Databases</h2><div class="card" id="db"></div>
+<h2>Recent warnings and errors</h2><div class="card log" id="problems"></div>
+<div id="toast"></div>
+
+<script>
+const KEY='__API_KEY_PLACEHOLDER__';
+const H={'X-API-Key':KEY,'Content-Type':'application/json'};
+const $=id=>document.getElementById(id);
+function el(tag,txt,cls){const e=document.createElement(tag);if(txt!=null)e.textContent=txt;if(cls)e.className=cls;return e}
+function toast(t){const x=$('toast');x.textContent=t;x.style.display='block';setTimeout(()=>x.style.display='none',3500)}
+async function api(path,method='GET',body){
+  const r=await fetch(path,{method,headers:H,body:body?JSON.stringify(body):undefined});
+  if(!r.ok){let d='';try{d=(await r.json()).detail}catch(e){}throw new Error(d||r.status)}
+  return r.json()}
+function dur(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h}h ${m}m`:`${m}m ${s%60}s`}
+function fill(box,...nodes){box.replaceChildren(...nodes)}
+
+function render(s){
+  $('now').textContent=`${s.now} - ${s.timezone} - up ${dur(s.uptime_s)}`;
+  const l=s.llm, b=$('banner');
+  let txt, cls='ok';
+  if(l.phase==='loading'||l.phase==='stopping'){txt=l.message||l.phase;cls='warn'}
+  else if(l.phase==='error'){txt='Error: '+l.message;cls='bad'}
+  else if(l.phase==='sleeping'){txt=l.message;cls='warn'}
+  else{const a=l.models.find(m=>m.id===l.active);txt=a&&a.ready?`${a.label} is loaded`:`${a?a.label:'Model'} is not running`;cls=a&&a.ready?'ok':'bad'}
+  if(l.fallback_note)txt+=' - '+l.fallback_note;
+  fill(b,el('b',txt,cls));
+  $('idleNote').textContent=l.sleeping?'Unloaded. It loads on your next message.':`Idle for ${dur(l.idle_for_s)}.`;
+  if(document.activeElement!==$('idle'))$('idle').value=l.idle_unload_min;
+
+  const t=$('servers');t.replaceChildren();
+  for(const v of s.servers){const tr=el('tr');const c1=el('td');
+    const d=el('span',null,'dot '+(v.up?'up':(/sleep|on first|disabled/.test(v.detail)?'mid':'')));c1.append(d,v.name);
+    tr.append(c1,el('td',':'+v.port),el('td',v.detail));t.append(tr)}
+
+  const vr=$('vram');vr.replaceChildren();
+  if(!s.vram.length)vr.append(el('div','GPU memory unknown (llama-server --list-devices returned nothing).','sub'));
+  for(const g of s.vram){const used=g.total_mib-g.free_mib,pct=Math.round(used/g.total_mib*100);
+    const bar=el('div',null,'bar');const f=el('div');f.style.width=pct+'%';bar.append(f);
+    vr.append(el('div',`${g.name}: ${used} of ${g.total_mib} MiB used (${g.free_mib} MiB free)`),bar)}
+  if(s.embed.cpu_note)vr.append(el('div',s.embed.cpu_note,'warn'));
+
+  const a=s.llama, lb=$('llama');lb.replaceChildren();
+  lb.append(el('div',a.version||'version unknown (self-check not finished)'),el('div',a.exe+'  ['+a.source+']','sub'));
+  const ck=a.check_running?el('div','Self-check running...','warn'):a.check_ok==null?el('div','Self-check not run yet','sub'):
+    a.check_ok?el('div','Self-check OK: every flag Lucy passes is known to this build ('+a.checked_at+')','ok'):el('div','Self-check found problems:','bad');
+  lb.append(ck);for(const p of a.problems||[])lb.append(el('div','- '+p,'bad'));
+  const sv=s.supervisor;if(sv)lb.append(el('div',`Watchdog: ${sv.restarts_recent} recent restart(s)${sv.gave_up?' - gave up, send a message to retry':''}${sv.last_action?' - last: '+sv.last_action:''}`,'sub'));
+
+  const m=$('mem');m.replaceChildren();
+  if(s.memory)m.append(el('div',`Memory search: ${s.memory.mode==='neural'?'by meaning (Stella)':'by keywords (TF-IDF)'} - ${s.memory.have}/${s.memory.total} memories have vectors`));
+  m.append(el('div',`Embed model: ${s.embed.model}  -  image sensor ${s.embed.use_mmproj?'ON':'off'}`,'sub'));
+  const sc=s.semantic||{};m.append(el('div',`Search index: ${sc.msg||0} chat messages, ${sc.file||0} file chunks, ${sc.image||0} pictures`,'sub'));
+
+  const d=$('db');d.replaceChildren(el('div',`sessions.sqlite schema v${s.db.sessions_version}`));
+  const mg=s.db.migration;if(mg&&mg.applied&&mg.applied.length)d.append(el('div','Upgraded this start: '+mg.applied.join(', '),'sub'));
+  if(mg&&mg.error)d.append(el('div',mg.error,'bad'));
+  d.append(el('div','Backups (newest first): '+((s.db.backups||[]).map(x=>`${x.name} (${x.mb} MB)`).join(', ')||'none yet'),'sub'));
+
+  const pb=$('problems');pb.replaceChildren();
+  if(!s.problems.length)pb.append(el('div','Nothing since start.','ok'));
+  for(const p of s.problems)pb.append(el('div',`${p.t}  ${p.level}  ${p.name}: ${p.msg}`,p.level==='ERROR'||p.level==='CRITICAL'?'bad':'warn'));
+}
+let busy=false;
+async function poll(){if(busy||document.hidden)return;busy=true;try{render(await api('/api/health/full'))}catch(e){fill($('banner'),el('b','Cannot reach Lucy Core: '+e.message,'bad'))}busy=false}
+async function act(label,fn){try{await fn();toast(label);poll()}catch(e){toast(label+' failed: '+e.message)}}
+$('sleepBtn').onclick=()=>act('Unloaded',()=>api('/api/llm/sleep','POST'));
+$('wakeBtn').onclick=()=>act('Loading...',()=>api('/api/llm/wake','POST'));
+$('embBtn').onclick=()=>act('Embed server restarting',()=>api('/api/embed/restart','POST'));
+$('chkBtn').onclick=()=>act('Flags re-checked',()=>api('/api/health/recheck','POST'));
+$('idleBtn').onclick=()=>act('Saved',()=>api('/api/llm/settings','POST',{idle_unload_min:parseInt($('idle').value||'0',10)}));
+poll();setInterval(poll,3000);
+</script></body></html>

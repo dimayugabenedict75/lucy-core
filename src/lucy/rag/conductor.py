@@ -20,12 +20,15 @@ Retrieval for the prompt has two parts:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
 from lucy.paths import RUNTIME
 from lucy.memory.store import MemoryStore
-from .embedding_engine import EmbeddingEngine
+import numpy as np
+
+from .embedding_engine import EmbeddingEngine, NeuralEmbedder, QUERY, DOC
 
 CATEGORIES = ("preference", "instruction", "fact", "person", "project", "other")
 PINNED_CATEGORIES = ("preference", "instruction")
@@ -43,9 +46,26 @@ class Conductor:
     MIN_RELEVANCE = 0.08
     # At or above this score a new memory is treated as a restatement of an existing one.
     DUPLICATE_SCORE = 0.7
+    # Neural (Stella) cosine thresholds. Starting guesses from the embed guide: MEASURE with tools/embed_calibrate.py.
+    MIN_COSINE = 0.62
+    NEURAL_DUPLICATE = 0.92
+    NEURAL_MERGE = 0.95           # consolidation: cosine at/above this = same fact worded differently (guess: calibrate)
+    NEURAL_FLAG = 0.78            # consolidation: same topic, so a conflicting pair is worth flagging (guess: calibrate)
+    SEARCH_TIMEOUT = 3.0          # seconds a memory lookup may wait for the embed server before using TF-IDF
 
-    def __init__(self, store_path=None, json_path=None):
+    _AUTO = object()
+
+    def __init__(self, store_path=None, json_path=None, neural=_AUTO):
         self.embedding_engine = EmbeddingEngine()
+        # neural=None -> TF-IDF only. Default: the real Stella server, but only for the production store
+        # (a custom store_path means a test / sandbox, which must never start llama-server).
+        if neural is Conductor._AUTO:
+            neural = None
+            if store_path is None and os.environ.get("LUCY_EMBED", "1") != "0":      # LUCY_EMBED=0: TF-IDF only (tests)
+                from lucy.server.embed_manager import embed_server
+                neural = NeuralEmbedder(embed_server)
+        self.neural = neural
+        self._bf_lock = threading.Lock()
         data_dir = RUNTIME / "data"
         self.json_path = json_path or (data_dir / "knowledge_store.json")      # legacy file: imported once, kept as backup
         self.store = MemoryStore(store_path or (data_dir / "knowledge.sqlite"))
@@ -87,6 +107,9 @@ class Conductor:
             importance = max(1, min(5, int(importance)))
         except (TypeError, ValueError):
             importance = 3
+        dup_qv = None
+        if self.neural is not None and replaces_id is None:
+            dup_qv = self.neural.embed_texts([text], DOC, timeout=self.SEARCH_TIMEOUT)      # network call: outside the lock
         with self._lock:
             if replaces_id is not None:
                 doc = self._get(replaces_id)
@@ -104,8 +127,19 @@ class Conductor:
                     self._save()
                     return {"status": "duplicate", "id": doc["id"], "text": doc["text"]}
             if self.knowledge_store:
-                score, idx = self.embedding_engine.rank(text, [d["text"] for d in self.knowledge_store])[0]
-                if score >= self.DUPLICATE_SCORE:
+                from lucy.memory.consolidate import conflicting
+                nd = self._neural_duplicate(dup_qv)
+                if nd is not None:
+                    # neural scores: "likes tea" vs "doesn't like tea" look like near-duplicates, so a conflicting
+                    # pair is never overwritten here (use replaces_id for corrections)
+                    idx, score = nd
+                    if conflicting(self.knowledge_store[idx]["text"], text):
+                        score = 0.0
+                    dup = score >= self.NEURAL_DUPLICATE
+                else:
+                    score, idx = self.embedding_engine.rank(text, [d["text"] for d in self.knowledge_store])[0]
+                    dup = score >= self.DUPLICATE_SCORE
+                if dup:
                     doc = self.knowledge_store[idx]
                     doc.update(text=text, category=category,
                                importance=max(doc["importance"], importance), updated=_now(), flag=None)
@@ -118,7 +152,35 @@ class Conductor:
                    "flag": None, "merged_into": None, "decayed_at": None}
             self.knowledge_store.append(doc)
             self._save()
+            if self.neural is not None:
+                self._backfill_async()
             return {"status": "saved", "id": doc["id"], "text": text}
+
+    def edit(self, memory_id, text=None, category=None, importance=None) -> dict:
+        """Memory screen: change text / category / importance of one memory. Returns {"status": "updated"|"error", ...}."""
+        with self._lock:
+            doc = self._get(memory_id)
+            if doc is None:
+                return {"status": "error", "error": f"no memory with id {memory_id}"}
+            if text is not None:
+                text = " ".join(str(text).split())
+                if not text:
+                    return {"status": "error", "error": "text cannot be empty"}
+                doc["text"] = text
+            if category is not None:
+                if category not in CATEGORIES:
+                    return {"status": "error", "error": f"category must be one of {', '.join(CATEGORIES)}"}
+                doc["category"] = category
+            if importance is not None:
+                try:
+                    doc["importance"] = max(1, min(5, int(importance)))
+                except (TypeError, ValueError):
+                    return {"status": "error", "error": "importance must be 1-5"}
+            doc.update(updated=_now(), flag=None)
+            self._save()
+        if self.neural is not None:
+            self._backfill_async()
+        return {"status": "updated", "memory": dict(doc)}
 
     def forget(self, memory_id) -> bool:
         with self._lock:
@@ -141,22 +203,135 @@ class Conductor:
         with self._lock:
             return [dict(d) for d in self.knowledge_store]
 
-    def search(self, query: str, limit: int = 5) -> list[dict]:
+    def _query_vec(self, query: str):
+        """Stella vector of the query, or None. Does the network call, so never call it while holding self._lock."""
+        if self.neural is None or not str(query).strip():
+            return None
+        return self.neural.embed_texts([query], QUERY, timeout=self.SEARCH_TIMEOUT)
+
+    def search(self, query: str, limit: int = 5, _qv="auto") -> list[dict]:
         """Memories ranked by relevance to `query` (each with a 'score'); irrelevant ones are dropped.
         TF-IDF ranks; when it finds fewer than `limit`, FTS5 keyword hits fill the gap (low fixed score)."""
+        if isinstance(_qv, str):                                    # "auto": embed the query now, before taking the lock
+            _qv = self._query_vec(query)
         with self._lock:
             if not self.knowledge_store or not str(query).strip():
                 return []
-            ranked = self.embedding_engine.rank(query, [d["text"] for d in self.knowledge_store])
+            ranked, floor = self._rank(query, _qv)
             out = [dict(self.knowledge_store[i], score=round(float(s), 3))
-                   for s, i in ranked[:limit] if s >= self.MIN_RELEVANCE]
+                   for s, i in ranked[:limit] if s >= floor]
             if len(out) < limit:
                 have = {d["id"] for d in out}
                 for mid in self.store.fts_search(query, limit=limit):
                     doc = self._get(mid)
                     if doc is not None and mid not in have and len(out) < limit:
-                        out.append(dict(doc, score=self.MIN_RELEVANCE))
+                        out.append(dict(doc, score=floor))
             return out
+
+    def _rank(self, query: str, qv=None):
+        """([(score, index)], floor). Neural cosines only when the server answers AND every active memory has a fresh
+        vector (all-or-nothing: two score scales are never mixed); otherwise exactly the old TF-IDF ranking."""
+        docs = self.knowledge_store
+        if self.neural is not None:
+            if qv is not None:
+                vecs = self.store.fresh_vectors(self.neural.model_id(), docs)
+                if len(vecs) == len(docs):
+                    sims = np.stack([vecs[d["id"]] for d in docs]) @ qv[0]
+                    return sorted(((float(x), i) for i, x in enumerate(sims)), reverse=True), self.MIN_COSINE
+                self._backfill_async()
+        return self.embedding_engine.rank(query, [d["text"] for d in docs]), self.MIN_RELEVANCE
+
+    def vector_status(self) -> dict:
+        """How many active memories have a fresh Stella vector (search/consolidation use Stella only when ALL do)."""
+        with self._lock:
+            docs = [dict(d) for d in self.knowledge_store]
+        if self.neural is None:
+            return {"mode": "tfidf", "have": 0, "total": len(docs), "model": None}
+        mid = self.neural.model_id()
+        have = len(self.store.fresh_vectors(mid, docs))
+        return {"mode": "neural" if docs and have == len(docs) else "tfidf", "have": have, "total": len(docs), "model": mid}
+
+    def neural_sims(self):
+        """Pairwise cosine matrix aligned with knowledge_store (caller holds the lock), or None unless every memory has a fresh vector."""
+        if self.neural is None or len(self.knowledge_store) < 2:
+            return None
+        docs = self.knowledge_store
+        vecs = self.store.fresh_vectors(self.neural.model_id(), docs)
+        if len(vecs) != len(docs):
+            return None
+        m = np.stack([vecs[d["id"]] for d in docs])
+        return m @ m.T
+
+    def explain(self, query: str, top_k: int = 5) -> dict:
+        """Why would these memories be recalled for `query`? Same ranking as the prompt uses; changes nothing."""
+        qv = self._query_vec(query)                                 # network call outside the lock
+        with self._lock:
+            pins = self.pinned()
+            pin_ids = {d["id"] for d in pins}
+            injected = [d["id"] for d in pins]
+            found = self.search(query, limit=top_k + len(pin_ids), _qv=qv) if str(query).strip() else []
+            injected += [d["id"] for d in found if d["id"] not in pin_ids][:top_k]
+            ranked, floor = self._rank(query, qv) if self.knowledge_store and str(query).strip() else ([], self.MIN_RELEVANCE)
+            rows = [{"id": self.knowledge_store[i]["id"], "text": self.knowledge_store[i]["text"],
+                     "category": self.knowledge_store[i]["category"], "importance": self.knowledge_store[i]["importance"],
+                     "score": round(float(s), 3), "above_floor": bool(s >= floor),
+                     "pinned": self.knowledge_store[i]["id"] in pin_ids,
+                     "in_prompt": self.knowledge_store[i]["id"] in injected} for s, i in ranked[:12]]
+            seen = {r["id"] for r in rows}
+            for d in pins:                                           # pinned ones go in whatever the query is
+                if d["id"] not in seen:
+                    rows.append({"id": d["id"], "text": d["text"], "category": d["category"], "importance": d["importance"],
+                                 "score": None, "above_floor": False, "pinned": True, "in_prompt": True})
+            mode = "neural" if (qv is not None and floor == self.MIN_COSINE) else "tfidf"
+            return {"mode": mode, "floor": floor, "rows": rows,
+                    "note": ("Meaning-based search (Stella)." if mode == "neural" else
+                             "Keyword search (TF-IDF): Stella is off, still loading, or some memories have no vector yet.")}
+
+    # -- neural vectors ------------------------------------------------------------
+    def backfill_vectors(self, background: bool = False) -> int:
+        """Embed every active memory that has no fresh vector. Returns how many were written (0 if server down).
+        background=True: only use a server that is already up and don't reset its idle timer."""
+        if self.neural is None:
+            return 0
+        with self._lock:
+            docs = [dict(d) for d in self.knowledge_store]
+        mid = self.neural.model_id()
+        have = self.store.fresh_vectors(mid, docs)
+        todo = [d for d in docs if d["id"] not in have]
+        done = 0
+        for i in range(0, len(todo), 32):
+            batch = todo[i:i + 32]
+            v = self.neural.embed_texts([d["text"] for d in batch], DOC, background=background)
+            if v is None:
+                break
+            for d, vec in zip(batch, v):
+                self.store.put_vector(d["id"], d["text"], mid, vec)
+                done += 1
+        return done
+
+    def _backfill_async(self) -> None:
+        if not self._bf_lock.acquire(blocking=False):
+            return
+
+        def run():
+            try:
+                self.backfill_vectors()
+            finally:
+                self._bf_lock.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    def _neural_duplicate(self, qv):
+        """(index, cosine) of the nearest memory, from the STORED vectors (no re-embedding of the whole memory).
+        None when the server is down or any memory lacks a fresh vector -> caller uses the TF-IDF check."""
+        if self.neural is None or qv is None:
+            return None
+        docs = self.knowledge_store
+        vecs = self.store.fresh_vectors(self.neural.model_id(), docs)
+        if len(vecs) != len(docs):
+            return None
+        sims = np.stack([vecs[d["id"]] for d in docs]) @ qv[0]
+        i = int(np.argmax(sims))
+        return i, float(sims[i])
 
     def pinned(self, limit: int = PINNED_LIMIT) -> list[dict]:
         """Always-on memories: preferences / standing instructions / importance 5."""
@@ -176,10 +351,11 @@ class Conductor:
 
     def retrieve_context(self, query: str, top_k: int = 5) -> str:
         """Text for the prompt: pinned memories + the best matches for `query`. "" if nothing."""
+        qv = self._query_vec(query)                                 # network call outside the lock
         with self._lock:
             pins = self.pinned()
             pin_ids = {d["id"] for d in pins}
-            relevant = [d for d in self.search(query, limit=top_k + len(pin_ids)) if d["id"] not in pin_ids][:top_k]
+            relevant = [d for d in self.search(query, limit=top_k + len(pin_ids), _qv=qv) if d["id"] not in pin_ids][:top_k]
             chosen = pins + relevant
             if not chosen:
                 return ""

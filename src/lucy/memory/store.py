@@ -15,6 +15,7 @@ calls `sync()` after each change; FTS5 adds fast keyword search on top of that r
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -44,6 +45,15 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS memories_status ON memories(status);
+CREATE TABLE IF NOT EXISTS memory_vectors (
+    memory_id INTEGER NOT NULL,
+    kind      TEXT NOT NULL DEFAULT 'text',
+    model_id  TEXT NOT NULL,
+    text_sha  TEXT,
+    dim       INTEGER NOT NULL,
+    vec       BLOB NOT NULL,
+    PRIMARY KEY (memory_id, kind)
+);
 """
 _FTS = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(text, content='memories', content_rowid='id', tokenize='unicode61');
@@ -224,3 +234,39 @@ class MemoryStore:
                 "UPDATE memories SET status = 'active', merged_into = NULL, flag = NULL "
                 "WHERE id = ? AND status = 'archived'", (memory_id,))
             return cur.rowcount > 0
+
+    # ------------------------------------------------------------------ neural vectors (side table, never touches `memories`)
+    @staticmethod
+    def text_sha(text: str) -> str:
+        return hashlib.sha1(" ".join(str(text).split()).encode("utf-8")).hexdigest()
+
+    def put_vector(self, memory_id: int, text: str, model_id: str, vec, kind: str = "text") -> None:
+        import numpy as np
+        v = np.asarray(vec, dtype=np.float32)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO memory_vectors(memory_id, kind, model_id, text_sha, dim, vec) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(memory_id, kind) DO UPDATE SET model_id=excluded.model_id, text_sha=excluded.text_sha, "
+                "dim=excluded.dim, vec=excluded.vec",
+                (int(memory_id), kind, model_id, self.text_sha(text), int(v.shape[0]), v.tobytes()))
+
+    def fresh_vectors(self, model_id: str, docs: List[dict], kind: str = "text") -> dict:
+        """{memory_id: ndarray} for the docs whose stored vector matches model_id AND the current text (stale ones are left out)."""
+        import numpy as np
+        if not docs:
+            return {}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT memory_id, model_id, text_sha, vec FROM memory_vectors WHERE kind = ?", (kind,)).fetchall()
+        want = {d["id"]: self.text_sha(d["text"]) for d in docs}
+        out = {}
+        for r in rows:
+            if r["model_id"] == model_id and want.get(r["memory_id"]) == r["text_sha"]:
+                out[r["memory_id"]] = np.frombuffer(r["vec"], dtype=np.float32)
+        return out
+
+    def vacuum_vectors(self) -> int:
+        """Drop vectors whose memory no longer exists (deleted by forget). Archived memories keep theirs."""
+        with self._lock, self._conn:
+            return self._conn.execute(
+                "DELETE FROM memory_vectors WHERE memory_id NOT IN (SELECT id FROM memories)").rowcount

@@ -128,9 +128,12 @@ def format_results(results: list[dict], header: str) -> str:
         return ""
     if any(r.get("partial") for r in results):
         header += " (no message contained ALL the words; these match only some of them - check they are really relevant)"
+    if any(r.get("semantic") for r in results):
+        header += " (some matches are by meaning, not exact words - check they are really relevant)"
     lines = [header]
     for i, r in enumerate(results, 1):
         title = f' "{r["title"]}"' if r.get("title") else ""
-        lines.append(f'[{i}] {r["date"]} -{title} (session {r["session_id"]}) {r["role"]}: {r["snippet"]}')
+        who = f'{r["role"]} "{r["name"]}"' if r.get("name") else r["role"]            # shared files: file "notes.md"
+        lines.append(f'[{i}] {r["date"]} -{title} (session {r["session_id"]}) {who}: {r["snippet"]}')
     text = "\n".join(lines)
     return text if len(text) <= 5000 else text[:5000] + "\n[... truncated ...]"

@@ -116,7 +116,7 @@ class Projects:
         if pid and not self.get(pid):
             raise ProjectError("No such project.")
         with self.lock:
-            self.conn.execute("INSERT OR IGNORE INTO sessions (session_id, title) VALUES (?, 'New Session')", (session_id,))
+            self.conn.execute("INSERT OR IGNORE INTO sessions (session_id, title, updated_at) VALUES (?, 'New Session', strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime'))", (session_id,))
             self.conn.execute("UPDATE sessions SET project_id = ? WHERE session_id = ?", (pid or None, session_id))
             self.conn.commit()
 
