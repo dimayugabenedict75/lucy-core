@@ -248,10 +248,16 @@ async function ensureSession() {
     currentSessionId = id;
     sessions[id] = {
         title: 'New Session', message_count: 0, messages: [],
-        updated_at: updated || new Date().toISOString().replace('T', ' ').slice(0, 19)
+        updated_at: updated || localNow()
     };
     renderHistory();
     return id;
+}
+
+// "YYYY-MM-DD HH:MM:SS" on this PC's clock (not UTC: UTC was the 8 h shift on just-sent messages)
+function localNow() {
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
 function formatTime(ts) {
@@ -826,7 +832,7 @@ async function sendMessage(queued) {
         path: f._savedPath || null
     })).filter(f => f);
 
-    const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    const now = localNow();
     addMessage(message || '(file)', true, outgoingFiles, now);
     const filesToSend = [...sendFiles];
     sendFiles.forEach(f => delete f._dataUrl);
@@ -1214,8 +1220,12 @@ function _applyLlmStatus(st) {
         } else if (st.phase === 'error') {
             label.textContent = 'Error: ' + st.message;
             label.classList.add('error');
+        } else if (st.phase === 'sleeping') {
+            label.textContent = st.message || 'Unloaded (idle). It loads again when you send a message.';
+            label.classList.add('loading');
         } else if (active && active.ready) {
-            label.textContent = `${active.label} is loaded on port ${active.port}`;
+            label.textContent = `${active.label} is loaded on port ${active.port}` +
+                (st.fallback_note ? ` - ${st.fallback_note}` : '');
             label.classList.add('ready');
         } else {
             label.textContent = `${active ? active.label : 'Model'} is not running`;
@@ -2416,7 +2426,7 @@ applyTheme(getSavedTheme());
 // ---- Init ----
 const greetingTime = document.getElementById('greetingTime');
 if (greetingTime) {
-    greetingTime.textContent = formatTime(new Date().toISOString()) || '';
+    greetingTime.textContent = formatTime(localNow()) || '';
 }
 loadSessions();
 loadVoiceStatus();

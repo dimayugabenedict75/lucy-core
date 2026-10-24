@@ -119,6 +119,10 @@ def consolidate(conductor, now: Optional[float] = None, dry_run: bool = False) -
             sim = conductor.embedding_engine.similarity_matrix([d["text"] for d in docs])
         else:
             sim = None
+        # Stella (meaning-based) similarity on top of TF-IDF, only when every memory already has a vector.
+        nsim = conductor.neural_sims() if hasattr(conductor, "neural_sims") else None
+        n_merge, n_flag = getattr(conductor, "NEURAL_MERGE", 0.95), getattr(conductor, "NEURAL_FLAG", 0.78)
+        report["mode"] = "neural+tfidf" if nsim is not None else "tfidf"
         gone: Dict[int, int] = {}                                   # dropped id -> kept id
         flagged_pairs: List[Tuple[int, int]] = []
         n = len(docs)
@@ -128,14 +132,15 @@ def consolidate(conductor, now: Optional[float] = None, dry_run: bool = False) -
                 if a["id"] in gone or b["id"] in gone:
                     continue
                 s = float(sim[i][j])
+                sn = float(nsim[i][j]) if nsim is not None else 0.0
                 cand = max(s, overlap(a["text"], b["text"]))
-                if cand < FLAG_SCORE:
+                if cand < FLAG_SCORE and sn < n_flag:
                     continue
                 if conflicting(a["text"], b["text"]):
-                    if a.get("category") == b.get("category") or cand >= MERGE_SCORE:
+                    if a.get("category") == b.get("category") or cand >= MERGE_SCORE or sn >= n_flag:
                         flagged_pairs.append((a["id"], b["id"]))
                     continue
-                if s >= MERGE_SCORE:
+                if s >= MERGE_SCORE or sn >= n_merge:
                     keep, drop = _survivor(a, b)
                     gone[drop["id"]] = keep["id"]
                     if not dry_run:

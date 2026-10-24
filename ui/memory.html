@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lucy Core - Memory</title>
+<style>
+:root{--bg:#fff;--fg:#1c1c1e;--mut:#6b6b70;--card:#f4f4f6;--line:#dcdce0;--ok:#1a9b4b;--bad:#d03a3a;--warn:#c27c00;--acc:#5b5bd6}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--fg:#ececf0;--mut:#9a9aa3;--card:#1e1e22;--line:#34343a;--ok:#3ccf74;--bad:#ff6b6b;--warn:#f0b34a;--acc:#8c8cff}}
+*{box-sizing:border-box}body{margin:0;padding:20px;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,sans-serif;max-width:980px;margin-inline:auto}
+h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);margin-bottom:12px}a{color:var(--acc)}
+.tabs{display:flex;gap:6px;margin:14px 0}.tabs button{background:transparent;color:var(--fg);border:1px solid var(--line)}.tabs button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:6px 11px;font:inherit;cursor:pointer;margin-right:6px}button.alt{background:transparent;color:var(--fg);border:1px solid var(--line)}button.del{background:var(--bad)}
+input,select,textarea{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px 8px;font:inherit}textarea{width:100%;min-height:54px}
+.item{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px}.item.flag{border-color:var(--warn)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}.meta{color:var(--mut);font-size:12px}.pill{padding:1px 8px;border-radius:99px;font-size:12px;background:var(--line)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+#toast{position:fixed;bottom:16px;right:16px;background:var(--fg);color:var(--bg);padding:8px 14px;border-radius:8px;display:none}
+</style></head><body>
+<h1>Memory</h1>
+<div class="sub" id="status">loading...</div>
+<div class="sub"><a href="/">chat</a> &middot; <a href="/health-panel">health</a></div>
+<div class="tabs"><button data-t="active" class="on">Memories</button><button data-t="archived">Archived</button><button data-t="why">Why recalled?</button><button data-t="search">Search chats and files</button></div>
+<div id="view"></div><div id="toast"></div>
+<script>
+const KEY='__API_KEY_PLACEHOLDER__',H={'X-API-Key':KEY,'Content-Type':'application/json'},CATS=['preference','instruction','fact','person','project','other'];
+const $=id=>document.getElementById(id);
+function el(t,x,c){const e=document.createElement(t);if(x!=null)e.textContent=x;if(c)e.className=c;return e}
+function toast(t){const x=$('toast');x.textContent=t;x.style.display='block';setTimeout(()=>x.style.display='none',3000)}
+async function api(p,m='GET',b){const r=await fetch(p,{method:m,headers:H,body:b?JSON.stringify(b):undefined});if(!r.ok){let d='';try{d=(await r.json()).detail}catch(e){}throw new Error(d||r.status)}return r.json()}
+let tab='active',data=null;
+async function load(){try{data=await api('/api/memory/all');const v=data.vectors;
+  $('status').textContent=`${data.active.length} active, ${data.archived.length} archived - search is ${v.mode==='neural'?'by meaning (Stella)':'by keywords (Stella off, loading, or '+v.have+'/'+v.total+' have vectors)'}`;
+  draw()}catch(e){$('status').textContent='Cannot reach Lucy Core: '+e.message}}
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));draw()});
+function draw(){const v=$('view');v.replaceChildren();if(!data)return;
+  if(tab==='active')data.active.slice().sort((a,b)=>b.id-a.id).forEach(m=>v.append(card(m,false)));
+  else if(tab==='archived'){if(!data.archived.length)v.append(el('div','Nothing archived.','sub'));data.archived.forEach(m=>v.append(card(m,true)))}
+  else if(tab==='why')why(v);else search(v)}
+function card(m,arch){const c=el('div',null,'item'+(m.flag?' flag':''));
+  const meta=el('div',`#${m.id} - ${m.category||'fact'} - importance ${m.importance??3} - used ${m.uses||0}x - ${m.updated||m.created||''}${m.source?' - by '+m.source:''}`,'meta');
+  c.append(meta);
+  if(m.flag)c.append(el('div','Possible conflict: '+m.flag,'warn'));
+  if(arch){c.append(el('div',m.text));const r=el('div',null,'row');const b=el('button','Restore');b.onclick=()=>act('Restored',()=>api(`/api/memory/${m.id}/unarchive`,'POST'));r.append(b);c.append(r);return c}
+  const ta=el('textarea');ta.value=m.text;const cat=el('select');CATS.forEach(x=>{const o=el('option',x);o.value=x;cat.append(o)});cat.value=m.category||'fact';
+  const imp=el('select');[1,2,3,4,5].forEach(n=>{const o=el('option',String(n));o.value=n;imp.append(o)});imp.value=m.importance??3;
+  const r=el('div',null,'row'),save=el('button','Save'),ar=el('button','Archive','alt'),dl=el('button','Delete','del');
+  save.onclick=()=>act('Saved',()=>api(`/api/memory/${m.id}/edit`,'POST',{text:ta.value,category:cat.value,importance:+imp.value}));
+  ar.onclick=()=>act('Archived',()=>api(`/api/memory/${m.id}/archive`,'POST'));
+  dl.onclick=()=>{if(confirm('Delete this memory for good?'))act('Deleted',()=>api(`/api/memory/${m.id}`,'DELETE'))};
+  r.append(save,ar,dl,cat,el('span','importance'),imp);c.append(ta,r);return c}
+async function act(l,fn){try{await fn();toast(l);load()}catch(e){toast('Failed: '+e.message)}}
+function why(v){v.append(el('div','Type a message to see which memories Lucy would pull in for it, and how they scored.','sub'));
+  const q=el('input');q.style.width='70%';q.placeholder='e.g. what tea does Dima like?';const go=el('button','Explain');const out=el('div');v.append(q,go,out);
+  const run=async()=>{if(!q.value.trim())return;out.replaceChildren(el('div','thinking...','sub'));try{const r=await api('/api/memory/explain?q='+encodeURIComponent(q.value));out.replaceChildren();
+    out.append(el('div',r.note+(r.mode==='neural'?` Scores are cosine similarity; the cutoff is ${r.floor}.`:''),'sub'));
+    const t=el('table');t.append(Object.assign(el('tr'),{innerHTML:'<th>#</th><th>Memory</th><th>Score</th><th>In prompt?</th>'}));
+    r.rows.forEach(x=>{const tr=el('tr');tr.append(el('td',x.id),el('td',x.text),el('td',x.score==null?'pinned':x.score+(x.above_floor?'':' (below cutoff)')),el('td',x.in_prompt?(x.pinned?'yes (pinned)':'yes'):'no',x.in_prompt?'ok':''));t.append(tr)});out.append(t)}catch(e){out.replaceChildren(el('div',e.message,'bad'))}};
+  go.onclick=run;q.onkeydown=e=>{if(e.key==='Enter')run()}}
+function search(v){v.append(el('div','Finds past chat messages, files you shared and (if the image sensor is on) pictures by meaning, not just exact words. Results appear once Stella has indexed them.','sub'));
+  const q=el('input');q.style.width='70%';q.placeholder='e.g. that argument about the GPU drivers';const go=el('button','Search');const out=el('div');v.append(q,go,out);
+  const run=async()=>{if(!q.value.trim())return;out.replaceChildren(el('div','searching...','sub'));try{const r=await api('/api/search/semantic?q='+encodeURIComponent(q.value));out.replaceChildren();
+    out.append(el('div',`Indexed: ${r.indexed.msg||0} messages, ${r.indexed.file||0} file chunks, ${r.indexed.image||0} pictures${r.stella?'':' - Stella is off'}`,'sub'));
+    if(!r.results.length)out.append(el('div','No matches.'));
+    r.results.forEach(x=>{const c=el('div',null,'item');c.append(el('div',`${x.date||''} - "${x.title||'session'}" - ${x.kind==='msg'?x.role:x.kind+(x.name?' '+x.name:'')} - score ${x.score}`,'meta'),el('div',x.snippet));out.append(c)})}catch(e){out.replaceChildren(el('div',e.message,'bad'))}};
+  go.onclick=run;q.onkeydown=e=>{if(e.key==='Enter')run()}}
+load();
+</script></body></html>

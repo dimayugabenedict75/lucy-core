@@ -64,3 +64,62 @@ class EmbeddingEngine:
         vectorizer = TfidfVectorizer(lowercase=True, token_pattern=r"(?u)\b\w+\b", ngram_range=(1, 2))
         matrix = vectorizer.fit_transform(texts)
         return cosine_similarity(matrix)
+
+
+# ---------------------------------------------------------------- neural (Stella via llama-server :8092)
+QUERY = "task: search result | query: "
+DOC = "title: none | text: "
+SYM = "task: sentence similarity | query: "
+
+
+class NeuralEmbedder:
+    """Text embeddings from the Stella embed server. Every method returns None when the server is down, still
+    loading, or returns garbage (NaN): callers then use TF-IDF exactly as before."""
+
+    def __init__(self, server):
+        self.srv = server
+
+    def model_id(self) -> str:
+        from pathlib import Path
+        m = Path(self.srv.cfg["model"])
+        try:
+            return f"{m.name}:{m.stat().st_size}#768"
+        except OSError:
+            return f"{m.name}:missing#768"
+
+    def _post(self, inputs: list, timeout: float = 15.0, background: bool = False):
+        """background=True (the indexer): only talk to a server that is ALREADY up, never start it and never reset
+        its idle timer, so indexing can't keep the GPU busy or wake Stella while you game."""
+        import httpx
+        if background:
+            if not self.srv.is_ready():
+                return None
+        elif not self.srv.ensure_up():
+            return None
+        try:
+            r = httpx.post(f"http://127.0.0.1:{self.srv.cfg['port']}/v1/embeddings", timeout=timeout,
+                           json={"model": "stella-embed", "input": inputs, "encoding_format": "float"})
+            r.raise_for_status()
+            v = np.array([d["embedding"] for d in sorted(r.json()["data"], key=lambda d: d["index"])],
+                         dtype=np.float32)
+            n = np.linalg.norm(v, axis=1, keepdims=True)
+            n[n == 0] = 1
+            return v / n if np.isfinite(v).all() else None
+        except Exception:
+            return None
+
+    def embed_texts(self, texts: list, prefix: str, timeout: float = 15.0, background: bool = False):
+        if not texts:
+            return None
+        return self._post([prefix + " ".join(str(t).split()) for t in texts], timeout=timeout, background=background)
+
+    def embed_image(self, data: bytes, mime: str = "image/png", timeout: float = 60.0, background: bool = True):
+        """Picture -> vector in the same space as text (needs use_mmproj true in embed.json and the sensor check passed).
+        None when the sensor is off or the server is not up."""
+        if not self.srv.cfg.get("use_mmproj"):
+            return None
+        import base64
+        url = f"data:{mime};base64," + base64.b64encode(data).decode()
+        v = self._post([{"content": [{"type": "image_url", "image_url": {"url": url}}]}],
+                       timeout=timeout, background=background)
+        return None if v is None else v[0]

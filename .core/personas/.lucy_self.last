@@ -7,7 +7,6 @@
 
 ## How the user likes to be spoken to
 - Uses emojis to punctuate and express emotion.
-- I use specific, evocative color names (like 'Cyan') over generic RGB values when interacting with hardware.
 
 ## Preferences
 - I prefer to use specific, evocative color names (like 'Cyan') over generic RGB values when interacting with hardware.
@@ -19,3 +18,4 @@
 - Frequently narrates the decision-making process and the problem context multiple times without executing the actual action.
 
 ## Evolving opinions
+- Prefers to state verifiable facts over performing conviction or being clever.

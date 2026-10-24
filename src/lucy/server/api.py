@@ -31,6 +31,10 @@ from lucy.server.voice_control import router as voice_router
 from lucy import paths as _paths
 from contextvars import ContextVar
 from lucy.server.llm_manager import llm                      # model switching, temperature, reasoning, KV cache
+from lucy.server.embed_manager import embed_server           # Stella embed server (port 8092): starts lazily, stops when idle
+from lucy.server.supervisor import Supervisor                # idle unload (games), crash restart
+from lucy.server import health as _health, db_migrate as _db_migrate
+from lucy.memory.semantic import SemanticIndex               # search past chats / files by meaning
 from lucy.server.agent_loop import AgentLoop, LoopConfig     # reliable tool-calling loop (retries, validation, ...)
 from lucy.server.tts_filter import TTSStreamFilter, clean_for_speech   # only speakable words reach the voice
 from lucy.server import file_guard                           # path resolution, tolerant edits, syntax checks, backups
@@ -256,8 +260,8 @@ _conn.execute("""
         connector_id  INTEGER PRIMARY KEY AUTOINCREMENT,
         name          TEXT NOT NULL UNIQUE,
         token         TEXT,
-        created_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
-        updated_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
+        created_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')),
+        updated_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime'))
     )
 """)
 _conn.commit()
@@ -269,6 +273,9 @@ except sqlite3.OperationalError:
     pass                                                                  # column already exists
 _conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
 _conn.commit()
+_MIGRATION_REPORT = _db_migrate.run(_conn, _db_lock, _PATH)      # numbered schema upgrades; copies the database first
+_health.install_log_capture()
+_STARTED_AT = time.time()
 
 
 def _now_str() -> str:
@@ -312,7 +319,7 @@ def _session_exists(session_id: str) -> bool:
 def _ensure_session(session_id: str):
     with _db_lock:
         _conn.execute(
-            "INSERT OR IGNORE INTO sessions (session_id, title) VALUES (?, 'New Session')",
+            "INSERT OR IGNORE INTO sessions (session_id, title, updated_at) VALUES (?, 'New Session', strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime'))",
             (session_id,),
         )
         _conn.commit()
@@ -463,8 +470,10 @@ def _append_message(session_id: str, role: str, content: str, attachments: list 
     atts = [a for a in (attachments or []) if a]
     with _db_lock:
         cur = _conn.execute(
-            "INSERT INTO messages (session_id, role, content, attachments) VALUES (?, ?, ?, ?)",
-            (session_id, role, content, json.dumps(atts, ensure_ascii=False) if atts else None),
+            # created_at is written explicitly (PC local clock): an older database keeps its old column DEFAULT,
+            # which was UTC, and CREATE TABLE IF NOT EXISTS never rewrites it
+            "INSERT INTO messages (session_id, role, content, created_at, attachments) VALUES (?, ?, ?, ?, ?)",
+            (session_id, role, content, _now_str(), json.dumps(atts, ensure_ascii=False) if atts else None),
         )
         rowid = cur.lastrowid
         _conn.execute(
@@ -506,6 +515,8 @@ def _delete_session_db(session_id: str) -> bool:
 
 # --- Instantiating Core Systems ---
 _memory_manager = MemoryManager()
+_semantic = SemanticIndex(_paths.RUNTIME / "data" / "semantic_index.sqlite", _memory_manager.conductor.neural,
+                          _conn, _db_lock, library=_library)
 _skills_manager = SkillsManager()
 
 # --- Persona (P6): CORE = .core/personas/lucy.md (human-owned, hash-locked) + SELF = lucy_self.md (written by Lucy via
@@ -914,6 +925,14 @@ def _run_memory_tool(tool_name: str, args: dict) -> str:
             _conn, _db_lock, query, session_id=sid,
             exclude_session=None if sid else _current_session.get(),
             days=args.get("days"), limit=args.get("limit", 5))
+        try:                                    # + matches by MEANING (chats, shared files) when Stella is available
+            lim = max(1, min(int(args.get("limit", 5) or 5), 15))
+            sem = _semantic.search(query, kinds=("msg", "file", "image"), limit=lim, session_id=sid,
+                                   exclude_session=None if sid else _current_session.get(), days=args.get("days"))
+            seen = {r["id"] for r in res if r.get("id") is not None}
+            res = (res + [r for r in sem if r["id"] is None or r["id"] not in seen])[:lim]
+        except Exception as e:                  # noqa: BLE001  (the keyword results above are still good)
+            logger.warning(f"semantic history search skipped: {e}")
         return (_history.format_results(res, f"Found {len(res)} match(es) in past conversations:")
                 or "Nothing found in past conversations for that query.")
     return f"Unknown memory tool: {tool_name}"
@@ -1283,6 +1302,7 @@ class _Brain:
     """Adapter that lets the agent loop see the live llama-server (llm_manager)."""
     @property
     def base_url(self) -> str:
+        llm.touch()                                   # a chat round is about to use the model: restart the idle clock
         return llm.api_url
 
     @property
@@ -1695,7 +1715,9 @@ async def chat_endpoint(
 
     # Build messages (includes system persona, memory, skills, history, and new user message)
     # Image paths are embedded directly in the user message as multimodal content
-    messages = _build_messages(session_id, message, image_paths=image_paths if image_paths else None)
+    await llm.wake()                 # unloaded for idle / games? start loading now, while the prompt is being built
+    # in a worker thread: the memory lookup may call the embed server and must never stall the event loop
+    messages = await asyncio.to_thread(_build_messages, session_id, message, image_paths=image_paths if image_paths else None)
     # If non-image files were uploaded, add a system note about them
     non_image_files = [p for p in uploaded_file_paths if p not in image_paths]
     if non_image_files:
@@ -2102,7 +2124,8 @@ async def cli_chat_endpoint(
     voice_mode_bool = voice_mode and voice_mode.lower() == "true"
 
     # Build messages (CLI mode — same as chat but with coding tone)
-    messages = _build_messages(session_id, message)
+    await llm.wake()
+    messages = await asyncio.to_thread(_build_messages, session_id, message)
 
     # Store user message in CLI session
     _append_message(session_id, "user", message)
@@ -2310,7 +2333,7 @@ async def update_connector(connector_id: int, request: Request, _ = Depends(veri
     token = body.get("token", "").strip()
     with _db_lock:
         result = _conn.execute(
-            "UPDATE connectors SET token = ?, updated_at = strftime('%Y-%m-%d %H:%M:%S', 'now') "
+            "UPDATE connectors SET token = ?, updated_at = strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime') "
             "WHERE connector_id = ?",
             (token, connector_id),
         )
@@ -2497,6 +2520,171 @@ async def _llm_autostart():
         logger.info(f"Autostart: loading {llm.active['label']} on port {llm.active['port']} "
                     f"(kv={llm.state['kv_cache']}, reasoning={'on' if llm.reasoning else 'off'})")
         asyncio.get_running_loop().create_task(llm.ensure_active())
+
+
+# === P-H1/H5/H4: self-check, supervisor (idle unload + crash restart), warm start, semantic indexing ===
+_supervisor: Supervisor | None = None
+
+
+def _daily_backups() -> None:
+    _db_migrate.daily_backup(_PATH)
+    _db_migrate.daily_backup(_paths.RUNTIME / "data" / "knowledge.sqlite")
+
+
+async def _warm_and_index() -> None:
+    """After the chat model is up: warm the embed server (optional), then keep the semantic index and the memory
+    vectors filled while it is up. Never starts the embed server just for indexing (so games stay undisturbed)."""
+    await asyncio.sleep(6)
+    for _ in range(240):
+        if llm.phase in ("idle", "error", "sleeping"):
+            break
+        await asyncio.sleep(1.5)
+    conductor = _memory_manager.conductor
+    if conductor.neural is not None and embed_server.cfg.get("enabled", True) and embed_server.cfg.get("warm_start", True) \
+            and not llm.sleeping:
+        await asyncio.to_thread(embed_server.ensure_up)
+    while True:
+        await asyncio.sleep(45)
+        try:
+            if conductor.neural is None or not await asyncio.to_thread(embed_server.is_ready):
+                continue
+            if conductor.vector_status()["mode"] != "neural":
+                await asyncio.to_thread(conductor.backfill_vectors, True)
+            await asyncio.to_thread(_semantic.index_pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                              # noqa: BLE001
+            logger.warning(f"background indexing failed: {e}")
+
+
+@app.on_event("startup")
+async def _health_supervisor_startup():
+    global _supervisor
+    _supervisor = Supervisor(llm, embed_server, busy=_proactive_is_busy)
+    _supervisor.start()
+    loop = asyncio.get_running_loop()
+    loop.create_task(asyncio.to_thread(_health.run_startup_check, llm, embed_server))
+    loop.create_task(asyncio.to_thread(_daily_backups))
+    loop.create_task(_warm_and_index())
+    if _MIGRATION_REPORT.get("applied"):
+        logger.info(f"Database upgraded to v{_MIGRATION_REPORT['to']}: {', '.join(_MIGRATION_REPORT['applied'])}"
+                    + (f" (backup: {_MIGRATION_REPORT['backup']})" if _MIGRATION_REPORT.get("backup") else ""))
+
+
+@app.on_event("shutdown")
+async def _health_supervisor_shutdown():
+    if _supervisor:
+        _supervisor.stop()
+
+
+def _backup_list(n: int = 8) -> list[dict]:
+    try:
+        files = sorted(_db_migrate.BACKUP_DIR.glob("*.sqlite"), key=lambda p: p.stat().st_mtime, reverse=True)[:n]
+        return [{"name": f.name, "mb": round(f.stat().st_size / 1048576, 1)} for f in files]
+    except OSError:
+        return []
+
+
+@app.get("/api/health/full")
+async def health_full(_ = Depends(verify_api_key)):
+    """Everything the health panel shows: servers, GPU memory, llama.cpp build + self-check, supervisor, memory, warnings."""
+    return await _health.snapshot(
+        llm=llm, embed=embed_server, supervisor=_supervisor, memory=_memory_manager, semantic=_semantic,
+        started_at=_STARTED_AT,
+        db={"sessions_version": _db_migrate.version(_conn), "migration": _MIGRATION_REPORT, "backups": _backup_list()})
+
+
+@app.post("/api/health/recheck")
+async def health_recheck(_ = Depends(verify_api_key)):
+    """Re-run the llama.cpp flag self-check (after you updated llama.cpp)."""
+    return await asyncio.to_thread(_health.run_startup_check, llm, embed_server)
+
+
+@app.post("/api/llm/sleep")
+async def llm_sleep(_ = Depends(verify_api_key)):
+    """Unload the chat model and the embed server now (e.g. before a game). The next message loads them again."""
+    ok = await llm.sleep_now("you asked")
+    try:
+        await asyncio.to_thread(embed_server.stop)
+    except Exception as e:                                  # noqa: BLE001
+        logger.warning(f"embed stop failed: {e}")
+    if not ok:
+        raise HTTPException(status_code=409, detail="The model is loading or unloading right now; try again in a moment.")
+    return await llm.status()
+
+
+@app.post("/api/llm/wake")
+async def llm_wake(_ = Depends(verify_api_key)):
+    await llm.wake()
+    return await llm.status()
+
+
+@app.post("/api/embed/restart")
+async def embed_restart(_ = Depends(verify_api_key)):
+    await asyncio.to_thread(embed_server.restart)
+    return {"status": "restarting"}
+
+
+def _panel(filename: str) -> HTMLResponse:
+    html = (_paths.UI_DIR / filename).read_text(encoding="utf-8").replace("__API_KEY_PLACEHOLDER__", DEV_API_KEY)
+    return HTMLResponse(content=html)
+
+
+@app.get("/health-panel")
+async def health_panel():
+    """Standalone health page (same local-only key injection as the chat page)."""
+    return _panel("health.html")
+
+
+@app.get("/memory-panel")
+async def memory_panel():
+    """Standalone memory screen: view / edit / archive memories and see why they are recalled."""
+    return _panel("memory.html")
+
+
+# === Memory screen + semantic search endpoints ===
+@app.get("/api/memory/all")
+async def memory_all(_ = Depends(verify_api_key)):
+    c = _memory_manager.conductor
+    return {"active": c.all(), "archived": c.archived(), "vectors": c.vector_status()}
+
+
+@app.post("/api/memory/{memory_id}/edit")
+async def memory_edit(memory_id: int, request: Request, _ = Depends(verify_api_key)):
+    body = await request.json()
+    res = _memory_manager.conductor.edit(memory_id, text=body.get("text"), category=body.get("category"),
+                                         importance=body.get("importance"))
+    if res["status"] != "updated":
+        raise HTTPException(status_code=400, detail=res.get("error", "could not edit"))
+    return res
+
+
+@app.post("/api/memory/{memory_id}/archive")
+async def memory_archive(memory_id: int, _ = Depends(verify_api_key)):
+    if not _memory_manager.conductor.archive(memory_id):
+        raise HTTPException(status_code=404, detail="Memory not found")
+    return {"status": "archived", "id": memory_id}
+
+
+@app.post("/api/memory/{memory_id}/unarchive")
+async def memory_unarchive(memory_id: int, _ = Depends(verify_api_key)):
+    if not _memory_manager.conductor.unarchive(memory_id):
+        raise HTTPException(status_code=404, detail="Archived memory not found")
+    return {"status": "restored", "id": memory_id}
+
+
+@app.get("/api/memory/explain")
+async def memory_explain(q: str, _ = Depends(verify_api_key)):
+    """Why would these memories be recalled for this message? (same ranking as the prompt; changes nothing)"""
+    return await asyncio.to_thread(_memory_manager.conductor.explain, q)
+
+
+@app.get("/api/search/semantic")
+async def search_semantic(q: str, limit: int = 8, kinds: str = "msg,file,image", _ = Depends(verify_api_key)):
+    """Past chats / library files / pictures by meaning. Empty while Stella is off or the index is still filling."""
+    ks = tuple(k for k in kinds.split(",") if k in ("msg", "file", "image")) or ("msg",)
+    res = await asyncio.to_thread(_semantic.search, q, kinds=ks, limit=max(1, min(limit, 20)))
+    return {"results": res, "indexed": _semantic.counts(), "stella": _semantic.neural is not None}
 
 
 # === LLM settings (Settings > Model) ===

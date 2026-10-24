@@ -11,6 +11,15 @@ Responsibilities
 Lifetime: the llama-server is tied to this Lucy Core process (Windows Job Object, KILL_ON_JOB_CLOSE),
 so whichever model is loaded unloads whenever Lucy Core stops, even after a crash or a kill.
 
+Sleep / wake: after `idle_unload_min` minutes without use (Settings value, 0 = never) server/supervisor.py asks
+sleep_now() to unload the model so the GPU is free for games; wake() (called when a chat starts) loads it again.
+Before every load a VRAM check (llama.cpp --list-devices) compares free memory with what this model used last time;
+if it would not fit (a game is running) the other, smaller model is loaded instead and the chosen one is retried
+at the next wake.
+
+Pinned llama.cpp: runtime/data/llama_exe.json {"llama_server": "<path>"} overrides the exe path (tools/llama_pin.py
+writes it), so a bad llama.cpp update can be rolled back without touching this file.
+
 Config: DEFAULT_MODELS_CFG below (edit it here). If runtime/data/llm_models.json exists it OVERRIDES
 it, so delete that file if you only edit this module.
 State (runtime/data/llm_state.json): what the settings tab saved: active model, temperature,
@@ -32,6 +41,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from lucy.server import llama_check
+
 logger = logging.getLogger("lucy.core.llm")
 
 KV_CHOICES = {"q4": "q4_0", "q4_0": "q4_0", "q8": "q8_0", "q8_0": "q8_0"}
@@ -42,33 +53,52 @@ DEFAULT_MODELS_CFG: dict[str, Any] = {
               "llama_server -m <gguf> --mmproj <mmproj> -ngl <gpu_layers> -c <context_length> "
               "<flash_attn_args> --cache-type-k/v <Settings KV> <reasoning flags from Settings> "
               "<extra_args> --host <host> --port <model port>"),
-    "llama_server": "D:/llama.cpp/bin/llama-server.exe",
+    "llama_server": "C:/Users/dimay/AppData/Local/Microsoft/WinGet/Packages/ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe/llama-server.exe",   # winget b11829 (was D:/llama.cpp/bin)
     "host": "127.0.0.1",
     "context_length": 100000,
     "gpu_layers": 999,
     "flash_attn_args": ["--flash-attn", "on"],
     "extra_args": ["--jinja", "--parallel", "1"],
     "ready_timeout_s": 300,
+    "vram_plan": True,         # check free GPU memory before loading (needs llama-server --list-devices)
+    "vram_margin_mib": 700,    # keep this much free after loading
+    "auto_fallback": True,     # model does not fit -> load the other (smaller) one instead of failing
     "autostart": True,      # load the Settings > Model selection when Lucy Core (8090) starts
     "models": [
         {"id": "lucy-12b", "label": "Lucy 12B", "port": 8080, "temperature": 0.7,
-         "gguf": "C:/Users/dimay/Lucy/Lucy_Core/models/Lucy-12b/Lux-Plus-M12B.i1-QAT_Q4_K.gguf",
-         "mmproj": "C:/Users/dimay/Lucy/Lucy_Core/models/Lucy-12b/Lux-Plus-M12B.mmproj-bf16.gguf",
+         "gguf": "C:/Users/dimay/Lucy/Lucy_Core/models/LLM/Lucy-12b/Lux-Plus-M12B.i1-QAT_Q4_K.gguf",
+         "mmproj": "C:/Users/dimay/Lucy/Lucy_Core/models/LLM/Lucy-12b/Lux-Plus-M12B.mmproj-bf16.gguf",
          "extra_args": []},
         {"id": "lucy-4b", "label": "Lucy 4B", "port": 8081, "temperature": 0.5,
-         "gguf": "C:/Users/dimay/Lucy/Lucy_Core/models/Lucy-4b/Lucy-4B-it-qat-q4_0.i1-Q4_K_M.gguf",
-         "mmproj": "C:/Users/dimay/Lucy/Lucy_Core/models/Lucy-4b/Lucy-4B-it-qat-q4_0.mmproj-Q8_0.gguf",
+         "gguf": "C:/Users/dimay/Lucy/Lucy_Core/models/LLM/Lucy-4b/Lucy-4B-it-qat-q4_0.i1-Q4_K_M.gguf",
+         "mmproj": "C:/Users/dimay/Lucy/Lucy_Core/models/LLM/Lucy-4b/Lucy-4B-it-qat-q4_0.mmproj-Q8_0.gguf",
          "extra_args": ["--reasoning", "off"]},
     ],
 }
 
 DEFAULT_STATE: dict[str, Any] = {"active": "lucy-12b", "temperature": 0.7, "reasoning": False,
-                                 "kv_cache": "q8_0"}
+                                 "kv_cache": "q8_0", "idle_unload_min": 15, "vram_learned": {}}
 
 
 def _runtime_dir() -> Path:
     # <Lucy_Core>/src/lucy/server/llm_manager.py -> <Lucy_Core>/runtime
     return Path(__file__).resolve().parents[3] / "runtime"
+
+
+def llama_exe_override(runtime: Path) -> str | None:
+    """Path from runtime/data/llama_exe.json (pinned / rolled-back llama.cpp), if that file exists and points at an exe."""
+    try:
+        p = json.loads((runtime / "data" / "llama_exe.json").read_text(encoding="utf-8")).get("llama_server")
+        return p if p and Path(p).is_file() else None
+    except Exception:
+        return None
+
+
+def _mib(path: str | None) -> int:
+    try:
+        return int(Path(path).stat().st_size / 1048576) if path else 0
+    except OSError:
+        return 0
 
 
 def _read_json(path: Path, default: dict) -> dict:
@@ -245,8 +275,13 @@ class LLMManager:
         self._task: asyncio.Task | None = None
         self._procs: dict[str, subprocess.Popen] = {}
         self._owned: set[str] = set()                     # models launched by THIS Lucy Core process
-        self.phase = "idle"                               # idle | stopping | loading | error
+        self.phase = "idle"                               # idle | stopping | loading | sleeping | error
         self.message = ""
+        self.sleeping = False
+        self.last_used = time.monotonic()                 # last time a chat used the model (idle unload counts from here)
+        self.inflight = 0
+        self.fallback_note = ""
+        self.exe_source = "config"
         self.load()
 
     # -- config ---------------------------------------------------------------
@@ -255,20 +290,31 @@ class LLMManager:
         if self.models_path.exists():
             logger.warning(f"{self.models_path} exists and overrides DEFAULT_MODELS_CFG in llm_manager.py")
         self.cfg = _read_json(self.models_path, DEFAULT_MODELS_CFG)
+        ov = llama_exe_override(self.runtime)
+        if ov:
+            self.cfg["llama_server"] = ov
+            self.exe_source = "pinned override (runtime/data/llama_exe.json)"
         self.models: dict[str, dict] = {m["id"]: m for m in self.cfg["models"]}
         st = _read_json(self.state_path, DEFAULT_STATE)
         if st["active"] not in self.models:
             st["active"] = next(iter(self.models))
             st["temperature"] = self.models[st["active"]]["temperature"]
         st["kv_cache"] = KV_CHOICES.get(str(st["kv_cache"]).lower(), "q8_0")
+        try:
+            st["idle_unload_min"] = max(0, min(1440, int(st.get("idle_unload_min", 15))))
+        except (TypeError, ValueError):
+            st["idle_unload_min"] = 15
+        if not isinstance(st.get("vram_learned"), dict):
+            st["vram_learned"] = {}
         self.state = st
+        self.preferred = st["active"]                      # what the user chose; state["active"] may differ while a fallback runs
         if not self.state_path.exists():
             self.state["temperature"] = self.models[st["active"]]["temperature"]
             self._save()
 
     def _save(self) -> None:
         try:
-            self.state_path.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+            self.state_path.write_text(json.dumps({**self.state, "active": self.preferred}, indent=2), encoding="utf-8")
         except OSError as e:
             logger.warning(f"could not save llm_state.json: {e}")
 
@@ -316,6 +362,12 @@ class LLMManager:
             "kv_cache": self.state["kv_cache"],
             "phase": self.phase,
             "message": self.message,
+            "sleeping": self.sleeping,
+            "preferred": self.preferred,
+            "fallback_note": self.fallback_note,
+            "idle_unload_min": self.state["idle_unload_min"],
+            "idle_for_s": int(time.monotonic() - self.last_used),
+            "exe_source": self.exe_source,
             "models": [{"id": m["id"], "label": m["label"], "port": m["port"],
                         "temperature_preset": m["temperature"], "ready": ok}
                        for m, ok in zip(self.models.values(), health)],
@@ -329,7 +381,7 @@ class LLMManager:
             if "model" in body and body["model"] != self.state["active"]:
                 if body["model"] not in self.models:
                     raise ValueError(f"unknown model '{body['model']}'")
-                self.state["active"] = body["model"]
+                self.state["active"] = self.preferred = body["model"]
                 self.state["temperature"] = self.models[body["model"]]["temperature"]   # preset
                 todo.append("switch")
             if "temperature" in body and "switch" not in todo:
@@ -344,6 +396,15 @@ class LLMManager:
                     self.state["reasoning"] = new
                     if "switch" not in todo and "restart" not in todo:
                         todo.append("restart")
+            if "idle_unload_min" in body:
+                try:
+                    m = int(body["idle_unload_min"])
+                except (TypeError, ValueError):
+                    raise ValueError("idle_unload_min must be a whole number of minutes (0 = never)")
+                if not 0 <= m <= 1440:
+                    raise ValueError("idle_unload_min must be between 0 and 1440")
+                self.state["idle_unload_min"] = m
+                self.touch()
             if "kv_cache" in body:
                 kv = KV_CHOICES.get(str(body["kv_cache"]).lower())
                 if kv is None:
@@ -365,7 +426,10 @@ class LLMManager:
     async def ensure_active(self, restart: bool = False) -> None:
         """Make the active model the only one loaded (restart=True: reload it, e.g. new KV cache)."""
         async with self._busy:
+            self.sleeping = False
+            self.state["active"] = self.preferred                      # always try the chosen model first
             target = self.active
+            free_before = None
             try:
                 self.phase, self.message = "stopping", "Unloading other model..."
                 # A server we did not launch (e.g. started by hand / by an older Lucy Core) is not tied
@@ -377,16 +441,104 @@ class LLMManager:
                         self._owned.discard(m["id"])
                 if await self._healthy(target["port"]):
                     self.phase, self.message = "idle", f"{target['label']} ready"
+                    self.touch()
                     return
+                target, free_before = await self._fit_target(target)
                 self.phase, self.message = "loading", f"Loading {target['label']}..."
                 proc = await asyncio.to_thread(self._launch, target)
                 self._owned.add(target["id"])
                 await self._wait_ready(target, proc)
-                self.phase, self.message = "idle", f"{target['label']} ready"
+                self.phase, self.message = "idle", f"{target['label']} ready" + (f" ({self.fallback_note})" if self.fallback_note else "")
+                self.touch()
+                await self._learn_vram(target, free_before)
                 logger.info(f"{target['label']} ready on port {target['port']} (kv={self.state['kv_cache']})")
             except Exception as e:
                 self.phase, self.message = "error", str(e)
                 logger.error(f"LLM switch failed: {e}")
+
+    # -- sleep / wake / memory planning ---------------------------------------------------
+    def touch(self) -> None:
+        """A chat used (or is about to use) the model: restart the idle clock."""
+        self.last_used = time.monotonic()
+
+    async def wake(self) -> None:
+        """A chat is starting: if the model is unloaded (idle sleep, crash, never started) begin loading it NOW.
+        Non-blocking: the agent loop already waits for the model and shows 'loading' in the UI."""
+        self.touch()
+        if self.phase in ("loading", "stopping"):
+            return
+        if self.sleeping or self.phase == "sleeping" or not await self._healthy(self.active["port"]):
+            self.phase, self.message = "loading", f"Loading {self.models[self.preferred]['label']}..."
+            self._task = asyncio.get_running_loop().create_task(self.ensure_active())
+
+    async def sleep_now(self, reason: str = "manual") -> bool:
+        """Unload every llama-server so the GPU is free. Returns False if a load/unload is already in progress."""
+        if self.phase in ("loading", "stopping"):
+            return False
+        async with self._busy:
+            self.phase, self.message = "stopping", "Unloading..."
+            try:
+                for m in self.models.values():
+                    await asyncio.to_thread(stop_port, m["port"])
+            except Exception as e:
+                self.phase, self.message = "error", f"Could not unload: {e}"
+                logger.error(self.message)
+                return False
+            self._owned.clear()
+            self.sleeping = True
+            self.phase, self.message = "sleeping", f"Unloaded ({reason}). It loads again when you send a message."
+            logger.info(self.message)
+            return True
+
+    def _need_mib(self, m: dict) -> tuple[int, bool]:
+        """(MiB the model needs on the GPU, measured?). Unmeasured = just the file sizes: a floor, never an overestimate."""
+        key = f"{m['id']}:{self.cfg['context_length']}:{self.state['kv_cache']}"
+        learned = self.state["vram_learned"].get(key)
+        if learned:
+            return int(learned), True
+        return _mib(m["gguf"]) + _mib(m.get("mmproj")), False
+
+    async def _fit_target(self, target: dict) -> tuple[dict, int | None]:
+        """Check free GPU memory before loading. Returns (model to load, free MiB before loading or None)."""
+        self.fallback_note = ""
+        if not self.cfg.get("vram_plan", True):
+            return target, None
+        free = await asyncio.to_thread(llama_check.free_vram_mib, self.cfg["llama_server"], 0.0)
+        if free is None:
+            return target, None
+        margin = int(self.cfg.get("vram_margin_mib", 700))
+        need, known = self._need_mib(target)
+        if free >= need + margin:
+            return target, free
+        if self.cfg.get("auto_fallback", True):
+            for m in sorted((x for x in self.models.values() if x["id"] != target["id"]),
+                            key=lambda x: self._need_mib(x)[0]):
+                n2, _ = self._need_mib(m)
+                if n2 < need and free >= n2 + margin:
+                    self.state["active"] = m["id"]
+                    self.fallback_note = (f"{target['label']} needs about {need} MiB but only {free} MiB are free, "
+                                          f"so {m['label']} was loaded instead; {target['label']} is retried at the next wake")
+                    logger.warning(self.fallback_note)
+                    return m, free
+        raise RuntimeError(f"Not enough free GPU memory for {target['label']}: {free} MiB free, needs about {need}"
+                           f"{'' if known else '+'} MiB. Close whatever is using the GPU (a game?) and send a message again.")
+
+    async def _learn_vram(self, m: dict, free_before: int | None) -> None:
+        """Remember how much GPU memory this model really took (free before - free after), for the next planning."""
+        if free_before is None or not self.cfg.get("vram_plan", True):
+            return
+        await asyncio.sleep(2.0)                                   # let the allocations settle
+        after = await asyncio.to_thread(llama_check.free_vram_mib, self.cfg["llama_server"], 0.0)
+        if after is None:
+            return
+        used = free_before - after
+        floor = max(300, int(_mib(m["gguf"]) * 0.5))
+        if used < floor:                                           # implausible: something else freed memory meanwhile
+            return
+        key = f"{m['id']}:{self.cfg['context_length']}:{self.state['kv_cache']}"
+        self.state["vram_learned"][key] = int(used)
+        self._save()
+        logger.info(f"{m['label']} uses about {used} MiB of GPU memory (saved for load planning)")
 
     def _build_argv(self, m: dict) -> list[str]:
         exe = self.cfg["llama_server"]
